@@ -68,7 +68,7 @@ void read_legacy(const panplay::Json& json, AppSettings* settings) {
     host_port = host_port.substr(0, host_port.find('/'));
     const auto colon = host_port.rfind(':');
     settings->ftp_host = host_port.substr(0, colon);
-    if (colon != std::string::npos) settings->ftp_port = host_port.substr(colon + 1);
+    settings->ftp_port = colon == std::string::npos ? "21" : host_port.substr(colon + 1);
     settings->ftp_dir = prefix;
     return;
   }
