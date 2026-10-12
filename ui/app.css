@@ -631,6 +631,8 @@ body.detail-open { overflow: hidden; }
 
 .rename-btn[hidden] { display: none; }
 
+.detail .job-cancel { align-self: flex-start; }
+
 .rename-note {
   flex-basis: 100%;
   min-height: 1rem;

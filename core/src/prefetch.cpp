@@ -40,21 +40,25 @@ class ReadAtStream final : public ByteStream {
 
 }  // namespace
 
-std::unique_ptr<ByteStream> DrivePlugin::open_stream(const std::string& file_id, std::int64_t offset, std::string*) {
+std::unique_ptr<ByteStream> DrivePlugin::open_stream(const std::string& file_id, std::int64_t offset, std::string*,
+                                                     AbortSignal*) {
   return std::make_unique<ReadAtStream>(*this, file_id, offset);
 }
 
 std::unique_ptr<ByteStream> DrivePlugin::open_range(const std::string& file_id, std::int64_t offset, std::int64_t,
-                                                    std::string* error) {
-  return open_stream(file_id, offset, error);
+                                                    std::string* error, AbortSignal* abort) {
+  return open_stream(file_id, offset, error, abort);
 }
 
 namespace {
 
 PrefetchOptions sane(PrefetchOptions options) {
-  options.block_size = std::clamp<std::size_t>(options.block_size, 64u << 10, 64u << 20);
+  constexpr std::size_t kMaxBufferBytes = 512u << 20;
+  options.block_size = std::clamp<std::size_t>(options.block_size, 64u << 10, 32u << 20);
   options.connections = std::clamp(options.connections, 1, 16);
-  options.max_blocks = std::clamp<std::size_t>(options.max_blocks, static_cast<std::size_t>(options.connections), 64);
+  const std::size_t max_by_memory = std::max<std::size_t>(kMaxBufferBytes / options.block_size, 1);
+  options.max_blocks = std::clamp<std::size_t>(options.max_blocks, static_cast<std::size_t>(options.connections),
+                                               std::max(max_by_memory, static_cast<std::size_t>(options.connections)));
   options.max_retries = std::clamp(options.max_retries, 0, 10);
   options.retry_base_ms = std::clamp(options.retry_base_ms, 1, 10000);
   return options;
@@ -65,11 +69,8 @@ PrefetchOptions sane(PrefetchOptions options) {
 PrefetchReader::PrefetchReader(DrivePlugin& drive, std::string file_id, std::int64_t size, const CancelToken* cancel,
                                PrefetchOptions options)
     : drive_(drive), file_id_(std::move(file_id)), size_(size), cancel_(cancel), options_(sane(options)) {
-  if (options_.connections <= 1) {
-    workers_.emplace_back([this] { worker_loop(); });
-  } else {
-    for (int i = 0; i < options_.connections; ++i) workers_.emplace_back([this] { range_worker_loop(); });
-  }
+  const auto loop = options_.connections <= 1 ? &PrefetchReader::worker_loop : &PrefetchReader::range_worker_loop;
+  for (int i = 0; i < options_.connections; ++i) workers_.emplace_back([this, loop] { run_worker(loop); });
 }
 
 PrefetchReader::~PrefetchReader() {
@@ -78,14 +79,39 @@ PrefetchReader::~PrefetchReader() {
     stop_ = true;
     if (active_stream_ != nullptr) active_stream_->abort();
     for (ByteStream* stream : range_streams_) stream->abort();
+    for (AbortSignal* signal : open_aborts_) signal->abort();
   }
   cv_.notify_all();
   for (auto& worker : workers_) worker.join();
 }
 
+void PrefetchReader::run_worker(void (PrefetchReader::*loop)(AbortSignal&)) {
+  AbortSignal signal;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    open_aborts_.push_back(&signal);
+  }
+  try {
+    (this->*loop)(signal);
+  } catch (const std::exception& e) {
+    std::lock_guard<std::mutex> lock(mu_);
+    error_ = std::string("预读出错: ") + e.what();
+    cv_.notify_all();
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+  open_aborts_.erase(std::remove(open_aborts_.begin(), open_aborts_.end(), &signal), open_aborts_.end());
+}
+
+bool PrefetchReader::arm_open(AbortSignal& signal, std::uint64_t generation) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (stop_ || generation != generation_) return false;
+  signal.reset();
+  return true;
+}
+
 // 多连接：每条连接领一段 [start, start + block_size)，用一次有界请求下完。
 // 下完的段先放在 pending_，按偏移顺序接到 blocks_ 后面，读取方看到的仍是顺序数据。
-void PrefetchReader::range_worker_loop() {
+void PrefetchReader::range_worker_loop(AbortSignal& signal) {
   std::unique_lock<std::mutex> lock(mu_);
   while (true) {
     cv_.wait(lock, [&] {
@@ -115,6 +141,10 @@ void PrefetchReader::range_worker_loop() {
       }
       stream.reset();
     };
+    struct DropOnExit {
+      decltype(drop_stream)& drop;
+      ~DropOnExit() { drop(); }
+    } drop_on_exit{drop_stream};
     while (filled < block.data.size()) {
       if (stale(generation)) break;
       if (cancel_ && cancel_->cancelled()) {
@@ -123,8 +153,9 @@ void PrefetchReader::range_worker_loop() {
       }
       if (!stream) {
         const std::int64_t at = start + static_cast<std::int64_t>(filled);
+        if (!arm_open(signal, generation)) break;
         std::string open_error;
-        auto opened = drive_.open_range(file_id_, at, length - static_cast<std::int64_t>(filled), &open_error);
+        auto opened = drive_.open_range(file_id_, at, length - static_cast<std::int64_t>(filled), &open_error, &signal);
         if (!opened) {
           if (++failures > options_.max_retries) {
             failure = open_error.empty() ? "无法打开下载" : open_error;
@@ -197,7 +228,7 @@ bool PrefetchReader::wait_retry(int attempt, std::uint64_t generation) {
   return !stop_ && generation == generation_ && !(cancel_ && cancel_->cancelled());
 }
 
-void PrefetchReader::worker_loop() {
+void PrefetchReader::worker_loop(AbortSignal& signal) {
   std::unique_ptr<ByteStream> stream;
   std::int64_t stream_position = -1;
   std::uint64_t stream_generation = 0;
@@ -211,6 +242,11 @@ void PrefetchReader::worker_loop() {
     stream.reset();
     stream_position = -1;
   };
+  // 出异常时也要从 active_stream_ 摘掉，否则跳转或析构会去中止已释放的连接。要在 lock 之前声明。
+  struct DropOnExit {
+    decltype(drop_stream)& drop;
+    ~DropOnExit() { drop(); }
+  } drop_on_exit{drop_stream};
 
   std::unique_lock<std::mutex> lock(mu_);
   while (true) {
@@ -236,9 +272,10 @@ void PrefetchReader::worker_loop() {
       const std::int64_t at = start + static_cast<std::int64_t>(filled);
       if (!stream || stream_generation != generation || stream_position != at) {
         drop_stream();
+        if (!arm_open(signal, generation)) break;
         std::string open_error;
         if (std::getenv("PANPLAY_TRACE") != nullptr) std::cerr << "打开下载 @" << at << "\n";
-        auto opened = drive_.open_stream(file_id_, at, &open_error);
+        auto opened = drive_.open_stream(file_id_, at, &open_error, &signal);
         if (!opened) {
           if (++failures > options_.max_retries) {
             failure = open_error.empty() ? "无法打开下载" : open_error;
@@ -386,6 +423,7 @@ std::string PrefetchReader::seek(std::int64_t position) {
   position_ = position;
   if (active_stream_ != nullptr) active_stream_->abort();
   for (ByteStream* stream : range_streams_) stream->abort();
+  for (AbortSignal* signal : open_aborts_) signal->abort();
   cv_.notify_all();
   return "";
 }

@@ -64,6 +64,18 @@ class WinHttpStream final : public HttpStream {
   std::int64_t content_length() const override { return content_length_; }
   std::string final_url() const override { return final_url_; }
 
+  std::string header(const std::string& name) const override {
+    HINTERNET request = request_.load();
+    if (request == nullptr) return {};
+    const std::wstring wide_name = widen(name);
+    wchar_t value[1024]{};
+    DWORD size = sizeof(value);
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, wide_name.c_str(), value, &size, WINHTTP_NO_HEADER_INDEX)) {
+      return {};
+    }
+    return narrow(std::wstring(value, size / sizeof(wchar_t)));
+  }
+
   std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) override {
     HINTERNET request = request_.load();
     if (request == nullptr) {
@@ -167,11 +179,23 @@ std::unique_ptr<HttpStream> HttpClient::open(const HttpRequest& request, std::st
     header_block += widen(header.second);
     header_block += L"\r\n";
   }
+  if (request.abort != nullptr && !request.abort->arm([handle] { WinHttpCloseHandle(handle); })) {
+    WinHttpCloseHandle(handle);
+    WinHttpCloseHandle(connect);
+    *error = "下载已中止";
+    return nullptr;
+  }
   BOOL sent = WinHttpSendRequest(handle, header_block.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : header_block.c_str(),
                                  header_block.empty() ? 0 : static_cast<DWORD>(-1),
                                  request.body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(request.body.data()),
                                  static_cast<DWORD>(request.body.size()), static_cast<DWORD>(request.body.size()), 0);
-  if (!sent || !WinHttpReceiveResponse(handle, nullptr)) {
+  const bool received = sent && WinHttpReceiveResponse(handle, nullptr);
+  if (request.abort != nullptr && request.abort->disarm()) {
+    WinHttpCloseHandle(connect);
+    *error = "下载已中止";
+    return nullptr;
+  }
+  if (!received) {
     WinHttpCloseHandle(handle);
     WinHttpCloseHandle(connect);
     *error = "request failed";

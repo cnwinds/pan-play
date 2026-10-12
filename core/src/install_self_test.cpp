@@ -125,9 +125,17 @@ class FakeDrive final : public DrivePlugin {
     return result;
   }
 
-  std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error) override {
+  std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error,
+                                          AbortSignal* abort) override {
     ++stream_opens;
-    delay();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(latency_ms.load());
+    while (std::chrono::steady_clock::now() < until) {
+      if (abort != nullptr && abort->aborted()) {
+        *error = "下载已中止";
+        return nullptr;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
     const auto it = files_.find(file_id);
     if (it == files_.end() || offset < 0 || offset > it->second.size) {
       *error = "没有这个文件";
@@ -668,6 +676,30 @@ int prefetch_tests() {
     if (error != "interrupted") return fail("取消后没有返回中断");
     if (spent > std::chrono::seconds(1)) return fail("取消后没有很快停下");
   }
+
+  for (const int connections : {1, 4}) {
+    PrefetchOptions slow = options;
+    slow.connections = connections;
+    const auto started = std::chrono::steady_clock::now();
+    {
+      PrefetchReader reader(drive, "/big.bin", size, nullptr, slow);
+      std::uint8_t byte = 0;
+      std::string error;
+      reader.read(&byte, 1, &error);
+      drive.latency_ms = 10000;
+      if (auto seek_error = reader.seek(60ll << 20); !seek_error.empty()) return fail(seek_error);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      drive.latency_ms = 0;
+      if (auto seek_error = reader.seek(50ll << 20); !seek_error.empty()) return fail(seek_error);
+      reader.read(&byte, 1, &error);
+      if (!error.empty() || byte != byte_at(50ll << 20)) return fail("连接中跳转后数据不对");
+      drive.latency_ms = 10000;
+      if (auto seek_error = reader.seek(10ll << 20); !seek_error.empty()) return fail(seek_error);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    drive.latency_ms = 0;
+    if (std::chrono::steady_clock::now() - started > std::chrono::seconds(2)) return fail("连接还没建立时跳转或关闭要等很久");
+  }
   return 0;
 }
 
@@ -1018,7 +1050,7 @@ class SimDrive final : public DrivePlugin {
   void logout() override {}
   std::vector<DriveEntry> list(const std::string&, std::string*) override { return {}; }
   ReadResult read_at(const std::string&, std::int64_t, std::size_t) override { return {}; }
-  std::unique_ptr<ByteStream> open_stream(const std::string&, std::int64_t offset, std::string*) override {
+  std::unique_ptr<ByteStream> open_stream(const std::string&, std::int64_t offset, std::string*, AbortSignal*) override {
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
     return std::make_unique<Stream>(rate_, size_ - offset);
   }

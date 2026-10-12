@@ -324,7 +324,7 @@ std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) 
 
 void publish_progress(const panplay::InstallResult& snapshot) {
   std::lock_guard<std::mutex> lock(job.mu);
-  if (!job.running) return;
+  if (!job.running || (job.cancel && job.cancel->cancelled())) return;
   job.result.message = snapshot.message;
   job.result.files_done = snapshot.files_done;
   job.result.files_total = snapshot.files_total;
@@ -693,6 +693,17 @@ void handle_client(SOCKET client) {
       job.worker = std::thread(run_install, job.path, job.cancel);
     }
     if (previous.joinable()) previous.join();
+    reply_json(client, 200, "{\"ok\":true}");
+    return;
+  }
+  if (method == "POST" && target == "/api/cancel") {
+    std::lock_guard<std::mutex> lock(job.mu);
+    if (!job.running || !job.cancel) {
+      reply_json(client, 409, json_error("没有正在进行的安装"));
+      return;
+    }
+    job.cancel->cancel();
+    job.result.message = "正在取消…";
     reply_json(client, 200, "{\"ok\":true}");
     return;
   }

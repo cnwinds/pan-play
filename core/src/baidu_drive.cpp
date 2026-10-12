@@ -43,6 +43,20 @@ bool write_file_atomic(const std::string& path, const std::string& text) {
 
 bool link_expired_status(int status) { return status == 403 || status == 404 || status == 410; }
 
+// "bytes 100-199/1000" 里的 100；格式不对时返回 -1。
+std::int64_t range_start(const std::string& content_range) {
+  const auto space = content_range.find(' ');
+  const auto dash = content_range.find('-');
+  if (space == std::string::npos || dash == std::string::npos || dash <= space + 1) return -1;
+  std::int64_t value = 0;
+  for (std::size_t i = space + 1; i < dash; ++i) {
+    const char ch = content_range[i];
+    if (ch < '0' || ch > '9' || value > (INT64_MAX - 9) / 10) return -1;
+    value = value * 10 + (ch - '0');
+  }
+  return value;
+}
+
 class BaiduStream final : public ByteStream {
  public:
   BaiduStream(std::unique_ptr<HttpStream> http, std::int64_t expected) : http_(std::move(http)), left_(expected) {}
@@ -249,18 +263,19 @@ class BaiduDrive final : public DrivePlugin {
     return result;
   }
 
-  std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error) override {
-    return open_bytes(file_id, offset, -1, error);
+  std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error,
+                                          AbortSignal* abort) override {
+    return open_bytes(file_id, offset, -1, error, abort);
   }
 
   std::unique_ptr<ByteStream> open_range(const std::string& file_id, std::int64_t offset, std::int64_t length,
-                                         std::string* error) override {
-    return open_bytes(file_id, offset, length, error);
+                                         std::string* error, AbortSignal* abort) override {
+    return open_bytes(file_id, offset, length, error, abort);
   }
 
  private:
   std::unique_ptr<ByteStream> open_bytes(const std::string& file_id, std::int64_t offset, std::int64_t length,
-                                         std::string* error) {
+                                         std::string* error, AbortSignal* abort) {
     std::string range = "bytes=" + std::to_string(offset) + "-";
     if (length > 0) range += std::to_string(offset + length - 1);
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -271,15 +286,22 @@ class BaiduDrive final : public DrivePlugin {
         return nullptr;
       }
       HttpRequest request{url, "GET", "", {{"User-Agent", "pan.baidu.com"}, {"Range", range}}};
+      request.abort = abort;
       auto http = client_.open(request, error);
       if (!http) {
+        if (abort != nullptr && abort->aborted()) return nullptr;
         if (resolved && attempt == 0) continue;
         return nullptr;
       }
       const int status = http->status();
-      if ((link_expired_status(status) || (resolved && status != 206)) && attempt == 0) continue;
+      const bool misplaced = status == 206 && range_start(http->header("Content-Range")) != offset;
+      if ((link_expired_status(status) || (resolved && (status != 206 || misplaced))) && attempt == 0) continue;
       if (status != 206 && !(status == 200 && offset == 0)) {
         *error = "下载没有按偏移返回，状态 " + std::to_string(status);
+        return nullptr;
+      }
+      if (misplaced) {
+        *error = "下载返回的数据位置不对";
         return nullptr;
       }
       remember_resolved(file_id, url, http->final_url());
@@ -310,11 +332,16 @@ class BaiduDrive final : public DrivePlugin {
     if (it != dlinks_.end() && it->second.url == requested) it->second.resolved = final_url;
   }
 
+  // 刷新令牌要走网络，期间不占 mu_，别的线程还能用缓存的下载地址；刷新本身由 refresh_mu_ 排队。
   std::string access_token() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (session_.access_token.empty()) return {};
+      if (session_.expires_at > now_seconds()) return session_.access_token;
+    }
+    std::lock_guard<std::mutex> refreshing(refresh_mu_);
+    if (!refresh()) return {};
     std::lock_guard<std::mutex> lock(mu_);
-    if (session_.access_token.empty()) return {};
-    if (session_.expires_at > now_seconds()) return session_.access_token;
-    if (!refresh_locked()) return {};
     return session_.access_token;
   }
 
@@ -353,19 +380,27 @@ class BaiduDrive final : public DrivePlugin {
   }
 
   // 百度的 refresh_token 只能用一次。别的进程或旧实例可能已经换过，先看会话文件里是不是有更新的。
-  bool refresh_locked() {
-    Session saved = session_;
-    load_session_locked();
-    if (session_.refresh_token != saved.refresh_token && session_.expires_at > now_seconds()) return true;
-    if (session_.refresh_token.empty() || config_.secret_key.empty()) return false;
+  // 调用方持有 refresh_mu_，不持有 mu_。
+  bool refresh() {
+    std::string refresh_token;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (session_.expires_at > now_seconds()) return true;
+      const Session saved = session_;
+      load_session_locked();
+      if (session_.refresh_token != saved.refresh_token && session_.expires_at > now_seconds()) return true;
+      if (session_.refresh_token.empty() || config_.secret_key.empty()) return false;
+      refresh_token = session_.refresh_token;
+    }
     const std::string url = "https://openapi.baidu.com/oauth/2.0/token?grant_type=refresh_token&refresh_token=" +
-                            url_encode(session_.refresh_token) + "&client_id=" + url_encode(config_.app_key) +
+                            url_encode(refresh_token) + "&client_id=" + url_encode(config_.app_key) +
                             "&client_secret=" + url_encode(config_.secret_key);
     HttpResponse response = client_.send({url});
     if (!response.error.empty()) return false;
     Json json = Json::parse(response.body, nullptr);
     const std::string token = json.str("access_token");
     if (token.empty()) return false;
+    std::lock_guard<std::mutex> lock(mu_);
     session_.access_token = token;
     if (!json.str("refresh_token").empty()) session_.refresh_token = json.str("refresh_token");
     session_.expires_at = now_seconds() + static_cast<std::int64_t>(json.num("expires_in")) - 60;
@@ -395,6 +430,7 @@ class BaiduDrive final : public DrivePlugin {
   BaiduConfig config_;
   HttpClient client_;
   std::mutex mu_;
+  std::mutex refresh_mu_;
   Session session_;
   std::map<std::string, Dlink> dlinks_;
 };

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "panplay/abort.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -22,6 +24,8 @@ struct HttpRequest {
   std::string body;
   std::vector<std::pair<std::string, std::string>> headers;
   int timeout_ms = 0;  // 0 = default (30s receive)
+  // 可选。中止后 open 立即失败返回；open 成功后由 HttpStream::abort 接管。
+  AbortSignal* abort = nullptr;
 };
 
 // 边收边读的响应体。
@@ -33,6 +37,8 @@ class HttpStream {
   virtual std::int64_t content_length() const = 0;
   // 跟随重定向后实际请求的地址。
   virtual std::string final_url() const = 0;
+  // 响应头的值，没有时返回空串。
+  virtual std::string header(const std::string& name) const = 0;
   // 返回读到的字节数，0 表示响应体结束。
   virtual std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) = 0;
   // 可以从其他线程调用，让阻塞中的 read 立刻失败返回。

@@ -326,7 +326,26 @@ function renderDetail(game) {
   fillDetail(game, lines, action, meta);
   const progress = document.createElement("p");
   progress.id = "job-progress";
-  const refresh = () => fillDetail(game, lines, action, meta);
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "rename-btn quiet job-cancel";
+  cancel.textContent = "取消安装";
+  cancel.hidden = true;
+  const refresh = () => {
+    fillDetail(game, lines, action, meta);
+    cancel.hidden = game.state !== "installing";
+    cancel.disabled = false;
+  };
+  cancel.addEventListener("click", async () => {
+    cancel.disabled = true;
+    try {
+      await api("/api/cancel", {});
+      progress.textContent = "正在取消…";
+    } catch (error) {
+      progress.textContent = error.message;
+      cancel.disabled = false;
+    }
+  });
   const showMeta = () => {
     title.textContent = displayName(game);
     const oldArt = cover.querySelector(".case-art");
@@ -340,7 +359,7 @@ function renderDetail(game) {
     scheduleMetaPoll(true);
   });
   action.addEventListener("click", () => startInstall(game, progress, refresh));
-  copy.append(lines, meta, action, progress, rename.form);
+  copy.append(lines, meta, action, progress, cancel, rename.form);
   detailBody.append(cover, copy);
   detailGame = game;
   detailReload = () => api("/api/game", { path: game.path }).then((data) => {

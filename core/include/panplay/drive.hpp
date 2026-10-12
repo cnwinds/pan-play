@@ -1,5 +1,7 @@
 #pragma once
 
+#include "panplay/abort.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -71,10 +73,12 @@ class DrivePlugin {
   // 少量随机读，例如 ZIP 末尾目录。大段数据用 open_stream。
   virtual ReadResult read_at(const std::string& file_id, std::int64_t offset, std::size_t length) = 0;
   // 默认实现用 read_at 按 1 MB 分段读；网盘插件应该覆盖成一次请求顺序读到底。
-  virtual std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error);
+  // abort 可选：另一个线程调用 abort->abort() 时，还在建立中的请求立即失败返回。
+  virtual std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error,
+                                                  AbortSignal* abort = nullptr);
   // 只读 [offset, offset + length)。读完整段后连接可以复用。默认实现直接用 open_stream，由调用方只读到 length。
   virtual std::unique_ptr<ByteStream> open_range(const std::string& file_id, std::int64_t offset, std::int64_t length,
-                                                 std::string* error);
+                                                 std::string* error, AbortSignal* abort = nullptr);
 };
 
 struct BaiduConfig {

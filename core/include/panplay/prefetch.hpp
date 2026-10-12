@@ -47,8 +47,11 @@ class PrefetchReader {
     std::size_t used = 0;
   };
 
-  void worker_loop();
-  void range_worker_loop();
+  void worker_loop(AbortSignal& signal);
+  void range_worker_loop(AbortSignal& signal);
+  void run_worker(void (PrefetchReader::*loop)(AbortSignal&));
+  // 在 generation 没变时清掉 signal 上次的中止状态；变了返回 false。
+  bool arm_open(AbortSignal& signal, std::uint64_t generation);
   bool wait_retry(int attempt, std::uint64_t generation);
   bool stale(std::uint64_t generation);
   std::int64_t buffered_end_locked() const;
@@ -77,6 +80,8 @@ class PrefetchReader {
   std::map<std::int64_t, Block> pending_;
   int in_flight_ = 0;
   std::vector<ByteStream*> range_streams_;
+  // 每个后台线程一个，用来中止还在建立中的连接。
+  std::vector<AbortSignal*> open_aborts_;
   std::vector<std::thread> workers_;
 };
 
