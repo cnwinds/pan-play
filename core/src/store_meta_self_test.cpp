@@ -81,6 +81,8 @@ int check_cache() {
   routes["https://store.playstation.com/zh-hans-hk/concept/3"] = {403, "", ""};
   routes["https://store.playstation.com/zh-hans-hk/concept/4"] = {200, sample_page(4, "封面挂了", "https://img.test/down.png"), ""};
   routes["https://store.playstation.com/zh-hans-hk/concept/5"] = {200, sample_page(5, "处理中又刷新"), ""};
+  routes["https://store.playstation.com/zh-hans-hk/concept/6"] = {200, sample_page(6, "AVIF封面", "https://img.test/a.png"), ""};
+  routes["https://img.test/a.png?w=440"] = {200, std::string("\0\0\0\x1C" "ftypavif\0\0\0\0", 16), ""};
   int requests = 0;
   StoreMetaCache* active = nullptr;
   bool refreshed_mid_flight = false;
@@ -135,6 +137,12 @@ int check_cache() {
       }
       active = nullptr;
       if (!result && cache.lookup(5, nullptr) != StoreMetaState::ready) result = fail("概念 5 最终应就绪");
+    }
+    if (!result) {
+      cache.lookup(6, nullptr);
+      while (cache.run_once()) {
+      }
+      if (cache.lookup(6, &meta) != StoreMetaState::ready || !meta.has_cover) result = fail("AVIF 封面应能落到本机");
     }
   }
   if (!result) {

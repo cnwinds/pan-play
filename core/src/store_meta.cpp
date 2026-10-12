@@ -174,7 +174,8 @@ bool looks_like_image(const std::string& body) {
   const bool jpeg = b[0] == 0xFF && b[1] == 0xD8;
   const bool png = b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G';
   const bool webp = body.size() >= 12 && body.compare(0, 4, "RIFF") == 0 && body.compare(8, 4, "WEBP") == 0;
-  return jpeg || png || webp;
+  const bool avif = body.size() >= 12 && (body.compare(4, 8, "ftypavif") == 0 || body.compare(4, 8, "ftypavis") == 0);
+  return jpeg || png || webp || avif;
 }
 
 HttpRequest store_request(const std::string& url) {
@@ -435,6 +436,8 @@ void StoreMetaCache::load() {
   const Json root = Json::parse(text, nullptr);
   const Json* concepts = root.get("concepts");
   if (concepts == nullptr || concepts->type != Json::Type::object) return;
+  // 版本 1 把 AVIF 封面当成坏图，清掉了封面地址
+  const bool drop_coverless = root.num("version") < 2;
   for (const auto& [key, node] : concepts->object) {
     StoreMeta meta;
     meta.concept_id = std::strtoll(key.c_str(), nullptr, 10);
@@ -449,12 +452,13 @@ void StoreMetaCache::load() {
     meta.description = node.str("description");
     meta.fetched_at = static_cast<std::int64_t>(node.num("fetched_at"));
     meta.has_cover = meta.found && std::filesystem::exists(cover_file(meta.concept_id));
+    if (drop_coverless && meta.found && !meta.has_cover) meta.fetched_at = 0;
     entries_[meta.concept_id] = meta;
   }
 }
 
 void StoreMetaCache::save_locked() {
-  std::string json = "{\"version\":1,\"concepts\":{";
+  std::string json = "{\"version\":2,\"concepts\":{";
   bool first = true;
   for (const auto& [id, meta] : entries_) {
     if (!first) json += ",";
