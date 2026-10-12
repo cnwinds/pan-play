@@ -1,11 +1,31 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace panplay {
+
+class CancelToken {
+ public:
+  void cancel() { cancelled_.store(true); }
+  bool cancelled() const { return cancelled_.load(); }
+
+ private:
+  std::atomic<bool> cancelled_{false};
+};
+
+// 从某个偏移开始顺序读一个网盘文件。
+class ByteStream {
+ public:
+  virtual ~ByteStream() = default;
+  // 返回读到的字节数，0 表示文件结束。出错时设置 error。
+  virtual std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) = 0;
+  // 可以从其他线程调用，让阻塞中的 read 尽快返回。
+  virtual void abort() {}
+};
 
 struct DriveEntry {
   std::string file_id;
@@ -48,7 +68,13 @@ class DrivePlugin {
   virtual bool session_valid() = 0;
   virtual void logout() = 0;
   virtual std::vector<DriveEntry> list(const std::string& path, std::string* error) = 0;
+  // 少量随机读，例如 ZIP 末尾目录。大段数据用 open_stream。
   virtual ReadResult read_at(const std::string& file_id, std::int64_t offset, std::size_t length) = 0;
+  // 默认实现用 read_at 按 1 MB 分段读；网盘插件应该覆盖成一次请求顺序读到底。
+  virtual std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error);
+  // 只读 [offset, offset + length)。读完整段后连接可以复用。默认实现直接用 open_stream，由调用方只读到 length。
+  virtual std::unique_ptr<ByteStream> open_range(const std::string& file_id, std::int64_t offset, std::int64_t length,
+                                                 std::string* error);
 };
 
 struct BaiduConfig {

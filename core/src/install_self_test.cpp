@@ -2,28 +2,49 @@
 
 #include "panplay/dummy_ftp.hpp"
 #include "panplay/library.hpp"
+#include "panplay/prefetch.hpp"
 
 #include <zlib.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace panplay {
 namespace {
 
-class MemoryDrive final : public DrivePlugin {
+using Generator = std::function<void(std::int64_t offset, std::uint8_t* dst, std::size_t size)>;
+
+struct FakeFile {
+  std::int64_t size = 0;
+  Generator fill;
+};
+
+// 内容按偏移现算的假网盘，统计请求次数，可以模拟延迟和断线。
+class FakeDrive final : public DrivePlugin {
  public:
   void add(const std::string& path, std::vector<std::uint8_t> bytes) {
-    files_[path] = std::move(bytes);
+    auto shared = std::make_shared<std::vector<std::uint8_t>>(std::move(bytes));
+    add_generated(path, static_cast<std::int64_t>(shared->size()), [shared](std::int64_t offset, std::uint8_t* dst, std::size_t size) {
+      std::memcpy(dst, shared->data() + offset, size);
+    });
+  }
+
+  void add_generated(const std::string& path, std::int64_t size, Generator fill) {
+    files_[path] = FakeFile{size, std::move(fill)};
     std::string cursor = path;
     while (true) {
       const auto slash = cursor.rfind('/');
@@ -32,6 +53,12 @@ class MemoryDrive final : public DrivePlugin {
       dirs_.insert(cursor);
     }
   }
+
+  std::atomic<int> read_at_calls{0};
+  std::atomic<int> stream_opens{0};
+  std::atomic<int> latency_ms{0};
+  // 下一次打开的流读到这么多字节后断开，只生效一次。
+  std::atomic<std::int64_t> break_next_stream_after{-1};
 
   std::string id() const override { return "memory"; }
   std::string display_name() const override { return "内存"; }
@@ -69,7 +96,7 @@ class MemoryDrive final : public DrivePlugin {
       children[name] = entry;
     };
     for (const auto& dir_path : dirs_) consider(dir_path, true, 0);
-    for (const auto& [file_path, bytes] : files_) consider(file_path, false, static_cast<std::int64_t>(bytes.size()));
+    for (const auto& [file_path, file] : files_) consider(file_path, false, file.size);
     std::vector<DriveEntry> out;
     for (const auto& [name, entry] : children) {
       (void)name;
@@ -79,31 +106,73 @@ class MemoryDrive final : public DrivePlugin {
   }
 
   ReadResult read_at(const std::string& file_id, std::int64_t offset, std::size_t length) override {
+    ++read_at_calls;
+    delay();
     ReadResult result;
     const auto it = files_.find(file_id);
     if (it == files_.end()) {
       result.error = "没有这个文件";
       return result;
     }
-    if (offset < 0 || length == 0 || static_cast<std::uint64_t>(offset) > it->second.size()) {
+    if (offset < 0 || length == 0 || offset > it->second.size) {
       result.error = "读取范围无效";
       return result;
     }
-    const auto start = static_cast<std::size_t>(offset);
-    const auto n = std::min(length, it->second.size() - start);
-    result.bytes.assign(it->second.begin() + static_cast<std::ptrdiff_t>(start),
-                        it->second.begin() + static_cast<std::ptrdiff_t>(start + n));
+    const auto n = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(length), it->second.size - offset));
+    result.bytes.resize(n);
+    it->second.fill(offset, result.bytes.data(), n);
     result.status = 206;
     return result;
   }
 
+  std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error) override {
+    ++stream_opens;
+    delay();
+    const auto it = files_.find(file_id);
+    if (it == files_.end() || offset < 0 || offset > it->second.size) {
+      *error = "没有这个文件";
+      return nullptr;
+    }
+    return std::make_unique<Stream>(it->second, offset, break_next_stream_after.exchange(-1));
+  }
+
  private:
+  class Stream final : public ByteStream {
+   public:
+    Stream(const FakeFile& file, std::int64_t offset, std::int64_t break_after)
+        : file_(file), offset_(offset), break_after_(break_after) {}
+
+    std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) override {
+      if (break_after_ >= 0 && delivered_ >= break_after_) {
+        *error = "模拟断线";
+        return 0;
+      }
+      std::int64_t n = std::min<std::int64_t>(static_cast<std::int64_t>(size), file_.size - offset_);
+      if (break_after_ >= 0) n = std::min(n, break_after_ - delivered_);
+      if (n <= 0) return 0;
+      file_.fill(offset_, dst, static_cast<std::size_t>(n));
+      offset_ += n;
+      delivered_ += n;
+      return static_cast<std::size_t>(n);
+    }
+
+   private:
+    const FakeFile& file_;
+    std::int64_t offset_;
+    std::int64_t break_after_;
+    std::int64_t delivered_ = 0;
+  };
+
+  void delay() const {
+    if (latency_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(latency_ms));
+  }
+
   static std::string trim(std::string path) {
     while (path.size() > 1 && path.back() == '/') path.pop_back();
     return path.empty() ? "/" : path;
   }
 
-  std::map<std::string, std::vector<std::uint8_t>> files_;
+  std::map<std::string, FakeFile> files_;
   std::set<std::string> dirs_;
 };
 
@@ -111,20 +180,29 @@ class CountingSink final : public InstallSink {
  public:
   explicit CountingSink(InstallSink& inner) : inner_(inner) {}
 
-  int stores_ending(const std::string& suffix) const {
+  int writes_ending(const std::string& suffix) const {
     int count = 0;
-    for (const auto& [path, hits] : stores_) {
+    for (const auto& [path, hits] : writes_) {
       if (path.size() >= suffix.size() && path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0) count += hits;
     }
     return count;
   }
+  int writers_opened() const { return writers_; }
 
-  void reset() { stores_.clear(); }
+  void reset() {
+    writes_.clear();
+    writers_ = 0;
+  }
 
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) override {
+    writes_[path] += 1;
+    ++writers_;
+    return inner_.open_writer(path, error);
+  }
   std::string ensure_dir(const std::string& path) override { return inner_.ensure_dir(path); }
   std::int64_t file_size(const std::string& path, std::string* error) override { return inner_.file_size(path, error); }
   std::string store(const std::string& path, const std::uint8_t* data, std::size_t size) override {
-    stores_[path] += 1;
+    writes_[path] += 1;
     return inner_.store(path, data, size);
   }
   std::string append(const std::string& path, const std::uint8_t* data, std::size_t size) override {
@@ -142,7 +220,74 @@ class CountingSink final : public InstallSink {
 
  private:
   InstallSink& inner_;
-  std::map<std::string, int> stores_;
+  std::map<std::string, int> writes_;
+  int writers_ = 0;
+};
+
+// 只记大小的存放位置，大文件不落盘。1 MB 以内的文件保留内容，方便读回进度日志和完成标记。
+class MemorySink final : public InstallSink {
+ public:
+  struct File {
+    std::int64_t size = 0;
+    std::vector<std::uint8_t> bytes;
+  };
+
+  std::map<std::string, File> files;
+
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string*) override {
+    files[path] = File{};
+    return std::make_unique<Writer>(files[path]);
+  }
+  std::string ensure_dir(const std::string&) override { return ""; }
+  std::int64_t file_size(const std::string& path, std::string*) override {
+    const auto it = files.find(path);
+    return it == files.end() ? -1 : it->second.size;
+  }
+  std::string store(const std::string& path, const std::uint8_t* data, std::size_t size) override {
+    files[path] = File{static_cast<std::int64_t>(size), std::vector<std::uint8_t>(data, data + size)};
+    return "";
+  }
+  std::string append(const std::string& path, const std::uint8_t* data, std::size_t size) override {
+    File& file = files[path];
+    file.bytes.insert(file.bytes.end(), data, data + size);
+    file.size += static_cast<std::int64_t>(size);
+    return "";
+  }
+  std::string rename_path(const std::string& from, const std::string& to) override {
+    const auto it = files.find(from);
+    if (it == files.end()) return "没有这个文件";
+    files[to] = std::move(it->second);
+    files.erase(from);
+    return "";
+  }
+  std::string read_file(const std::string& path, std::vector<std::uint8_t>* out, std::size_t) override {
+    const auto it = files.find(path);
+    if (it == files.end()) return "missing";
+    *out = it->second.bytes;
+    return "";
+  }
+  std::vector<std::string> list_children(const std::string&, std::string*) override { return {}; }
+  std::string remove_file(const std::string& path) override {
+    files.erase(path);
+    return "";
+  }
+  std::string remove_dir(const std::string&) override { return ""; }
+
+ private:
+  class Writer final : public FileWriter {
+   public:
+    explicit Writer(File& file) : file_(file) {}
+    std::string write(const std::uint8_t* data, std::size_t size) override {
+      file_.size += static_cast<std::int64_t>(size);
+      if (file_.size <= (1 << 20)) file_.bytes.insert(file_.bytes.end(), data, data + size);
+      else file_.bytes.clear();
+      return "";
+    }
+    std::string finish() override { return ""; }
+
+   private:
+    File& file_;
+  };
 };
 
 void append16(std::vector<std::uint8_t>& out, std::uint16_t value) {
@@ -152,6 +297,15 @@ void append16(std::vector<std::uint8_t>& out, std::uint16_t value) {
 
 void append32(std::vector<std::uint8_t>& out, std::uint32_t value) {
   for (int shift = 0; shift < 32; shift += 8) out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xff));
+}
+
+void append64(std::vector<std::uint8_t>& out, std::uint64_t value) {
+  for (int shift = 0; shift < 64; shift += 8) out.push_back(static_cast<std::uint8_t>((value >> shift) & 0xff));
+}
+
+std::uint32_t crc_of(const std::vector<std::uint8_t>& data) {
+  return static_cast<std::uint32_t>(
+      ::crc32(::crc32(0L, Z_NULL, 0), data.empty() ? Z_NULL : data.data(), static_cast<uInt>(data.size())));
 }
 
 std::vector<std::uint8_t> raw_deflate(const std::vector<std::uint8_t>& data) {
@@ -178,91 +332,144 @@ struct ZipInput {
   bool deflate = false;
 };
 
-std::vector<std::uint8_t> make_zip(const std::vector<ZipInput>& members) {
+struct ZipLayout {
+  // 强制写 ZIP64 字段和 ZIP64 目录结束记录。
+  bool zip64 = false;
+  // 本地文件头不写大小，数据后面跟数据描述符。
+  bool descriptor = false;
+  // 大于 0 时按这个大小切成跨卷 ZIP（.z01 … .zip），偏移按卷号分开记。
+  std::size_t span = 0;
+};
+
+// 生成测试 ZIP。跨卷时返回每一卷，否则只有一个元素。
+std::vector<std::vector<std::uint8_t>> make_zip(const std::vector<ZipInput>& members, const ZipLayout& layout) {
   struct Meta {
     std::string name;
     std::uint16_t method = 0;
     std::uint32_t crc = 0;
-    std::uint32_t comp_size = 0;
-    std::uint32_t uncomp_size = 0;
-    std::uint32_t local_offset = 0;
-    std::vector<std::uint8_t> payload;
+    std::uint64_t comp_size = 0;
+    std::uint64_t uncomp_size = 0;
+    std::uint64_t local = 0;
   };
-  std::vector<Meta> metas;
   std::vector<std::uint8_t> out;
+  if (layout.span > 0) append32(out, 0x08074b50);
+  const auto disk_of = [&](std::uint64_t position) -> std::uint32_t {
+    return layout.span > 0 ? static_cast<std::uint32_t>(position / layout.span) : 0;
+  };
+  const auto offset_in_disk = [&](std::uint64_t position) -> std::uint64_t {
+    return layout.span > 0 ? position % layout.span : position;
+  };
+  const std::uint16_t flags = layout.descriptor ? 8 : 0;
+  std::vector<Meta> metas;
   for (const auto& member : members) {
     Meta meta;
     meta.name = member.name;
-    meta.uncomp_size = static_cast<std::uint32_t>(member.data.size());
-    meta.crc = static_cast<std::uint32_t>(::crc32(::crc32(0L, Z_NULL, 0), member.data.empty() ? Z_NULL : member.data.data(),
-                                                 static_cast<uInt>(member.data.size())));
-    if (member.deflate) {
-      meta.method = 8;
-      meta.payload = raw_deflate(member.data);
-    } else {
-      meta.method = 0;
-      meta.payload = member.data;
-    }
-    meta.comp_size = static_cast<std::uint32_t>(meta.payload.size());
-    meta.local_offset = static_cast<std::uint32_t>(out.size());
+    meta.uncomp_size = member.data.size();
+    meta.crc = crc_of(member.data);
+    const std::vector<std::uint8_t> payload = member.deflate ? raw_deflate(member.data) : member.data;
+    meta.method = member.deflate ? 8 : 0;
+    meta.comp_size = payload.size();
+    meta.local = out.size();
     append32(out, 0x04034b50);
-    append16(out, 20);
-    append16(out, 0);
+    append16(out, 45);
+    append16(out, flags);
     append16(out, meta.method);
     append16(out, 0);
     append16(out, 0);
-    append32(out, meta.crc);
-    append32(out, meta.comp_size);
-    append32(out, meta.uncomp_size);
+    append32(out, layout.descriptor ? 0 : meta.crc);
+    append32(out, layout.descriptor ? 0 : static_cast<std::uint32_t>(meta.comp_size));
+    append32(out, layout.descriptor ? 0 : static_cast<std::uint32_t>(meta.uncomp_size));
     append16(out, static_cast<std::uint16_t>(meta.name.size()));
     append16(out, 0);
     out.insert(out.end(), meta.name.begin(), meta.name.end());
-    out.insert(out.end(), meta.payload.begin(), meta.payload.end());
+    out.insert(out.end(), payload.begin(), payload.end());
+    if (layout.descriptor) {
+      append32(out, 0x08074b50);
+      append32(out, meta.crc);
+      append32(out, static_cast<std::uint32_t>(meta.comp_size));
+      append32(out, static_cast<std::uint32_t>(meta.uncomp_size));
+    }
     metas.push_back(std::move(meta));
   }
-  const auto central = static_cast<std::uint32_t>(out.size());
+  const std::uint64_t central = out.size();
   for (const auto& meta : metas) {
     append32(out, 0x02014b50);
-    append16(out, 20);
-    append16(out, 20);
-    append16(out, 0);
+    append16(out, 45);
+    append16(out, 45);
+    append16(out, flags);
     append16(out, meta.method);
     append16(out, 0);
     append16(out, 0);
     append32(out, meta.crc);
-    append32(out, meta.comp_size);
-    append32(out, meta.uncomp_size);
+    append32(out, layout.zip64 ? 0xffffffffu : static_cast<std::uint32_t>(meta.comp_size));
+    append32(out, layout.zip64 ? 0xffffffffu : static_cast<std::uint32_t>(meta.uncomp_size));
     append16(out, static_cast<std::uint16_t>(meta.name.size()));
+    append16(out, static_cast<std::uint16_t>(layout.zip64 ? 4 + 28 : 0));
     append16(out, 0);
-    append16(out, 0);
-    append16(out, 0);
+    append16(out, layout.zip64 ? 0xffff : static_cast<std::uint16_t>(disk_of(meta.local)));
     append16(out, 0);
     append32(out, 0);
-    append32(out, meta.local_offset);
+    append32(out, layout.zip64 ? 0xffffffffu : static_cast<std::uint32_t>(offset_in_disk(meta.local)));
     out.insert(out.end(), meta.name.begin(), meta.name.end());
+    if (layout.zip64) {
+      append16(out, 0x0001);
+      append16(out, 28);
+      append64(out, meta.uncomp_size);
+      append64(out, meta.comp_size);
+      append64(out, offset_in_disk(meta.local));
+      append32(out, disk_of(meta.local));
+    }
   }
-  const auto central_size = static_cast<std::uint32_t>(out.size() - central);
+  const std::uint64_t central_size = out.size() - central;
+  const std::uint64_t zip64_record = out.size();
+  const std::uint64_t end_record = zip64_record + (layout.zip64 ? 56 + 20 : 0);
+  const std::uint32_t last_disk = disk_of(end_record);
+  if (layout.zip64) {
+    append32(out, 0x06064b50);
+    append64(out, 44);
+    append16(out, 45);
+    append16(out, 45);
+    append32(out, last_disk);
+    append32(out, disk_of(central));
+    append64(out, metas.size());
+    append64(out, metas.size());
+    append64(out, central_size);
+    append64(out, offset_in_disk(central));
+    append32(out, 0x07064b50);
+    append32(out, disk_of(zip64_record));
+    append64(out, offset_in_disk(zip64_record));
+    append32(out, last_disk + 1);
+  }
   append32(out, 0x06054b50);
+  append16(out, layout.zip64 ? 0xffff : static_cast<std::uint16_t>(last_disk));
+  append16(out, layout.zip64 ? 0xffff : static_cast<std::uint16_t>(disk_of(central)));
+  append16(out, layout.zip64 ? 0xffff : static_cast<std::uint16_t>(metas.size()));
+  append16(out, layout.zip64 ? 0xffff : static_cast<std::uint16_t>(metas.size()));
+  append32(out, layout.zip64 ? 0xffffffffu : static_cast<std::uint32_t>(central_size));
+  append32(out, layout.zip64 ? 0xffffffffu : static_cast<std::uint32_t>(offset_in_disk(central)));
   append16(out, 0);
-  append16(out, 0);
-  append16(out, static_cast<std::uint16_t>(metas.size()));
-  append16(out, static_cast<std::uint16_t>(metas.size()));
-  append32(out, central_size);
-  append32(out, central);
-  append16(out, 0);
-  return out;
+
+  if (layout.span == 0) return {out};
+  if (disk_of(out.size() - 1) != last_disk) return {};
+  std::vector<std::vector<std::uint8_t>> volumes;
+  for (std::size_t offset = 0; offset < out.size(); offset += layout.span) {
+    const std::size_t n = std::min(layout.span, out.size() - offset);
+    volumes.emplace_back(out.begin() + static_cast<std::ptrdiff_t>(offset), out.begin() + static_cast<std::ptrdiff_t>(offset + n));
+  }
+  return volumes;
 }
 
-std::vector<std::vector<std::uint8_t>> split_marked(const std::vector<std::uint8_t>& zip, std::size_t chunk) {
-  std::vector<std::vector<std::uint8_t>> parts;
-  for (std::size_t offset = 0; offset < zip.size(); offset += chunk) {
-    std::vector<std::uint8_t> part{0x50, 0x4b, 0x07, 0x08};
-    const std::size_t n = std::min(chunk, zip.size() - offset);
-    part.insert(part.end(), zip.begin() + static_cast<std::ptrdiff_t>(offset),
-                zip.begin() + static_cast<std::ptrdiff_t>(offset + n));
-    parts.push_back(std::move(part));
+void add_spanned(FakeDrive& drive, const std::string& dir, const std::string& stem,
+                 const std::vector<std::vector<std::uint8_t>>& volumes) {
+  for (std::size_t i = 0; i < volumes.size(); ++i) {
+    char name[64];
+    if (i + 1 == volumes.size()) {
+      std::snprintf(name, sizeof(name), "%s.zip", stem.c_str());
+    } else {
+      std::snprintf(name, sizeof(name), "%s.z%02d", stem.c_str(), static_cast<int>(i + 1));
+    }
+    drive.add(dir + "/" + name, volumes[i]);
   }
-  return parts;
 }
 
 int fail(const std::string& message) {
@@ -270,9 +477,13 @@ int fail(const std::string& message) {
   return 1;
 }
 
-bool same_bytes(const std::vector<std::uint8_t>& left, const std::vector<std::uint8_t>& right) { return left == right; }
+std::vector<std::uint8_t> pattern(std::size_t size, std::uint8_t seed) {
+  std::vector<std::uint8_t> bytes(size);
+  for (std::size_t i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(seed + i * 7 + (i >> 8));
+  return bytes;
+}
 
-int resume_on(InstallSink& raw, MemoryDrive& drive, const std::vector<std::uint8_t>& param, const std::vector<std::uint8_t>& eboot,
+int resume_on(InstallSink& raw, FakeDrive& drive, const std::vector<std::uint8_t>& param, const std::vector<std::uint8_t>& eboot,
               const std::filesystem::path& disk_root) {
   CountingSink sink(raw);
   InstallRequest request;
@@ -285,7 +496,7 @@ int resume_on(InstallSink& raw, MemoryDrive& drive, const std::vector<std::uint8
   const std::string partial = "/mnt/usb0/homebrew/.panplay-staging/CUSA12345/eboot.bin";
   if (sink.file_size(partial, &error) != 50 || !error.empty()) return fail("中断时第二个文件不是 50 字节");
   std::vector<std::uint8_t> journal;
-  error = sink.read_file("/mnt/usb0/homebrew/.panplay-staging/CUSA12345/.panplay-journal.json", &journal, 1 << 20);
+  error = sink.read_file("/mnt/usb0/homebrew/.panplay-staging/CUSA12345/.panplay-journal.jsonl", &journal, 1 << 20);
   if (!error.empty()) return fail(error);
   const std::string journal_text(journal.begin(), journal.end());
   if (journal_text.find("param.sfo") == std::string::npos || journal_text.find("eboot.bin") != std::string::npos) {
@@ -296,20 +507,20 @@ int resume_on(InstallSink& raw, MemoryDrive& drive, const std::vector<std::uint8
   request.stop_after_output_bytes = -1;
   InstallResult second = install_game(drive, sink, request);
   if (second.status != "installed" || second.files_done != 2) return fail("继续后没有装完: " + second.message);
-  if (sink.stores_ending("/param.sfo") != 0) return fail("已校验文件被重写了");
-  if (sink.stores_ending("/eboot.bin") < 1) return fail("未完成文件没有继续写");
+  if (sink.writes_ending("/param.sfo") != 0) return fail("已校验文件被重写了");
+  if (sink.writes_ending("/eboot.bin") != 1) return fail("未完成文件没有从头重写一次");
 
   std::vector<std::uint8_t> got_param;
   std::vector<std::uint8_t> got_eboot;
   error = sink.read_file("/mnt/usb0/homebrew/CUSA12345/param.sfo", &got_param, 1 << 20);
-  if (!error.empty() || !same_bytes(got_param, param)) return fail("param.sfo 内容不对");
+  if (!error.empty() || got_param != param) return fail("param.sfo 内容不对");
   error = sink.read_file("/mnt/usb0/homebrew/CUSA12345/eboot.bin", &got_eboot, 1 << 20);
-  if (!error.empty() || !same_bytes(got_eboot, eboot)) return fail("eboot.bin 内容不对");
+  if (!error.empty() || got_eboot != eboot) return fail("eboot.bin 内容不对");
 
   sink.reset();
   InstallResult third = install_game(drive, sink, request);
   if (third.status != "already") return fail("完成后再次安装没有显示已安装");
-  if (sink.stores_ending("/param.sfo") != 0 || sink.stores_ending("/eboot.bin") != 0) return fail("已安装后又写了游戏文件");
+  if (sink.writes_ending("/param.sfo") != 0 || sink.writes_ending("/eboot.bin") != 0) return fail("已安装后又写了游戏文件");
 
   for (const auto& entry : std::filesystem::recursive_directory_iterator(disk_root)) {
     if (!entry.is_regular_file()) continue;
@@ -321,6 +532,331 @@ int resume_on(InstallSink& raw, MemoryDrive& drive, const std::vector<std::uint8
   return 0;
 }
 
+int prefetch_tests() {
+  FakeDrive drive;
+  const std::int64_t size = (64ll << 20) + 12345;
+  const auto byte_at = [](std::int64_t offset) { return static_cast<std::uint8_t>((offset * 131) ^ (offset >> 13)); };
+  drive.add_generated("/big.bin", size, [&](std::int64_t offset, std::uint8_t* dst, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) dst[i] = byte_at(offset + static_cast<std::int64_t>(i));
+  });
+  PrefetchOptions options;
+  options.retry_base_ms = 1;
+  options.connections = 1;
+  options.block_size = 4u << 20;
+  options.max_blocks = 8;
+
+  {
+    PrefetchReader reader(drive, "/big.bin", size, nullptr, options);
+    std::vector<std::uint8_t> buffer(7919);
+    std::int64_t at = 0;
+    while (true) {
+      std::string error;
+      const std::size_t got = reader.read(buffer.data(), buffer.size(), &error);
+      if (!error.empty()) return fail(error);
+      if (got == 0) break;
+      for (std::size_t i = 0; i < got; i += 997) {
+        if (buffer[i] != byte_at(at + static_cast<std::int64_t>(i))) return fail("预读数据不对");
+      }
+      at += static_cast<std::int64_t>(got);
+    }
+    if (at != size) return fail("预读没有读到文件结尾");
+    if (drive.stream_opens != 1 || drive.read_at_calls != 0) {
+      return fail("顺序读 64 MB 打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
+    }
+  }
+
+  drive.stream_opens = 0;
+  drive.break_next_stream_after = 10ll << 20;
+  {
+    PrefetchReader reader(drive, "/big.bin", size, nullptr, options);
+    if (auto error = reader.seek(1000); !error.empty()) return fail(error);
+    std::vector<std::uint8_t> buffer(1 << 20);
+    std::int64_t at = 1000;
+    while (true) {
+      std::string error;
+      const std::size_t got = reader.read(buffer.data(), buffer.size(), &error);
+      if (!error.empty()) return fail("断线后没有自动重连: " + error);
+      if (got == 0) break;
+      if (buffer[0] != byte_at(at) || buffer[got - 1] != byte_at(at + static_cast<std::int64_t>(got) - 1)) {
+        return fail("断线重连后数据错位");
+      }
+      at += static_cast<std::int64_t>(got);
+    }
+    if (at != size) return fail("断线重连后没有读完");
+    if (drive.stream_opens != 2) return fail("断线一次应该重连一次，实际打开 " + std::to_string(drive.stream_opens.load()) + " 次");
+  }
+
+  drive.stream_opens = 0;
+  {
+    PrefetchReader reader(drive, "/big.bin", size, nullptr, options);
+    std::uint8_t byte = 0;
+    std::string error;
+    reader.read(&byte, 1, &error);
+    if (auto seek_error = reader.seek(100); !seek_error.empty()) return fail(seek_error);
+    reader.read(&byte, 1, &error);
+    if (!error.empty() || byte != byte_at(100)) return fail("缓冲内向前跳转后数据不对");
+    if (auto seek_error = reader.seek(3ll << 20); !seek_error.empty()) return fail(seek_error);
+    reader.read(&byte, 1, &error);
+    if (!error.empty() || byte != byte_at(3ll << 20)) return fail("近距离向前跳转后数据不对");
+    if (drive.stream_opens != 1) return fail("近距离向前跳转不该重连");
+    if (auto seek_error = reader.seek((3ll << 20) - 50); !seek_error.empty()) return fail(seek_error);
+    reader.read(&byte, 1, &error);
+    if (!error.empty() || byte != byte_at((3ll << 20) - 50)) return fail("块内往回跳后数据不对");
+    if (auto seek_error = reader.seek((4ll << 20) + 20); !seek_error.empty()) return fail(seek_error);
+    reader.read(&byte, 1, &error);
+    if (auto seek_error = reader.seek((4ll << 20) - 30); !seek_error.empty()) return fail(seek_error);
+    std::vector<std::uint8_t> span(100);
+    std::size_t got_span = 0;
+    while (got_span < span.size()) {
+      const std::size_t got = reader.read(span.data() + got_span, span.size() - got_span, &error);
+      if (got == 0) break;
+      got_span += got;
+    }
+    for (std::size_t i = 0; i < span.size(); ++i) {
+      if (span[i] != byte_at((4ll << 20) - 30 + static_cast<std::int64_t>(i))) return fail("跨块往回跳后数据不对");
+    }
+    if (drive.stream_opens != 1) return fail("往回跳一小段不该重连");
+    if (auto seek_error = reader.seek(60ll << 20); !seek_error.empty()) return fail(seek_error);
+    reader.read(&byte, 1, &error);
+    if (!error.empty() || byte != byte_at(60ll << 20)) return fail("远距离跳转后数据不对");
+    if (drive.stream_opens != 2) return fail("跳转次数不对");
+  }
+
+  for (const int connections : {2, 4}) {
+    PrefetchOptions multi = options;
+    multi.connections = connections;
+    multi.max_blocks = static_cast<std::size_t>(connections) * 2;
+    drive.stream_opens = 0;
+    drive.latency_ms = 2;
+    drive.break_next_stream_after = 3ll << 20;
+    PrefetchReader reader(drive, "/big.bin", size, nullptr, multi);
+    if (auto error = reader.seek(777); !error.empty()) return fail(error);
+    std::vector<std::uint8_t> buffer(300000);
+    std::int64_t at = 777;
+    bool jumped = false;
+    while (true) {
+      std::string error;
+      const std::size_t got = reader.read(buffer.data(), buffer.size(), &error);
+      if (!error.empty()) return fail("多连接读取出错: " + error);
+      if (got == 0) break;
+      for (std::size_t i = 0; i < got; i += 4099) {
+        if (buffer[i] != byte_at(at + static_cast<std::int64_t>(i))) return fail("多连接数据顺序不对");
+      }
+      if (buffer[got - 1] != byte_at(at + static_cast<std::int64_t>(got) - 1)) return fail("多连接数据顺序不对");
+      at += static_cast<std::int64_t>(got);
+      if (!jumped && at > (20ll << 20)) {
+        jumped = true;
+        at = 5ll << 20;
+        if (auto seek_error = reader.seek(at); !seek_error.empty()) return fail(seek_error);
+      }
+    }
+    drive.latency_ms = 0;
+    if (at != size) return fail("多连接没有读到文件结尾");
+  }
+
+  {
+    CancelToken cancel;
+    drive.latency_ms = 50;
+    PrefetchReader reader(drive, "/big.bin", size, &cancel, options);
+    cancel.cancel();
+    std::uint8_t byte = 0;
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    reader.read(&byte, 1, &error);
+    const auto spent = std::chrono::steady_clock::now() - started;
+    drive.latency_ms = 0;
+    if (error != "interrupted") return fail("取消后没有返回中断");
+    if (spent > std::chrono::seconds(1)) return fail("取消后没有很快停下");
+  }
+  return 0;
+}
+
+int many_files_test() {
+  FakeDrive drive;
+  std::vector<ZipInput> inputs;
+  for (int i = 0; i < 3000; ++i) {
+    inputs.push_back({"data/file" + std::to_string(i) + ".bin", pattern(static_cast<std::size_t>(100 + i % 700), static_cast<std::uint8_t>(i)),
+                      i % 3 == 0});
+  }
+  const auto zip = make_zip(inputs, {});
+  drive.add("/apps/panplay/Many CUSA30000/game.zip", zip.front());
+  MemorySink memory;
+  CountingSink sink(memory);
+  InstallRequest request;
+  request.source_dir = "/apps/panplay/Many CUSA30000";
+  request.prefetch.connections = 1;
+  const InstallResult result = install_game(drive, sink, request);
+  if (result.status != "installed" || result.files_total != 3000) return fail("3000 个小文件没有装完: " + result.message);
+  if (drive.read_at_calls > 4) return fail("读 ZIP 目录用了 " + std::to_string(drive.read_at_calls.load()) + " 次随机读");
+  if (drive.stream_opens > 2) return fail("顺序解压打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
+  if (sink.writers_opened() != 3000) return fail("每个文件应该只开一次写入流");
+  const auto& sample = memory.files["/mnt/usb0/homebrew/CUSA30000/data/file2999.bin"];
+  if (sample.bytes != inputs.back().data) return fail("最后一个文件内容不对");
+  return 0;
+}
+
+int zip64_split_test() {
+  FakeDrive drive;
+  const auto first = pattern(300000, 3);
+  const auto second = pattern(5000, 11);
+  ZipLayout layout;
+  layout.zip64 = true;
+  layout.descriptor = true;
+  const auto zip = make_zip({{"sce_sys/param.json", second, true}, {"eboot.bin", first, false}}, layout);
+  const auto& bytes = zip.front();
+  const std::size_t half = bytes.size() / 2;
+  drive.add("/apps/panplay/Raw PPSA40000/game.zip.001", std::vector<std::uint8_t>(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(half)));
+  drive.add("/apps/panplay/Raw PPSA40000/game.zip.002", std::vector<std::uint8_t>(bytes.begin() + static_cast<std::ptrdiff_t>(half), bytes.end()));
+  MemorySink sink;
+  InstallRequest request;
+  request.source_dir = "/apps/panplay/Raw PPSA40000";
+  const InstallResult result = install_game(drive, sink, request);
+  if (result.status != "installed") return fail("ZIP64 加数据描述符的切分包没有装上: " + result.message);
+  if (sink.files["/mnt/usb0/homebrew/PPSA40000/eboot.bin"].bytes != first) return fail("ZIP64 包里的大文件内容不对");
+  if (sink.files["/mnt/usb0/homebrew/PPSA40000/sce_sys/param.json"].bytes != second) return fail("ZIP64 包里的压缩文件内容不对");
+  return 0;
+}
+
+int large_file_test() {
+  // 一个超过 4 GB 的文件，存储方式，ZIP64。内容是重复的 1 MB 块，CRC 用 crc32_combine 直接算。
+  constexpr std::int64_t kBlock = 1 << 20;
+  constexpr std::int64_t kBlocks = 4 * 1024 + 300;
+  constexpr std::int64_t kSize = kBlock * kBlocks;
+  const auto block = pattern(static_cast<std::size_t>(kBlock), 5);
+  const auto block_crc = static_cast<std::uint32_t>(::crc32(::crc32(0L, Z_NULL, 0), block.data(), static_cast<uInt>(block.size())));
+  uLong crc = block_crc;
+  for (std::int64_t i = 1; i < kBlocks; ++i) crc = ::crc32_combine(crc, block_crc, static_cast<z_off_t>(kBlock));
+  const std::string name = "image0.dat";
+
+  std::vector<std::uint8_t> head;
+  append32(head, 0x04034b50);
+  append16(head, 45);
+  append16(head, 0);
+  append16(head, 0);
+  append32(head, 0);
+  append32(head, static_cast<std::uint32_t>(crc));
+  append32(head, 0xffffffffu);
+  append32(head, 0xffffffffu);
+  append16(head, static_cast<std::uint16_t>(name.size()));
+  append16(head, 20);
+  head.insert(head.end(), name.begin(), name.end());
+  append16(head, 0x0001);
+  append16(head, 16);
+  append64(head, static_cast<std::uint64_t>(kSize));
+  append64(head, static_cast<std::uint64_t>(kSize));
+
+  std::vector<std::uint8_t> tail;
+  append32(tail, 0x02014b50);
+  append16(tail, 45);
+  append16(tail, 45);
+  append16(tail, 0);
+  append16(tail, 0);
+  append32(tail, 0);
+  append32(tail, static_cast<std::uint32_t>(crc));
+  append32(tail, 0xffffffffu);
+  append32(tail, 0xffffffffu);
+  append16(tail, static_cast<std::uint16_t>(name.size()));
+  append16(tail, 4 + 24);
+  append16(tail, 0);
+  append16(tail, 0);
+  append16(tail, 0);
+  append32(tail, 0);
+  append32(tail, 0xffffffffu);
+  tail.insert(tail.end(), name.begin(), name.end());
+  append16(tail, 0x0001);
+  append16(tail, 24);
+  append64(tail, static_cast<std::uint64_t>(kSize));
+  append64(tail, static_cast<std::uint64_t>(kSize));
+  append64(tail, 0);
+  const std::uint64_t central = head.size() + static_cast<std::uint64_t>(kSize);
+  const std::uint64_t central_size = tail.size();
+  const std::uint64_t zip64_record = central + central_size;
+  append32(tail, 0x06064b50);
+  append64(tail, 44);
+  append16(tail, 45);
+  append16(tail, 45);
+  append32(tail, 0);
+  append32(tail, 0);
+  append64(tail, 1);
+  append64(tail, 1);
+  append64(tail, central_size);
+  append64(tail, central);
+  append32(tail, 0x07064b50);
+  append32(tail, 0);
+  append64(tail, zip64_record);
+  append32(tail, 1);
+  append32(tail, 0x06054b50);
+  append16(tail, 0);
+  append16(tail, 0);
+  append16(tail, 0xffff);
+  append16(tail, 0xffff);
+  append32(tail, 0xffffffffu);
+  append32(tail, 0xffffffffu);
+  append16(tail, 0);
+
+  const std::int64_t head_size = static_cast<std::int64_t>(head.size());
+  const std::int64_t total = head_size + kSize + static_cast<std::int64_t>(tail.size());
+  FakeDrive drive;
+  drive.add_generated("/apps/panplay/Huge PPSA50000/game.zip", total, [&](std::int64_t offset, std::uint8_t* dst, std::size_t n) {
+    while (n > 0) {
+      std::size_t step = 0;
+      if (offset < head_size) {
+        step = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(n), head_size - offset));
+        std::memcpy(dst, head.data() + offset, step);
+      } else if (offset < head_size + kSize) {
+        const std::int64_t in_block = (offset - head_size) % kBlock;
+        step = static_cast<std::size_t>(std::min<std::int64_t>({static_cast<std::int64_t>(n), kBlock - in_block,
+                                                                head_size + kSize - offset}));
+        std::memcpy(dst, block.data() + in_block, step);
+      } else {
+        const std::int64_t at = offset - head_size - kSize;
+        step = n;
+        std::memcpy(dst, tail.data() + at, step);
+      }
+      dst += step;
+      offset += static_cast<std::int64_t>(step);
+      n -= step;
+    }
+  });
+  MemorySink sink;
+  InstallRequest request;
+  request.source_dir = "/apps/panplay/Huge PPSA50000";
+  request.prefetch.connections = 1;
+  const auto started = std::chrono::steady_clock::now();
+  const InstallResult result = install_game(drive, sink, request);
+  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  if (result.status != "installed") return fail("超过 4 GB 的文件没有装上: " + result.message);
+  if (sink.files["/mnt/usb0/homebrew/PPSA50000/image0.dat"].size != kSize) return fail("超过 4 GB 的文件大小不对");
+  if (drive.stream_opens != 1) return fail("5 GB 文件打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
+  std::cout << "  超过 4 GB 的单文件：" << (kSize >> 20) << " MB，" << seconds << " 秒，网盘随机读 " << drive.read_at_calls
+            << " 次，读取流 " << drive.stream_opens << " 次\n";
+  return 0;
+}
+
+int cancel_install_test() {
+  FakeDrive drive;
+  std::vector<ZipInput> inputs;
+  for (int i = 0; i < 20; ++i) inputs.push_back({"f" + std::to_string(i), pattern(5000, static_cast<std::uint8_t>(i)), false});
+  drive.add("/apps/panplay/Stop CUSA60000/game.zip", make_zip(inputs, {}).front());
+  MemorySink sink;
+  CancelToken cancel;
+  InstallRequest request;
+  request.source_dir = "/apps/panplay/Stop CUSA60000";
+  request.cancel = &cancel;
+  request.on_progress = [&](const InstallResult& snapshot) {
+    if (snapshot.files_done >= 3) cancel.cancel();
+  };
+  const InstallResult stopped = install_game(drive, sink, request);
+  if (stopped.status != "interrupted" || stopped.files_done < 3 || stopped.files_done >= 20) {
+    return fail("取消安装后状态不对: " + stopped.status + " " + std::to_string(stopped.files_done));
+  }
+  InstallRequest again;
+  again.source_dir = request.source_dir;
+  const InstallResult finished = install_game(drive, sink, again);
+  if (finished.status != "installed") return fail("取消后继续没有装完: " + finished.message);
+  return 0;
+}
+
 }  // namespace
 
 int run_install_pipeline_self_test() {
@@ -329,22 +865,17 @@ int run_install_pipeline_self_test() {
   std::vector<std::uint8_t> eboot(8000);
   for (std::size_t i = 0; i < eboot.size(); ++i) eboot[i] = static_cast<std::uint8_t>(9 + i);
   const std::vector<std::uint8_t> hello{'h', 'e', 'l', 'l', 'o'};
-  const auto split_zip = make_zip({{"param.sfo", param, false}, {"eboot.bin", eboot, true}});
-  if (split_zip.empty()) return fail("没有生成测试压缩包");
-  const auto parts = split_marked(split_zip, 500);
-  if (parts.size() < 2) return fail("分卷没有切开");
-  const auto single_zip = make_zip({{"hello.txt", hello, false}});
-
-  MemoryDrive drive;
-  for (std::size_t i = 0; i < parts.size(); ++i) {
-    char name[32];
-    if (i + 1 == parts.size()) {
-      std::snprintf(name, sizeof(name), "disc.zip");
-    } else {
-      std::snprintf(name, sizeof(name), "disc.z%02d", static_cast<int>(i + 1));
-    }
-    drive.add(std::string("/apps/panplay/Demo CUSA12345/") + name, parts[i]);
+  std::vector<std::vector<std::uint8_t>> parts;
+  for (std::size_t span = 97; span < 400 && parts.size() < 3; span += 13) {
+    ZipLayout spanned;
+    spanned.span = span;
+    parts = make_zip({{"param.sfo", param, false}, {"eboot.bin", eboot, true}}, spanned);
   }
+  if (parts.size() < 3) return fail("跨卷 ZIP 没有切开");
+  const auto single_zip = make_zip({{"hello.txt", hello, false}}, {}).front();
+
+  FakeDrive drive;
+  add_spanned(drive, "/apps/panplay/Demo CUSA12345", "disc", parts);
   drive.add("/apps/panplay/Nested CUSA99999/inner/alone.zip", single_zip);
   drive.add("/apps/panplay/Old/game.7z", std::vector<std::uint8_t>{1, 2, 3, 4});
   drive.add("/apps/panplay/Single CUSA00001/game.zip", single_zip);
@@ -397,7 +928,7 @@ int run_install_pipeline_self_test() {
 
   InstallRequest rejected;
   rejected.source_dir = "/apps/panplay/Old";
-  auto local_probe = make_local_sink(std::filesystem::temp_directory_path().string());
+  auto local_probe = make_local_sink(std::filesystem::temp_directory_path().u8string());
   InstallResult only_7z = install_game(drive, *local_probe, rejected);
   if (only_7z.status != "error" || only_7z.message.find("7z") == std::string::npos) return fail("7z 没有被拒绝");
 
@@ -414,7 +945,7 @@ int run_install_pipeline_self_test() {
 
   {
     const auto local_root = root / "local";
-    auto local = make_local_sink(local_root.string());
+    auto local = make_local_sink(local_root.u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Single CUSA00001";
     request.dest_prefix = "/mnt/usb0/homebrew";
@@ -449,7 +980,7 @@ int run_install_pipeline_self_test() {
   }
 
   {
-    auto local = make_local_sink((root / "rar").string());
+    auto local = make_local_sink((root / "rar").u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Rar CUSA77777";
     request.dest_prefix = "/mnt/usb0/homebrew";
@@ -463,7 +994,116 @@ int run_install_pipeline_self_test() {
     if (again.status != "already") return fail("RAR 安装后没有显示已安装");
   }
 
+  if (const int code = prefetch_tests()) return code;
+  if (const int code = many_files_test()) return code;
+  if (const int code = zip64_split_test()) return code;
+  if (const int code = cancel_install_test()) return code;
+  if (const int code = large_file_test()) return code;
+
   std::cout << "self-test ok\n";
+  return 0;
+}
+
+namespace {
+
+// 模拟网盘下载：首包延迟、带宽上限、偶尔卡顿。
+class SimDrive final : public DrivePlugin {
+ public:
+  SimDrive(double mb_per_second, std::int64_t size) : rate_(mb_per_second * 1024 * 1024), size_(size) {}
+  std::string id() const override { return "sim"; }
+  std::string display_name() const override { return "sim"; }
+  LoginChallenge start_login() override { return {}; }
+  LoginPoll poll_login(const LoginChallenge&) override { return {}; }
+  bool session_valid() override { return true; }
+  void logout() override {}
+  std::vector<DriveEntry> list(const std::string&, std::string*) override { return {}; }
+  ReadResult read_at(const std::string&, std::int64_t, std::size_t) override { return {}; }
+  std::unique_ptr<ByteStream> open_stream(const std::string&, std::int64_t offset, std::string*) override {
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    return std::make_unique<Stream>(rate_, size_ - offset);
+  }
+
+ private:
+  class Stream final : public ByteStream {
+   public:
+    Stream(double rate, std::int64_t left) : rate_(rate), left_(left), ready_(std::chrono::steady_clock::now()) {}
+    std::size_t read(std::uint8_t*, std::size_t size, std::string*) override {
+      const std::size_t n = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), left_));
+      if (n == 0) return 0;
+      sent_ += static_cast<std::int64_t>(n);
+      left_ -= static_cast<std::int64_t>(n);
+      double cost = static_cast<double>(n) / rate_;
+      // 每 48 MB 卡 400 ms，模拟 CDN 抖动。
+      if (sent_ / (48 << 20) != (sent_ - static_cast<std::int64_t>(n)) / (48 << 20)) cost += 0.4;
+      // 两次读之间隔得久，说明是缓冲满了在等，这段带宽浪费掉，不能攒着用。
+      const auto now = std::chrono::steady_clock::now();
+      if (now - returned_ > std::chrono::milliseconds(5)) ready_ = std::max(ready_, now);
+      ready_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(cost));
+      std::this_thread::sleep_until(ready_);
+      returned_ = std::chrono::steady_clock::now();
+      return n;
+    }
+
+   private:
+    double rate_;
+    std::int64_t left_;
+    std::int64_t sent_ = 0;
+    std::chrono::steady_clock::time_point ready_;
+    std::chrono::steady_clock::time_point returned_;
+  };
+
+  double rate_;
+  std::int64_t size_;
+};
+
+}  // namespace
+
+int run_prefetch_bench() {
+  constexpr std::int64_t kSize = 256ll << 20;
+  struct Scene {
+    double download;
+    double write;
+  };
+  struct Config {
+    std::size_t block;
+    std::size_t blocks;
+  };
+  const Scene scenes[] = {{40.0, 60.0}, {60.0, 60.0}};
+  const Config configs[] = {{256u << 10, 1}, {4u << 20, 1}, {4u << 20, 2}, {4u << 20, 4}, {4u << 20, 8}, {4u << 20, 16}, {8u << 20, 8}};
+  for (const auto& scene : scenes) {
+    std::cout << "下载 " << scene.download << " MB/s（每 48 MB 卡 0.4 秒），写入 " << scene.write
+              << " MB/s（每 32 MB 换文件卡 0.3 秒），共 " << (kSize >> 20) << " MB，理想 "
+              << static_cast<double>(kSize >> 20) / scene.download + 5 * 0.4 << " 秒\n";
+    for (const auto& config : configs) {
+      SimDrive drive(scene.download, kSize);
+      PrefetchOptions options;
+      options.connections = 1;
+      options.block_size = config.block;
+      options.max_blocks = config.blocks;
+      PrefetchReader reader(drive, "x", kSize, nullptr, options);
+      std::vector<std::uint8_t> buffer(64u << 10);
+      const auto start = std::chrono::steady_clock::now();
+      auto ready = start;
+      std::int64_t consumed = 0;
+      while (true) {
+        std::string error;
+        const auto asked = std::chrono::steady_clock::now();
+        const std::size_t got = reader.read(buffer.data(), buffer.size(), &error);
+        if (got == 0) break;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - asked > std::chrono::milliseconds(2)) ready = std::max(ready, now);
+        consumed += static_cast<std::int64_t>(got);
+        double cost = static_cast<double>(got) / (scene.write * 1024 * 1024);
+        if (consumed / (32 << 20) != (consumed - static_cast<std::int64_t>(got)) / (32 << 20)) cost += 0.3;
+        ready += std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(cost));
+        std::this_thread::sleep_until(ready);
+      }
+      const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      std::cout << "  块 " << (config.block >> 10) << " KB × " << config.blocks << " = "
+                << ((config.block * config.blocks) >> 10) << " KB：" << seconds << " 秒，"
+                << static_cast<double>(kSize >> 20) / seconds << " MB/s" << std::endl;
+    }
+  }
   return 0;
 }
 

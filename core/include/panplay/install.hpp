@@ -2,6 +2,7 @@
 
 #include "panplay/drive.hpp"
 #include "panplay/library.hpp"
+#include "panplay/prefetch.hpp"
 #include "panplay/sink.hpp"
 
 #include <cstdint>
@@ -25,6 +26,8 @@ struct InstallRequest {
   std::int64_t stop_after_output_bytes = -1;
   // 扫描和逐个文件完成时回调。安装结束前就会调用，方便界面不必等到整包结束。
   std::function<void(const InstallResult&)> on_progress;
+  const CancelToken* cancel = nullptr;
+  PrefetchOptions prefetch;
 };
 
 struct Destination {
@@ -48,12 +51,20 @@ struct FinishedFile {
   std::uint32_t crc = 0;
 };
 
-std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& parts, std::vector<ListedRarEntry>* entries);
+struct RarExtract {
+  std::string staging_root;
+  std::string journal_path;
+  std::int64_t* written = nullptr;
+  std::int64_t stop_after_output_bytes = -1;
+  const CancelToken* cancel = nullptr;
+  PrefetchOptions prefetch;
+  std::function<void(const std::vector<FinishedFile>& done)> on_file_done;
+};
+
+std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& parts, const CancelToken* cancel,
+                             std::vector<ListedRarEntry>* entries);
 std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
-                                const std::vector<ListedRarEntry>& entries, const std::string& staging_root,
-                                std::vector<FinishedFile>* done, const std::string& journal_path, std::int64_t* written,
-                                std::int64_t stop_after_output_bytes,
-                                const std::function<void(const std::vector<FinishedFile>& done)>& on_file_done = {});
+                                const RarExtract& options, std::vector<FinishedFile>* done);
 
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request);
 bool parse_destination(const std::string& text, Destination* destination, std::string* error);
@@ -62,5 +73,6 @@ std::unique_ptr<InstallSink> open_destination(const Destination& destination, st
 int run_scan_cli(DrivePlugin& drive, const std::string& dir);
 int run_install_cli(DrivePlugin& drive, int argc, char** argv);
 int run_install_pipeline_self_test();
+int run_prefetch_bench();
 
 }  // namespace panplay

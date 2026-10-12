@@ -21,10 +21,40 @@ bool login_ftp(SOCKET control, LineReader* reader, const FtpEndpoint& endpoint, 
 
 namespace {
 
+class LocalWriter final : public FileWriter {
+ public:
+  explicit LocalWriter(const std::filesystem::path& path) : out_(path, std::ios::binary | std::ios::trunc) {}
+  bool ok() const { return static_cast<bool>(out_); }
+
+  std::string write(const std::uint8_t* data, std::size_t size) override {
+    out_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    return out_ ? "" : "写入中断";
+  }
+
+  std::string finish() override {
+    out_.close();
+    return out_ ? "" : "写入中断";
+  }
+
+ private:
+  std::ofstream out_;
+};
+
 class LocalSink : public InstallSink {
  public:
   explicit LocalSink(std::filesystem::path root) : root_(std::filesystem::absolute(std::move(root))) {
     std::filesystem::create_directories(root_);
+  }
+
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) override {
+    std::filesystem::path local;
+    if (!storage_path(root_, path, &local, error)) return nullptr;
+    auto writer = std::make_unique<LocalWriter>(local);
+    if (!writer->ok()) {
+      *error = "无法写入";
+      return nullptr;
+    }
+    return writer;
   }
 
   std::string ensure_dir(const std::string& path) override {
@@ -154,6 +184,42 @@ class FtpSink : public InstallSink {
       closesocket(control_);
       control_ = INVALID_SOCKET;
     }
+  }
+
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) override;
+
+  // 写入流结束时调用，读回传输结果。
+  std::string end_upload(SOCKET data_socket, bool finished) {
+    shutdown(data_socket, SD_SEND);
+    closesocket(data_socket);
+    std::string reply;
+    int code = 0;
+    if (!reader_.read_reply(&reply, &code)) return "没有收到传输结果";
+    if (finished && code != 226) return reply;
+    return "";
+  }
+
+  std::string begin_upload(const std::string& path, SOCKET* data_socket) {
+    std::string reply;
+    int code = 0;
+    std::string error;
+    if (!roundtrip("PASV", &reply, &code, &error)) return error;
+    if (code != 227) return reply;
+    std::string host;
+    std::uint16_t port = 0;
+    if (!parse_pasv(reply, &host, &port)) return "无法解析 PASV";
+    SOCKET socket = connect_tcp(host, port, &error);
+    if (socket == INVALID_SOCKET) return error;
+    if (!roundtrip("STOR " + path, &reply, &code, &error)) {
+      closesocket(socket);
+      return error;
+    }
+    if (code != 150 && code != 125) {
+      closesocket(socket);
+      return reply;
+    }
+    *data_socket = socket;
+    return "";
   }
 
   std::string ensure_dir(const std::string& path) override {
@@ -442,6 +508,45 @@ class FtpSink : public InstallSink {
   std::thread keepalive_;
 };
 
+// 一个文件一条数据连接。写入期间持有控制连接的锁，保活线程不会插入命令。
+class FtpWriter final : public FileWriter {
+ public:
+  FtpWriter(FtpSink& sink, std::unique_lock<std::mutex> lock, SOCKET data_socket)
+      : sink_(sink), lock_(std::move(lock)), data_(data_socket) {}
+
+  ~FtpWriter() override {
+    if (data_ != INVALID_SOCKET) sink_.end_upload(data_, false);
+  }
+
+  std::string write(const std::uint8_t* data, std::size_t size) override {
+    if (data_ == INVALID_SOCKET) return "写入已结束";
+    if (size == 0) return "";
+    if (!send_all(data_, reinterpret_cast<const char*>(data), size)) return "发送数据失败";
+    return "";
+  }
+
+  std::string finish() override {
+    if (data_ == INVALID_SOCKET) return "写入已结束";
+    const std::string error = sink_.end_upload(data_, true);
+    data_ = INVALID_SOCKET;
+    lock_.unlock();
+    return error;
+  }
+
+ private:
+  FtpSink& sink_;
+  std::unique_lock<std::mutex> lock_;
+  SOCKET data_ = INVALID_SOCKET;
+};
+
+std::unique_ptr<FileWriter> FtpSink::open_writer(const std::string& path, std::string* error) {
+  std::unique_lock<std::mutex> lock(io_);
+  SOCKET data_socket = INVALID_SOCKET;
+  *error = begin_upload(path, &data_socket);
+  if (!error->empty()) return nullptr;
+  return std::make_unique<FtpWriter>(*this, std::move(lock), data_socket);
+}
+
 std::vector<std::uint8_t> pattern(std::size_t size, std::uint8_t seed) {
   std::vector<std::uint8_t> bytes(size);
   for (std::size_t i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(seed + i);
@@ -468,27 +573,29 @@ int exercise(InstallSink& sink, const std::filesystem::path& disk_root, const st
 
   std::string error = sink.ensure_dir("/mnt/usb0/homebrew/.panplay-staging/CUSA00001");
   if (!error.empty()) return fail(label, error);
-  error = write_continuing(sink, staging, 0, first.data(), first.size());
-  if (!error.empty()) return fail(label, error);
-  if (sink.file_size(staging, &error) != 10000 || !error.empty()) return fail(label, "STOR 之后大小不是 10000");
-  error = write_continuing(sink, staging, 10000, second.data(), second.size());
-  if (!error.empty()) return fail(label, error);
+  {
+    auto writer = sink.open_writer(staging, &error);
+    if (!writer) return fail(label, error);
+    error = writer->write(first.data(), first.size());
+    if (error.empty()) error = writer->write(second.data(), second.size());
+    if (error.empty()) error = writer->finish();
+    if (!error.empty()) return fail(label, error);
+  }
+  if (sink.file_size(staging, &error) != static_cast<std::int64_t>(whole.size()) || !error.empty()) {
+    return fail(label, "连续写入后大小不对");
+  }
 
   std::filesystem::path on_disk;
   if (!storage_path(disk_root, staging, &on_disk, &error)) return fail(label, error);
-  if (read_file(on_disk) != whole) return fail(label, "续写后的文件内容不一致");
+  if (read_file(on_disk) != whole) return fail(label, "连续写入后的文件内容不一致");
 
   {
-    std::ofstream torn(on_disk, std::ios::binary | std::ios::app);
-    const char extra[] = {'x', 'x', 'x', 'x', 'x'};
-    torn.write(extra, 5);
+    auto writer = sink.open_writer(staging, &error);
+    if (!writer) return fail(label, error);
+    error = writer->write(first.data(), 10);
+    if (!error.empty()) return fail(label, error);
   }
-  error = write_continuing(sink, staging, static_cast<std::int64_t>(whole.size()), second.data(), 1);
-  if (error.empty()) return fail(label, "远端大小和已提交字节不一致时仍然写入了");
-  error.clear();
-  if (sink.file_size(staging, &error) != static_cast<std::int64_t>(whole.size()) + 5 || !error.empty()) {
-    return fail(label, "撕坏的文件大小变了");
-  }
+  if (sink.file_size(staging, &error) != 10 || !error.empty()) return fail(label, "没有 finish 的写入没有留下已写数据");
 
   error = sink.store(staging, whole.data(), whole.size());
   if (!error.empty()) return fail(label, error);
@@ -506,21 +613,6 @@ int exercise(InstallSink& sink, const std::filesystem::path& disk_root, const st
 }
 
 }  // namespace
-
-std::string write_continuing(InstallSink& sink, const std::string& path, std::int64_t committed, const std::uint8_t* data,
-                             std::size_t size) {
-  std::string error;
-  const std::int64_t remote = sink.file_size(path, &error);
-  if (!error.empty()) return error;
-  if (remote < 0) {
-    if (committed != 0) return "远端没有该文件，但已提交字节不是 0";
-    return sink.store(path, data, size);
-  }
-  if (remote != committed) {
-    return "远端大小 " + std::to_string(remote) + " 与已提交 " + std::to_string(committed) + " 不一致，需要从头覆盖";
-  }
-  return sink.append(path, data, size);
-}
 
 std::unique_ptr<InstallSink> make_local_sink(std::string root) {
   return std::make_unique<LocalSink>(std::filesystem::u8path(root));

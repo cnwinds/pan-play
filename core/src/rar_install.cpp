@@ -1,7 +1,8 @@
 #include "panplay/install.hpp"
 
-#include "panplay/json.hpp"
+#include "install_common.hpp"
 #include "panplay/library.hpp"
+#include "panplay/prefetch.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -10,12 +11,14 @@
 
 #include "dll.hpp"
 
-#include <zlib.h>
-
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <iostream>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,16 +29,28 @@ struct VolumeState {
   std::string file_id;
   std::int64_t size = 0;
   std::int64_t pos = 0;
+  std::unique_ptr<panplay::PrefetchReader> reader;
+  std::vector<std::uint8_t> window;
+  std::int64_t window_start = -1;
 };
 
 struct RarSession {
   panplay::DrivePlugin* drive = nullptr;
+  const panplay::CancelToken* cancel = nullptr;
+  panplay::PrefetchOptions prefetch;
+  // 列目录时只读文件头，在文件之间跳着读，每次取一小段，不开长连接。
+  bool random_access = false;
   std::vector<VolumeState> volumes;
   int index = 0;
   std::vector<wchar_t> name_buf;
+  std::string read_error;
+  std::chrono::steady_clock::duration read_time{};
+  std::chrono::steady_clock::duration write_time{};
+  std::int64_t read_calls = 0;
 };
 
-RarSession* session = nullptr;
+// UnRAR 的读取回调不带上下文；解压在调用线程里同步进行，所以按线程保存。
+thread_local RarSession* session = nullptr;
 
 std::wstring utf8_to_wide(const std::string& text) {
   if (text.empty()) return {};
@@ -69,18 +84,15 @@ int claim_name(const wchar_t* name) {
   const std::string wanted = lower_copy(base_name(name));
   for (std::size_t i = 0; i < session->volumes.size(); ++i) {
     if (lower_copy(session->volumes[i].name) == wanted) {
+      if (static_cast<std::size_t>(session->index) < session->volumes.size()) {
+        session->volumes[static_cast<std::size_t>(session->index)].reader.reset();
+      }
       session->index = static_cast<int>(i);
       session->volumes[i].pos = 0;
       return 1;
     }
   }
   return 0;
-}
-
-std::string parent_path(const std::string& path) {
-  const auto slash = path.rfind('/');
-  if (slash == std::string::npos || slash == 0) return "/";
-  return path.substr(0, slash);
 }
 
 bool safe_name(const std::string& name, std::string* normalized, bool* directory) {
@@ -137,60 +149,17 @@ bool is_stream_entry(const std::string& name) {
   return leaf.find(':') != std::string::npos || leaf.find("\xEF\x80\xBA") != std::string::npos;
 }
 
-std::string journal_json(const std::vector<panplay::FinishedFile>& done) {
-  std::string json = "{\"done\":[";
-  for (std::size_t i = 0; i < done.size(); ++i) {
-    if (i != 0) json += ",";
-    json += "{\"crc32\":" + std::to_string(done[i].crc) + ",\"name\":\"" + panplay::json_escape(done[i].name) +
-            "\",\"size\":" + std::to_string(done[i].size) + "}";
-  }
-  json += "]}";
-  return json;
-}
-
-std::string save_journal(panplay::InstallSink& sink, const std::string& path, const std::vector<panplay::FinishedFile>& done) {
-  if (auto error = sink.ensure_dir(parent_path(path)); !error.empty()) return error;
-  const std::string json = journal_json(done);
-  return sink.store(path, reinterpret_cast<const std::uint8_t*>(json.data()), json.size());
+std::uint64_t unpacked_size(const RARHeaderDataEx& header) {
+  return static_cast<std::uint64_t>(header.UnpSize) | (static_cast<std::uint64_t>(header.UnpSizeHigh) << 32);
 }
 
 struct RarWrite {
-  panplay::InstallSink* sink = nullptr;
-  std::string path;
-  std::int64_t stop = -1;
-  std::int64_t* written = nullptr;
-  std::uint32_t crc = 0;
-  std::int64_t committed = 0;
-  bool started = false;
-  bool discard = false;
+  std::unique_ptr<panplay::OutputFile> out;
   bool interrupted = false;
   std::string error;
-
-  std::string emit(const std::uint8_t* data, std::size_t size) {
-    if (size == 0 || discard) return "";
-    if (stop >= 0 && *written >= stop) return "interrupted";
-    bool partial = false;
-    if (stop >= 0 && *written + static_cast<std::int64_t>(size) > stop) {
-      size = static_cast<std::size_t>(stop - *written);
-      partial = true;
-    }
-    std::string write_error;
-    if (!started) {
-      write_error = sink->ensure_dir(parent_path(path));
-      if (write_error.empty()) write_error = sink->store(path, data, size);
-      if (write_error.empty()) started = true;
-    } else {
-      write_error = panplay::write_continuing(*sink, path, committed, data, size);
-    }
-    if (!write_error.empty()) return write_error;
-    crc = static_cast<std::uint32_t>(::crc32(crc, data, static_cast<uInt>(size)));
-    committed += static_cast<std::int64_t>(size);
-    *written += static_cast<std::int64_t>(size);
-    return partial ? "interrupted" : "";
-  }
 };
 
-RarWrite* active_write = nullptr;
+thread_local RarWrite* active_write = nullptr;
 
 int CALLBACK rar_callback(UINT msg, LPARAM user, LPARAM p1, LPARAM p2) {
   (void)user;
@@ -208,8 +177,11 @@ int CALLBACK rar_callback(UINT msg, LPARAM user, LPARAM p1, LPARAM p2) {
     return claim_name(wide.c_str()) ? 1 : -1;
   }
   if (msg == UCM_PROCESSDATA && active_write != nullptr) {
-    const auto error = active_write->emit(reinterpret_cast<const std::uint8_t*>(p1), static_cast<std::size_t>(p2));
-    if (error == "interrupted") {
+    if (!active_write->out) return 1;
+    const auto started = std::chrono::steady_clock::now();
+    const auto error = active_write->out->write(reinterpret_cast<const std::uint8_t*>(p1), static_cast<std::size_t>(p2));
+    if (session != nullptr) session->write_time += std::chrono::steady_clock::now() - started;
+    if (error == panplay::kInterrupted) {
       active_write->interrupted = true;
       return -1;
     }
@@ -224,8 +196,11 @@ int CALLBACK rar_callback(UINT msg, LPARAM user, LPARAM p1, LPARAM p2) {
 
 struct SessionGuard {
   RarSession state;
-  explicit SessionGuard(panplay::DrivePlugin& drive, const std::vector<panplay::DriveEntry>& parts) {
+  SessionGuard(panplay::DrivePlugin& drive, const std::vector<panplay::DriveEntry>& parts, const panplay::CancelToken* cancel,
+               const panplay::PrefetchOptions& prefetch) {
     state.drive = &drive;
+    state.cancel = cancel;
+    state.prefetch = prefetch;
     for (const auto& part : parts) {
       VolumeState volume;
       volume.name = part.name;
@@ -250,10 +225,41 @@ std::string open_archive(SessionGuard& guard, unsigned int mode, HANDLE* handle)
   HANDLE opened = RAROpenArchiveEx(&data);
   if (opened == nullptr || data.OpenResult != 0) {
     if (opened != nullptr) RARCloseArchive(opened);
-    return "无法打开 RAR";
+    return guard.state.read_error.empty() ? "无法打开 RAR" : guard.state.read_error;
   }
   *handle = opened;
   return "";
+}
+
+int read_window(VolumeState& volume, std::uint8_t* out, std::size_t size) {
+  constexpr std::size_t kWindow = 64u << 10;
+  const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), volume.size - volume.pos));
+  const std::int64_t window_end = volume.window_start + static_cast<std::int64_t>(volume.window.size());
+  if (volume.window_start < 0 || volume.pos < volume.window_start || volume.pos + static_cast<std::int64_t>(want) > window_end) {
+    if (session->cancel && session->cancel->cancelled()) {
+      session->read_error = panplay::kInterrupted;
+      return -1;
+    }
+    const auto length = static_cast<std::size_t>(
+        std::min<std::int64_t>(static_cast<std::int64_t>(std::max(want, kWindow)), volume.size - volume.pos));
+    panplay::ReadResult result = session->drive->read_at(volume.file_id, volume.pos, length);
+    if (!result.error.empty()) {
+      session->read_error = result.error;
+      return -1;
+    }
+    volume.window = std::move(result.bytes);
+    volume.window_start = volume.pos;
+  }
+  const auto offset = static_cast<std::size_t>(volume.pos - volume.window_start);
+  const std::size_t n = std::min(want, volume.window.size() - offset);
+  std::memcpy(out, volume.window.data() + offset, n);
+  volume.pos += static_cast<std::int64_t>(n);
+  return static_cast<int>(n);
+}
+
+std::string process_failure(const std::string& fallback) {
+  if (session != nullptr && !session->read_error.empty()) return session->read_error;
+  return fallback;
 }
 
 }  // namespace
@@ -266,12 +272,38 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
   }
   VolumeState& volume = session->volumes[static_cast<std::size_t>(session->index)];
   if (volume.pos >= volume.size || size == 0) return 0;
-  const auto want = static_cast<std::size_t>(std::min<std::int64_t>(size, volume.size - volume.pos));
-  panplay::ReadResult got = session->drive->read_at(volume.file_id, volume.pos, want);
-  if (!got.error.empty() || got.bytes.empty() || got.bytes.size() > want) return -1;
-  std::memcpy(data, got.bytes.data(), got.bytes.size());
-  volume.pos += static_cast<std::int64_t>(got.bytes.size());
-  return static_cast<int>(got.bytes.size());
+  if (session->random_access) return read_window(volume, static_cast<std::uint8_t*>(data), size);
+  if (!volume.reader) {
+    volume.reader = std::make_unique<panplay::PrefetchReader>(*session->drive, volume.file_id, volume.size, session->cancel,
+                                                              session->prefetch);
+  }
+  if (volume.reader->position() != volume.pos) {
+    if (auto error = volume.reader->seek(volume.pos); !error.empty()) {
+      session->read_error = error;
+      return -1;
+    }
+  }
+  const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), volume.size - volume.pos));
+  auto* out = static_cast<std::uint8_t*>(data);
+  std::size_t filled = 0;
+  const auto started = std::chrono::steady_clock::now();
+  ++session->read_calls;
+  struct Timer {
+    std::chrono::steady_clock::time_point started;
+    ~Timer() { session->read_time += std::chrono::steady_clock::now() - started; }
+  } timer{started};
+  while (filled < want) {
+    std::string error;
+    const std::size_t got = volume.reader->read(out + filled, want - filled, &error);
+    if (!error.empty()) {
+      session->read_error = error;
+      return -1;
+    }
+    if (got == 0) break;
+    filled += got;
+  }
+  volume.pos += static_cast<std::int64_t>(filled);
+  return static_cast<int>(filled);
 }
 
 extern "C" int panplay_unrar_seek(long long offset, int method) {
@@ -298,8 +330,18 @@ extern "C" long long panplay_unrar_tell(void) {
 
 namespace panplay {
 
-std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& parts, std::vector<ListedRarEntry>* entries) {
-  SessionGuard guard(drive, parts);
+std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& parts, const CancelToken* cancel,
+                             std::vector<ListedRarEntry>* entries) {
+  SessionGuard guard(drive, parts, cancel, PrefetchOptions{});
+  guard.state.random_access = true;
+  const auto listed_at = std::chrono::steady_clock::now();
+  struct Trace {
+    std::chrono::steady_clock::time_point started;
+    ~Trace() {
+      if (std::getenv("PANPLAY_TRACE") == nullptr) return;
+      std::cerr << "rar 列目录 " << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << " 秒\n";
+    }
+  } trace{listed_at};
   HANDLE handle = nullptr;
   if (auto error = open_archive(guard, RAR_OM_LIST, &handle); !error.empty()) return error;
   while (true) {
@@ -308,7 +350,7 @@ std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& 
     if (code == ERAR_END_ARCHIVE) break;
     if (code != ERAR_SUCCESS) {
       RARCloseArchive(handle);
-      return "读取 RAR 文件头失败";
+      return process_failure("读取 RAR 文件头失败");
     }
     if ((header.Flags & RHDF_ENCRYPTED) != 0) {
       RARCloseArchive(handle);
@@ -317,7 +359,7 @@ std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& 
     if (is_stream_entry(raw_header_name(header))) {
       if (RARProcessFileW(handle, RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
         RARCloseArchive(handle);
-        return "读取 RAR 目录失败";
+        return process_failure("读取 RAR 目录失败");
       }
       continue;
     }
@@ -331,11 +373,11 @@ std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& 
     entry.directory = (header.Flags & RHDF_DIRECTORY) != 0 || (!entry.name.empty() && entry.name.back() == '/');
     entry.solid = (header.Flags & RHDF_SOLID) != 0;
     entry.crc = header.FileCRC;
-    entry.size = static_cast<std::uint64_t>(header.UnpSize) | (static_cast<std::uint64_t>(header.UnpSizeHigh) << 32);
+    entry.size = unpacked_size(header);
     entries->push_back(std::move(entry));
     if (RARProcessFileW(handle, RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
       RARCloseArchive(handle);
-      return "读取 RAR 目录失败";
+      return process_failure("读取 RAR 目录失败");
     }
   }
   RARCloseArchive(handle);
@@ -343,18 +385,24 @@ std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& 
 }
 
 std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
-                                const std::vector<ListedRarEntry>& entries, const std::string& staging_root,
-                                std::vector<FinishedFile>* done, const std::string& journal_path, std::int64_t* written,
-                                std::int64_t stop_after_output_bytes,
-                                const std::function<void(const std::vector<FinishedFile>& done)>& on_file_done) {
-  (void)entries;
-  SessionGuard guard(drive, parts);
+                                const RarExtract& options, std::vector<FinishedFile>* done) {
+  SessionGuard guard(drive, parts, options.cancel, options.prefetch);
+  const auto started = std::chrono::steady_clock::now();
+  struct Trace {
+    RarSession& state;
+    std::chrono::steady_clock::time_point started;
+    ~Trace() {
+      if (std::getenv("PANPLAY_TRACE") == nullptr) return;
+      const auto seconds = [](std::chrono::steady_clock::duration value) { return std::chrono::duration<double>(value).count(); };
+      const auto total = std::chrono::steady_clock::now() - started;
+      std::cerr << "rar 解压共 " << seconds(total) << " 秒：等数据 " << seconds(state.read_time) << " 秒（" << state.read_calls
+                << " 次读），写出 " << seconds(state.write_time) << " 秒，其余（解压+校验）"
+                << seconds(total - state.read_time - state.write_time) << " 秒\n";
+    }
+  } trace{guard.state, started};
   HANDLE handle = nullptr;
-  RarWrite writer;
   if (auto error = open_archive(guard, RAR_OM_EXTRACT, &handle); !error.empty()) return error;
-  writer.sink = &sink;
-  writer.stop = stop_after_output_bytes;
-  writer.written = written;
+  RarWrite writer;
   active_write = &writer;
   std::string failure;
   while (failure.empty()) {
@@ -362,20 +410,20 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
     const int code = RARReadHeaderEx(handle, &header);
     if (code == ERAR_END_ARCHIVE) break;
     if (code != ERAR_SUCCESS) {
-      failure = "读取 RAR 文件头失败";
+      failure = process_failure("读取 RAR 文件头失败");
       break;
     }
     if ((header.Flags & RHDF_ENCRYPTED) != 0) {
       failure = "RAR 有密码，这一版不能安装";
       break;
     }
+    const bool solid = (header.Flags & RHDF_SOLID) != 0;
+    writer.out.reset();
+    writer.interrupted = false;
+    writer.error.clear();
     if (is_stream_entry(raw_header_name(header))) {
-      writer.discard = true;
-      writer.interrupted = false;
-      writer.error.clear();
-      const bool solid = (header.Flags & RHDF_SOLID) != 0;
       if (RARProcessFileW(handle, solid ? RAR_TEST : RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
-        failure = "解压 RAR 失败";
+        failure = process_failure("解压 RAR 失败");
         break;
       }
       continue;
@@ -387,23 +435,19 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       break;
     }
     const bool directory = (header.Flags & RHDF_DIRECTORY) != 0 || (!name.empty() && name.back() == '/');
-    const bool solid = (header.Flags & RHDF_SOLID) != 0;
-    const auto size = static_cast<std::uint64_t>(header.UnpSize) | (static_cast<std::uint64_t>(header.UnpSizeHigh) << 32);
+    const std::uint64_t size = unpacked_size(header);
     bool already = false;
     for (const auto& file : *done) {
       if (file.name == name && file.size == static_cast<std::int64_t>(size) && file.crc == header.FileCRC) already = true;
     }
-    writer.discard = already;
-    writer.path = join_storage_path(staging_root, name);
-    writer.started = false;
-    writer.committed = 0;
-    writer.crc = static_cast<std::uint32_t>(::crc32(0L, Z_NULL, 0));
-    writer.interrupted = false;
-    writer.error.clear();
+    if (!directory && !already) {
+      writer.out = std::make_unique<OutputFile>(sink, join_storage_path(options.staging_root, name),
+                                                options.stop_after_output_bytes, options.written);
+    }
     const int operation = directory || (already && !solid) ? RAR_SKIP : RAR_TEST;
     const int processed = RARProcessFileW(handle, operation, nullptr, nullptr);
     if (writer.interrupted) {
-      failure = "interrupted";
+      failure = kInterrupted;
       break;
     }
     if (!writer.error.empty()) {
@@ -411,26 +455,22 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       break;
     }
     if (processed != ERAR_SUCCESS) {
-      failure = "解压 RAR 失败: " + name;
+      failure = process_failure("解压 RAR 失败: " + name);
       break;
     }
-    if (directory || already) continue;
-    if (size == 0 && !writer.started) {
-      failure = sink.ensure_dir(parent_path(writer.path));
-      if (failure.empty()) {
-        const std::uint8_t empty = 0;
-        failure = sink.store(writer.path, &empty, 0);
-      }
-    }
+    if (!writer.out) continue;
+    failure = writer.out->finish();
     if (!failure.empty()) break;
-    if (writer.committed != static_cast<std::int64_t>(size) || writer.crc != header.FileCRC) {
+    if (writer.out->size() != static_cast<std::int64_t>(size) || writer.out->crc() != header.FileCRC) {
       failure = "校验和不符: " + name;
       break;
     }
-    done->push_back(FinishedFile{name, static_cast<std::int64_t>(size), header.FileCRC});
-    failure = save_journal(sink, journal_path, *done);
-    if (failure.empty() && on_file_done) on_file_done(*done);
+    const FinishedFile finished{name, static_cast<std::int64_t>(size), header.FileCRC};
+    done->push_back(finished);
+    failure = append_journal(sink, options.journal_path, finished);
+    if (failure.empty() && options.on_file_done) options.on_file_done(*done);
   }
+  writer.out.reset();
   active_write = nullptr;
   RARCloseArchive(handle);
   return failure;

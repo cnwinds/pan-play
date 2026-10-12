@@ -1,86 +1,27 @@
 #include "panplay/install.hpp"
 
+#include "install_common.hpp"
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
+#include "panplay/prefetch.hpp"
 
 #include <zlib.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <set>
 
 namespace panplay {
 namespace {
 
-constexpr const char* kInterrupted = "interrupted";
-
-struct Part {
+// 一组分卷里的一卷。start 是它在整组拼接后的起点。
+struct ZipVolume {
   std::string file_id;
   std::int64_t size = 0;
-  std::int64_t data_offset = 0;
-};
-
-class VolumeSource {
- public:
-  VolumeSource(DrivePlugin* drive, std::vector<Part> parts) : drive_(drive), parts_(std::move(parts)) {
-    for (const auto& part : parts_) logical_size_ += part.size - part.data_offset;
-    seek(0);
-  }
-
-  std::int64_t tell() const { return logical_; }
-  bool at_end() const { return logical_ >= logical_size_; }
-
-  std::string seek(std::int64_t logical) {
-    if (logical < 0 || logical > logical_size_) return "压缩包偏移越界";
-    if (parts_.empty()) {
-      logical_ = logical;
-      index_ = 0;
-      offset_ = 0;
-      return logical == 0 ? "" : "压缩包是空的";
-    }
-    std::int64_t left = logical;
-    for (std::size_t i = 0; i < parts_.size(); ++i) {
-      const std::int64_t span = parts_[i].size - parts_[i].data_offset;
-      if (left < span || i + 1 == parts_.size()) {
-        index_ = i;
-        offset_ = parts_[i].data_offset + left;
-        logical_ = logical;
-        return "";
-      }
-      left -= span;
-    }
-    return "压缩包偏移越界";
-  }
-
-  std::string read(std::uint8_t* dst, std::size_t size) {
-    std::size_t filled = 0;
-    while (filled < size) {
-      while (index_ < parts_.size() && offset_ >= parts_[index_].size) {
-        ++index_;
-        if (index_ < parts_.size()) offset_ = parts_[index_].data_offset;
-      }
-      if (index_ >= parts_.size() || logical_ >= logical_size_) return "压缩包意外结束";
-      const Part& part = parts_[index_];
-      const auto want = static_cast<std::size_t>(std::min<std::int64_t>(size - filled, part.size - offset_));
-      ReadResult got = drive_->read_at(part.file_id, offset_, want);
-      if (!got.error.empty()) return got.error;
-      if (got.bytes.empty() || got.bytes.size() > want) return "压缩包意外结束";
-      std::memcpy(dst + filled, got.bytes.data(), got.bytes.size());
-      offset_ += static_cast<std::int64_t>(got.bytes.size());
-      logical_ += static_cast<std::int64_t>(got.bytes.size());
-      filled += got.bytes.size();
-    }
-    return "";
-  }
-
- private:
-  DrivePlugin* drive_ = nullptr;
-  std::vector<Part> parts_;
-  std::size_t index_ = 0;
-  std::int64_t offset_ = 0;
-  std::int64_t logical_ = 0;
-  std::int64_t logical_size_ = 0;
+  std::int64_t start = 0;
 };
 
 struct Member {
@@ -89,15 +30,10 @@ struct Member {
   bool directory = false;
   std::uint16_t method = 0;
   std::uint32_t crc = 0;
-  std::uint32_t comp_size = 0;
+  std::uint64_t comp_size = 0;
   std::uint64_t uncomp_size = 0;
-  std::int64_t data_offset = 0;
-};
-
-struct DoneFile {
-  std::string name;
-  std::int64_t size = 0;
-  std::uint32_t crc = 0;
+  // 本地文件头在整组拼接后的位置。
+  std::int64_t local_offset = 0;
 };
 
 std::uint16_t read_u16(const std::uint8_t* data) {
@@ -105,7 +41,12 @@ std::uint16_t read_u16(const std::uint8_t* data) {
 }
 
 std::uint32_t read_u32(const std::uint8_t* data) {
-  return static_cast<std::uint32_t>(data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24));
+  return static_cast<std::uint32_t>(data[0]) | (static_cast<std::uint32_t>(data[1]) << 8) |
+         (static_cast<std::uint32_t>(data[2]) << 16) | (static_cast<std::uint32_t>(data[3]) << 24);
+}
+
+std::uint64_t read_u64(const std::uint8_t* data) {
+  return static_cast<std::uint64_t>(read_u32(data)) | (static_cast<std::uint64_t>(read_u32(data + 4)) << 32);
 }
 
 std::string base_name(std::string path) {
@@ -113,12 +54,6 @@ std::string base_name(std::string path) {
   const auto slash = path.rfind('/');
   if (slash == std::string::npos) return path;
   return path.substr(slash + 1);
-}
-
-std::string parent_path(const std::string& path) {
-  const auto slash = path.rfind('/');
-  if (slash == std::string::npos || slash == 0) return "/";
-  return path.substr(0, slash);
 }
 
 bool safe_zip_name(const std::string& name, std::string* normalized, bool* directory) {
@@ -151,66 +86,227 @@ bool safe_zip_name(const std::string& name, std::string* normalized, bool* direc
   return true;
 }
 
-std::string open_parts(DrivePlugin& drive, const std::vector<DriveEntry>& files, std::vector<Part>* parts) {
-  for (const auto& file : files) {
-    Part part;
-    part.file_id = file.file_id;
-    part.size = file.size;
-    if (file.size >= 4) {
-      ReadResult got = drive.read_at(file.file_id, 0, 4);
-      if (!got.error.empty()) return got.error;
-      if (got.bytes.size() == 4 && got.bytes[0] == 0x50 && got.bytes[1] == 0x4b && got.bytes[2] == 0x07 &&
-          got.bytes[3] == 0x08) {
-        part.data_offset = 4;
-      }
-    }
-    if (part.data_offset > part.size) return "分卷头比文件还长";
-    parts->push_back(std::move(part));
+std::vector<ZipVolume> zip_volumes(const std::vector<DriveEntry>& parts) {
+  std::vector<ZipVolume> volumes;
+  std::int64_t start = 0;
+  for (const auto& part : parts) {
+    volumes.push_back(ZipVolume{part.file_id, part.size, start});
+    start += part.size;
   }
+  return volumes;
+}
+
+// 随机读一小段，可以跨卷。只用于读目录。
+std::string read_span(DrivePlugin& drive, const std::vector<ZipVolume>& volumes, std::int64_t position, std::size_t size,
+                      std::vector<std::uint8_t>* out) {
+  out->clear();
+  out->reserve(size);
+  for (const auto& volume : volumes) {
+    if (out->size() == size) break;
+    const std::int64_t end = volume.start + volume.size;
+    if (position >= end) continue;
+    if (position < volume.start) return "压缩包偏移越界";
+    while (out->size() < size && position < end) {
+      const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size - out->size()),
+                                                                         end - position));
+      ReadResult got = drive.read_at(volume.file_id, position - volume.start, want);
+      if (!got.error.empty()) return got.error;
+      if (got.bytes.empty() || got.bytes.size() > want) return "压缩包意外结束";
+      out->insert(out->end(), got.bytes.begin(), got.bytes.end());
+      position += static_cast<std::int64_t>(got.bytes.size());
+    }
+  }
+  return out->size() == size ? "" : "压缩包意外结束";
+}
+
+// 在整组分卷上顺序读，每卷一个预读器。
+class ZipStream {
+ public:
+  ZipStream(DrivePlugin& drive, std::vector<ZipVolume> volumes, const CancelToken* cancel, PrefetchOptions options)
+      : drive_(drive), volumes_(std::move(volumes)), cancel_(cancel), options_(options) {}
+
+  std::int64_t position() const { return position_; }
+
+  std::string seek(std::int64_t position) {
+    for (std::size_t i = 0; i < volumes_.size(); ++i) {
+      const ZipVolume& volume = volumes_[i];
+      if (position < volume.start || position >= volume.start + volume.size) continue;
+      if (i != index_ || !reader_) open_volume(i);
+      position_ = position;
+      return reader_->seek(position - volume.start);
+    }
+    return "压缩包偏移越界";
+  }
+
+  std::string read(std::uint8_t* dst, std::size_t size) {
+    std::size_t filled = 0;
+    while (filled < size) {
+      if (!reader_ || reader_->position() >= reader_->size()) {
+        const std::size_t next = reader_ ? index_ + 1 : 0;
+        if (next >= volumes_.size()) return "压缩包意外结束";
+        open_volume(next);
+        continue;
+      }
+      std::string error;
+      const std::size_t got = reader_->read(dst + filled, size - filled, &error);
+      if (!error.empty()) return error;
+      if (got == 0) {
+        if (index_ + 1 >= volumes_.size()) return "压缩包意外结束";
+        open_volume(index_ + 1);
+        continue;
+      }
+      filled += got;
+      position_ += static_cast<std::int64_t>(got);
+    }
+    return "";
+  }
+
+  std::string skip(std::int64_t size) {
+    if (size == 0) return "";
+    return seek(position_ + size);
+  }
+
+ private:
+  void open_volume(std::size_t index) {
+    reader_.reset();
+    index_ = index;
+    reader_ = std::make_unique<PrefetchReader>(drive_, volumes_[index].file_id, volumes_[index].size, cancel_, options_);
+    position_ = volumes_[index].start;
+  }
+
+  DrivePlugin& drive_;
+  std::vector<ZipVolume> volumes_;
+  const CancelToken* cancel_;
+  PrefetchOptions options_;
+  std::size_t index_ = 0;
+  std::unique_ptr<PrefetchReader> reader_;
+  std::int64_t position_ = 0;
+};
+
+constexpr std::uint32_t kLocalHeader = 0x04034b50;
+constexpr std::uint32_t kCentralHeader = 0x02014b50;
+constexpr std::uint32_t kEndRecord = 0x06054b50;
+constexpr std::uint32_t kZip64EndRecord = 0x06064b50;
+constexpr std::uint32_t kZip64Locator = 0x07064b50;
+
+struct CentralDirectory {
+  std::uint64_t disk = 0;
+  std::uint64_t cd_disk = 0;
+  std::uint64_t entries = 0;
+  std::uint64_t size = 0;
+  std::uint64_t offset = 0;
+};
+
+// 分卷 ZIP 的偏移按卷号分别算；单个 ZIP 和 .zip.001 这种直接切开的，卷号都是 0，偏移就是拼接后的位置。
+std::string to_logical(const std::vector<ZipVolume>& volumes, std::uint64_t disk, std::uint64_t offset, std::int64_t* out) {
+  if (disk >= volumes.size()) return "ZIP 记录的分卷号超出了分卷数";
+  *out = volumes[static_cast<std::size_t>(disk)].start + static_cast<std::int64_t>(offset);
   return "";
 }
 
-std::string scan_zip(VolumeSource& source, int set_index, std::vector<Member>* members) {
-  if (auto error = source.seek(0); !error.empty()) return error;
-  while (!source.at_end()) {
-    std::uint8_t signature_bytes[4];
-    if (auto error = source.read(signature_bytes, 4); !error.empty()) return error;
-    const std::uint32_t signature = read_u32(signature_bytes);
-    if (signature == 0x02014b50 || signature == 0x06054b50) return "";
-    if (signature != 0x04034b50) return "无法识别的 ZIP 结构";
-    std::uint8_t header[26];
-    if (auto error = source.read(header, sizeof(header)); !error.empty()) return error;
-    const std::uint16_t flags = read_u16(header + 2);
-    const std::uint16_t method = read_u16(header + 4);
-    const std::uint32_t crc = read_u32(header + 10);
-    const std::uint32_t comp_size = read_u32(header + 14);
-    const std::uint32_t uncomp_size = read_u32(header + 18);
-    const std::uint16_t name_length = read_u16(header + 22);
-    const std::uint16_t extra_length = read_u16(header + 24);
-    if ((flags & 1) != 0) return "ZIP 有密码，第一版不能安装";
-    if (comp_size == 0xffffffffu || uncomp_size == 0xffffffffu) return "ZIP64 第一版不能安装";
-    if ((flags & 8) != 0 && comp_size == 0) return "ZIP 未在文件头写明大小，第一版不能跳着读";
-    std::string raw_name(name_length, '\0');
-    if (name_length > 0) {
-      if (auto error = source.read(reinterpret_cast<std::uint8_t*>(&raw_name[0]), name_length); !error.empty()) {
-        return error;
-      }
+std::string find_central_directory(DrivePlugin& drive, const std::vector<ZipVolume>& volumes, CentralDirectory* cd) {
+  const ZipVolume& last = volumes.back();
+  const std::size_t tail_size = static_cast<std::size_t>(std::min<std::int64_t>(last.size, 22 + 65535 + 20));
+  const std::int64_t tail_start = last.start + last.size - static_cast<std::int64_t>(tail_size);
+  std::vector<std::uint8_t> tail;
+  if (auto error = read_span(drive, volumes, tail_start, tail_size, &tail); !error.empty()) return error;
+  std::size_t at = std::string::npos;
+  for (std::size_t i = tail.size() >= 22 ? tail.size() - 22 + 1 : 0; i-- > 0;) {
+    if (read_u32(tail.data() + i) != kEndRecord) continue;
+    if (i + 22 + read_u16(tail.data() + i + 20) != tail.size()) continue;
+    at = i;
+    break;
+  }
+  if (at == std::string::npos) return "找不到 ZIP 目录，压缩包可能不完整";
+  const std::uint8_t* end = tail.data() + at;
+  cd->disk = read_u16(end + 4);
+  cd->cd_disk = read_u16(end + 6);
+  cd->entries = read_u16(end + 10);
+  cd->size = read_u32(end + 12);
+  cd->offset = read_u32(end + 16);
+
+  if (at >= 20 && read_u32(tail.data() + at - 20) == kZip64Locator) {
+    const std::uint8_t* locator = tail.data() + at - 20;
+    std::int64_t position = 0;
+    if (auto error = to_logical(volumes, read_u32(locator + 4), read_u64(locator + 8), &position); !error.empty()) {
+      return error;
     }
-    if (extra_length > 0) {
-      std::vector<std::uint8_t> extra(extra_length);
-      if (auto error = source.read(extra.data(), extra.size()); !error.empty()) return error;
-    }
+    std::vector<std::uint8_t> record;
+    if (auto error = read_span(drive, volumes, position, 56, &record); !error.empty()) return error;
+    if (read_u32(record.data()) != kZip64EndRecord) return "ZIP64 目录记录无法识别";
+    cd->disk = read_u32(record.data() + 16);
+    cd->cd_disk = read_u32(record.data() + 20);
+    cd->entries = read_u64(record.data() + 32);
+    cd->size = read_u64(record.data() + 40);
+    cd->offset = read_u64(record.data() + 48);
+  }
+  if (cd->disk != 0 && cd->disk + 1 != volumes.size()) return "分卷数量和压缩包记录的不一致，可能缺了分卷";
+  if (cd->size > (512u << 20)) return "ZIP 目录大得不正常";
+  return "";
+}
+
+std::string read_zip_members(DrivePlugin& drive, const std::vector<ZipVolume>& volumes, int set_index,
+                             std::vector<Member>* members) {
+  CentralDirectory cd;
+  if (auto error = find_central_directory(drive, volumes, &cd); !error.empty()) return error;
+  std::int64_t position = 0;
+  if (auto error = to_logical(volumes, cd.cd_disk, cd.offset, &position); !error.empty()) return error;
+  std::vector<std::uint8_t> bytes;
+  if (auto error = read_span(drive, volumes, position, static_cast<std::size_t>(cd.size), &bytes); !error.empty()) {
+    return error;
+  }
+  std::size_t at = 0;
+  for (std::uint64_t i = 0; i < cd.entries; ++i) {
+    if (at + 46 > bytes.size() || read_u32(bytes.data() + at) != kCentralHeader) return "ZIP 目录无法识别";
+    const std::uint8_t* header = bytes.data() + at;
+    const std::uint16_t flags = read_u16(header + 8);
+    const std::uint16_t method = read_u16(header + 10);
     Member member;
     member.set_index = set_index;
-    member.directory = false;
-    if (!safe_zip_name(raw_name, &member.name, &member.directory)) return "压缩包路径不安全";
-    if (!member.directory && method != 0 && method != 8) return "ZIP 使用了第一版不支持的压缩方法";
     member.method = method;
-    member.crc = crc;
-    member.comp_size = comp_size;
-    member.uncomp_size = uncomp_size;
-    member.data_offset = source.tell();
-    if (auto error = source.seek(member.data_offset + static_cast<std::int64_t>(comp_size)); !error.empty()) return error;
+    member.crc = read_u32(header + 16);
+    member.comp_size = read_u32(header + 20);
+    member.uncomp_size = read_u32(header + 24);
+    const std::uint16_t name_length = read_u16(header + 28);
+    const std::uint16_t extra_length = read_u16(header + 30);
+    const std::uint16_t comment_length = read_u16(header + 32);
+    std::uint64_t disk = read_u16(header + 34);
+    std::uint64_t local = read_u32(header + 42);
+    const std::size_t record = 46u + name_length + extra_length + comment_length;
+    if (at + record > bytes.size()) return "ZIP 目录无法识别";
+    const std::string raw_name(reinterpret_cast<const char*>(header + 46), name_length);
+
+    const std::uint8_t* extra = header + 46 + name_length;
+    std::size_t e = 0;
+    while (e + 4 <= extra_length) {
+      const std::uint16_t id = read_u16(extra + e);
+      const std::uint16_t length = read_u16(extra + e + 2);
+      if (e + 4 + length > extra_length) break;
+      if (id == 0x0001) {
+        const std::uint8_t* field = extra + e + 4;
+        std::size_t used = 0;
+        auto take = [&](std::uint64_t* value) {
+          if (used + 8 > length) return false;
+          *value = read_u64(field + used);
+          used += 8;
+          return true;
+        };
+        if (member.uncomp_size == 0xffffffffu && !take(&member.uncomp_size)) return "ZIP64 字段不完整";
+        if (member.comp_size == 0xffffffffu && !take(&member.comp_size)) return "ZIP64 字段不完整";
+        if (local == 0xffffffffu && !take(&local)) return "ZIP64 字段不完整";
+        if (disk == 0xffff) {
+          if (used + 4 > length) return "ZIP64 字段不完整";
+          disk = read_u32(field + used);
+        }
+      }
+      e += 4u + length;
+    }
+    at += record;
+
+    if ((flags & 1) != 0) return "ZIP 有密码，这一版不能安装";
+    if (!safe_zip_name(raw_name, &member.name, &member.directory)) return "压缩包路径不安全";
+    if (!member.directory && method != 0 && method != 8) return "ZIP 使用了不支持的压缩方法";
+    if (auto error = to_logical(volumes, disk, local, &member.local_offset); !error.empty()) return error;
     members->push_back(std::move(member));
   }
   return "";
@@ -231,47 +327,7 @@ std::string marker_json(const std::string& title_id, const std::string& plugin, 
   return json;
 }
 
-std::string journal_json(const std::vector<DoneFile>& done) {
-  std::string json = "{\"done\":[";
-  for (std::size_t i = 0; i < done.size(); ++i) {
-    if (i != 0) json += ",";
-    json += "{\"crc32\":" + std::to_string(done[i].crc) + ",\"name\":\"" + json_escape(done[i].name) +
-            "\",\"size\":" + std::to_string(done[i].size) + "}";
-  }
-  json += "]}";
-  return json;
-}
-
-std::string load_journal(InstallSink& sink, const std::string& path, std::vector<DoneFile>* done) {
-  std::vector<std::uint8_t> bytes;
-  const std::string error = sink.read_file(path, &bytes, 1 << 20);
-  if (error == "missing") return "";
-  if (!error.empty()) return error;
-  std::string parse_error;
-  const Json json = Json::parse(std::string(bytes.begin(), bytes.end()), &parse_error);
-  if (!parse_error.empty()) return parse_error;
-  const Json* list = json.get("done");
-  if (!list || list->type != Json::Type::array) return "进度记录无法识别";
-  for (const Json& item : list->array) {
-    DoneFile file;
-    file.name = item.str("name");
-    const std::string size_text = item.str("size");
-    const std::string crc_text = item.str("crc32");
-    if (file.name.empty() || size_text.empty() || crc_text.empty()) return "进度记录无法识别";
-    file.size = std::stoll(size_text);
-    file.crc = static_cast<std::uint32_t>(std::stoul(crc_text));
-    done->push_back(std::move(file));
-  }
-  return "";
-}
-
-std::string save_journal(InstallSink& sink, const std::string& path, const std::vector<DoneFile>& done) {
-  if (auto error = sink.ensure_dir(parent_path(path)); !error.empty()) return error;
-  const std::string json = journal_json(done);
-  return sink.store(path, reinterpret_cast<const std::uint8_t*>(json.data()), json.size());
-}
-
-bool already_done(const std::vector<DoneFile>& done, const Member& member) {
+bool already_done(const std::vector<FinishedFile>& done, const Member& member) {
   for (const auto& file : done) {
     if (file.name == member.name && file.size == static_cast<std::int64_t>(member.uncomp_size) && file.crc == member.crc) {
       return true;
@@ -280,112 +336,86 @@ bool already_done(const std::vector<DoneFile>& done, const Member& member) {
   return false;
 }
 
-struct Writer {
-  InstallSink* sink = nullptr;
-  std::string path;
-  std::int64_t stop = -1;
-  std::int64_t* written = nullptr;
-  std::uint32_t crc = 0;
-  std::int64_t committed = 0;
-  bool started = false;
-
-  std::string emit(const std::uint8_t* data, std::size_t size) {
-    if (size == 0) return "";
-    if (stop >= 0 && *written >= stop) return kInterrupted;
-    bool partial = false;
-    if (stop >= 0 && *written + static_cast<std::int64_t>(size) > stop) {
-      size = static_cast<std::size_t>(stop - *written);
-      partial = true;
-    }
-    std::string error;
-    if (!started) {
-      error = sink->ensure_dir(parent_path(path));
-      if (!error.empty()) return error;
-      error = sink->store(path, data, size);
-      if (error.empty()) started = true;
-    } else {
-      error = write_continuing(*sink, path, committed, data, size);
-    }
-    if (!error.empty()) return error;
-    crc = static_cast<std::uint32_t>(::crc32(crc, data, static_cast<uInt>(size)));
-    committed += static_cast<std::int64_t>(size);
-    *written += static_cast<std::int64_t>(size);
-    return partial ? kInterrupted : "";
-  }
+struct ExtractContext {
+  InstallSink& sink;
+  std::string staging_root;
+  std::string journal_path;
+  std::int64_t* written;
+  std::int64_t stop;
+  const CancelToken* cancel;
 };
 
-std::string extract_member(VolumeSource& source, InstallSink& sink, const Member& member, const std::string& staging_root,
-                           std::vector<DoneFile>* done, const std::string& journal_path, std::int64_t* written,
-                           std::int64_t stop) {
-  if (member.directory) return sink.ensure_dir(join_storage_path(staging_root, member.name));
-  if (already_done(*done, member)) return source.seek(member.data_offset + static_cast<std::int64_t>(member.comp_size));
-  if (stop >= 0 && *written >= stop) return kInterrupted;
-  if (auto error = source.seek(member.data_offset); !error.empty()) return error;
+bool cancelled(const CancelToken* cancel) { return cancel != nullptr && cancel->cancelled(); }
 
-  const std::string output = join_storage_path(staging_root, member.name);
-  Writer writer;
-  writer.sink = &sink;
-  writer.path = output;
-  writer.stop = stop;
-  writer.written = written;
-  writer.crc = static_cast<std::uint32_t>(::crc32(0L, Z_NULL, 0));
-
-  std::string error;
-  if (member.uncomp_size == 0 && member.comp_size == 0) {
-    const std::uint8_t empty = 0;
-    error = sink.ensure_dir(parent_path(output));
-    if (error.empty()) error = sink.store(output, &empty, 0);
-  } else if (member.method == 0) {
-    std::int64_t left = member.comp_size;
-    std::uint8_t buffer[8192];
-    while (left > 0 && error.empty()) {
-      const auto n = static_cast<std::size_t>(std::min<std::int64_t>(sizeof(buffer), left));
-      error = source.read(buffer, n);
-      if (error.empty()) error = writer.emit(buffer, n);
-      if (error.empty()) left -= static_cast<std::int64_t>(n);
+std::string copy_member(ZipStream& stream, const Member& member, OutputFile& out, const CancelToken* cancel) {
+  constexpr std::size_t kChunk = 64u << 10;
+  std::vector<std::uint8_t> input(kChunk);
+  std::uint64_t left = member.comp_size;
+  if (member.method == 0) {
+    while (left > 0) {
+      if (cancelled(cancel)) return kInterrupted;
+      const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, left));
+      if (auto error = stream.read(input.data(), n); !error.empty()) return error;
+      if (auto error = out.write(input.data(), n); !error.empty()) return error;
+      left -= n;
     }
-  } else {
-    z_stream stream{};
-    if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) return "无法开始解压";
-    std::int64_t left = member.comp_size;
-    std::uint8_t input[16384];
-    int result = Z_OK;
-    while (result != Z_STREAM_END && error.empty()) {
-      if (stream.avail_in == 0) {
-        if (left == 0) {
-          error = "解压数据提前结束";
-          break;
-        }
-        const auto n = static_cast<std::size_t>(std::min<std::int64_t>(sizeof(input), left));
-        error = source.read(input, n);
-        if (!error.empty()) break;
-        left -= static_cast<std::int64_t>(n);
-        stream.next_in = input;
-        stream.avail_in = static_cast<uInt>(n);
-      }
-      std::uint8_t output_buffer[8192];
-      stream.next_out = output_buffer;
-      stream.avail_out = sizeof(output_buffer);
-      result = inflate(&stream, Z_NO_FLUSH);
-      const std::size_t produced = sizeof(output_buffer) - stream.avail_out;
-      if (produced > 0 && error.empty()) error = writer.emit(output_buffer, produced);
-      if (result == Z_STREAM_END) break;
-      if (result != Z_OK && error.empty()) error = "解压失败";
-    }
-    inflateEnd(&stream);
-    if (error.empty() && member.uncomp_size == 0 && !writer.started) {
-      const std::uint8_t empty = 0;
-      error = sink.ensure_dir(parent_path(output));
-      if (error.empty()) error = sink.store(output, &empty, 0);
-    }
+    return "";
   }
-  if (error == kInterrupted) return error;
-  if (!error.empty()) return error;
-  if (writer.committed != static_cast<std::int64_t>(member.uncomp_size) || writer.crc != member.crc) {
+  if (left == 0) return "";
+  z_stream inflater{};
+  if (inflateInit2(&inflater, -MAX_WBITS) != Z_OK) return "无法开始解压";
+  std::vector<std::uint8_t> output(kChunk);
+  std::string error;
+  int result = Z_OK;
+  while (result != Z_STREAM_END && error.empty()) {
+    if (cancelled(cancel)) {
+      error = kInterrupted;
+      break;
+    }
+    if (inflater.avail_in == 0) {
+      if (left == 0) {
+        error = "解压数据提前结束";
+        break;
+      }
+      const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, left));
+      error = stream.read(input.data(), n);
+      if (!error.empty()) break;
+      left -= n;
+      inflater.next_in = input.data();
+      inflater.avail_in = static_cast<uInt>(n);
+    }
+    inflater.next_out = output.data();
+    inflater.avail_out = static_cast<uInt>(output.size());
+    result = inflate(&inflater, Z_NO_FLUSH);
+    const std::size_t produced = output.size() - inflater.avail_out;
+    if (produced > 0) error = out.write(output.data(), produced);
+    if (result != Z_OK && result != Z_STREAM_END && error.empty()) error = "解压失败";
+  }
+  inflateEnd(&inflater);
+  return error;
+}
+
+std::string extract_member(ZipStream& stream, ExtractContext& context, const Member& member, std::vector<FinishedFile>* done) {
+  if (member.directory) return context.sink.ensure_dir(join_storage_path(context.staging_root, member.name));
+  if (already_done(*done, member)) return "";
+  if (context.stop >= 0 && *context.written >= context.stop) return kInterrupted;
+  if (cancelled(context.cancel)) return kInterrupted;
+
+  if (auto error = stream.seek(member.local_offset); !error.empty()) return error;
+  std::uint8_t header[30];
+  if (auto error = stream.read(header, sizeof(header)); !error.empty()) return error;
+  if (read_u32(header) != kLocalHeader) return "ZIP 文件头和目录对不上: " + member.name;
+  if (auto error = stream.skip(read_u16(header + 26) + read_u16(header + 28)); !error.empty()) return error;
+
+  OutputFile out(context.sink, join_storage_path(context.staging_root, member.name), context.stop, context.written);
+  if (auto error = copy_member(stream, member, out, context.cancel); !error.empty()) return error;
+  if (auto error = out.finish(); !error.empty()) return error;
+  if (out.size() != static_cast<std::int64_t>(member.uncomp_size) || out.crc() != member.crc) {
     return "校验和不符: " + member.name;
   }
-  done->push_back(DoneFile{member.name, static_cast<std::int64_t>(member.uncomp_size), member.crc});
-  return save_journal(sink, journal_path, *done);
+  const FinishedFile finished{member.name, static_cast<std::int64_t>(member.uncomp_size), member.crc};
+  done->push_back(finished);
+  return append_journal(context.sink, context.journal_path, finished);
 }
 
 std::string finish_install(InstallSink& sink, const std::string& staging_root, const std::string& final_root,
@@ -437,6 +467,7 @@ void clean_staging(InstallSink& sink, const std::string& staging_root, const std
     return std::count(a.begin(), a.end(), '/') > std::count(b.begin(), b.end(), '/');
   });
   sink.remove_file(journal_path);
+  sink.remove_file(join_storage_path(staging_root, ".panplay-journal.json"));
   for (const auto& dir : ordered) sink.remove_dir(join_storage_path(staging_root, dir));
   sink.remove_dir(staging_root);
   sink.remove_dir(parent_path(staging_root));
@@ -463,15 +494,16 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     snapshot.files_total = total;
     request.on_progress(snapshot);
   };
+  const auto fail = [&](const std::string& message) {
+    result.status = message == kInterrupted ? "interrupted" : "error";
+    result.message = message == kInterrupted ? "已中断，再次执行安装会继续" : message;
+    return result;
+  };
   report("正在读取压缩包…", 0, 0);
 
   std::string error;
   const auto files = collect_archives(drive, request.source_dir, &error);
-  if (!error.empty()) {
-    result.status = "error";
-    result.message = error;
-    return result;
-  }
+  if (!error.empty()) return fail(error);
   const auto sets = group_archives(files);
   std::vector<ArchiveSet> zips;
   std::vector<ArchiveSet> rars;
@@ -481,41 +513,22 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     else if (set.format == "rar") rars.push_back(set);
     else other = true;
   }
-  if (zips.empty() && rars.empty()) {
-    result.status = "error";
-    result.message = other ? "还不能安装 7z" : "这个目录里没有压缩包";
-    return result;
-  }
+  if (zips.empty() && rars.empty()) return fail(other ? "还不能安装 7z" : "这个目录里没有压缩包");
 
-  std::vector<std::vector<Part>> opened(zips.size());
+  std::vector<std::vector<ZipVolume>> zip_sets;
   std::vector<Member> members;
-  std::set<std::string> names;
   for (std::size_t i = 0; i < zips.size(); ++i) {
-    if (auto open_error = open_parts(drive, zips[i].parts, &opened[i]); !open_error.empty()) {
-      result.status = "error";
-      result.message = open_error;
-      return result;
-    }
-    VolumeSource source(&drive, opened[i]);
-    if (auto scan_error = scan_zip(source, static_cast<int>(i), &members); !scan_error.empty()) {
-      result.status = "error";
-      result.message = scan_error;
-      return result;
+    zip_sets.push_back(zip_volumes(zips[i].parts));
+    if (auto zip_error = read_zip_members(drive, zip_sets.back(), static_cast<int>(i), &members); !zip_error.empty()) {
+      return fail(zip_error);
     }
   }
-  std::vector<std::vector<ListedRarEntry>> rar_entries(rars.size());
   for (std::size_t i = 0; i < rars.size(); ++i) {
-    if (auto list_error = list_rar_entries(drive, rars[i].parts, &rar_entries[i]); !list_error.empty()) {
-      result.status = "error";
-      result.message = list_error;
-      return result;
+    std::vector<ListedRarEntry> entries;
+    if (auto list_error = list_rar_entries(drive, rars[i].parts, request.cancel, &entries); !list_error.empty()) {
+      return fail(list_error);
     }
-    for (const auto& entry : rar_entries[i]) {
-      if (entry.size > 0xffffffffu) {
-        result.status = "error";
-        result.message = "有文件超过 4GB，这一版还不能安装";
-        return result;
-      }
+    for (const auto& entry : entries) {
       Member member;
       member.set_index = -1;
       member.name = entry.name;
@@ -525,20 +538,17 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       members.push_back(std::move(member));
     }
   }
+  std::set<std::string> names;
   for (const auto& member : members) {
     if (member.directory) continue;
-    if (!names.insert(member.name).second) {
-      result.status = "error";
-      result.message = "压缩包里有重复文件";
-      return result;
-    }
+    if (!names.insert(member.name).second) return fail("压缩包里有重复文件");
     ++result.files_total;
   }
 
   const std::string staging_root = join_storage_path(request.dest_prefix, ".panplay-staging/" + folder);
   const std::string final_root = join_storage_path(request.dest_prefix, folder);
   const std::string marker_path = join_storage_path(final_root, ".panplay-done.json");
-  const std::string journal_path = join_storage_path(staging_root, ".panplay-journal.json");
+  const std::string journal_path = join_storage_path(staging_root, ".panplay-journal.jsonl");
   const std::string expected = marker_json(title_id, drive.id(), members);
 
   std::vector<std::uint8_t> existing;
@@ -552,21 +562,17 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       return result;
     }
   } else if (error != "missing") {
-    result.status = "error";
-    result.message = error;
-    return result;
+    return fail(error);
   }
 
-  std::vector<DoneFile> done;
-  error = load_journal(sink, journal_path, &done);
-  if (!error.empty()) {
-    result.status = "error";
-    result.message = error;
-    return result;
+  std::vector<FinishedFile> done = load_journal(sink, journal_path);
+  error.clear();
+  if (sink.file_size(journal_path, &error) >= 0) {
+    if (auto write_error = write_journal(sink, journal_path, done); !write_error.empty()) return fail(write_error);
   }
 
   // 日志里可能留着旧版本写入、现在已不属于文件清单的条目，只数当前清单里的文件。
-  const auto count_done = [&](const auto& list) {
+  const auto count_done = [&](const std::vector<FinishedFile>& list) {
     int count = 0;
     for (const auto& file : list) {
       if (names.count(file.name) != 0) ++count;
@@ -577,57 +583,53 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   report("正在安装", result.files_done, result.files_total);
 
   std::int64_t written = 0;
-  for (std::size_t i = 0; i < zips.size(); ++i) {
-    VolumeSource source(&drive, opened[i]);
+  ExtractContext context{sink, staging_root, journal_path, &written, request.stop_after_output_bytes, request.cancel};
+  for (std::size_t i = 0; i < zip_sets.size(); ++i) {
+    std::vector<const Member*> ordered;
     for (const auto& member : members) {
-      if (member.set_index != static_cast<int>(i)) continue;
-      error = extract_member(source, sink, member, staging_root, &done, journal_path, &written, request.stop_after_output_bytes);
-      if (error == kInterrupted) {
-        result.status = "interrupted";
-        result.files_done = count_done(done);
-        result.message = "已中断，已完成 " + std::to_string(result.files_done) + " 个文件，再次执行安装会继续";
-        return result;
-      }
-      if (!error.empty()) {
-        result.status = "error";
-        result.files_done = count_done(done);
-        result.message = error;
-        return result;
-      }
+      if (member.set_index == static_cast<int>(i)) ordered.push_back(&member);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const Member* left, const Member* right) { return left->local_offset < right->local_offset; });
+    ZipStream stream(drive, zip_sets[i], request.cancel, request.prefetch);
+    for (const Member* member : ordered) {
+      error = extract_member(stream, context, *member, &done);
       result.files_done = count_done(done);
+      if (!error.empty()) {
+        if (error == kInterrupted) {
+          result.status = "interrupted";
+          result.message = "已中断，已完成 " + std::to_string(result.files_done) + " 个文件，再次执行安装会继续";
+          return result;
+        }
+        return fail(error);
+      }
       report("正在安装", result.files_done, result.files_total);
     }
   }
-  for (std::size_t i = 0; i < rars.size(); ++i) {
-    std::vector<FinishedFile> finished;
-    for (const auto& file : done) finished.push_back(FinishedFile{file.name, file.size, file.crc});
-    error = extract_rar_entries(drive, sink, rars[i].parts, rar_entries[i], staging_root, &finished, journal_path,
-                                &written, request.stop_after_output_bytes,
-                                [&](const std::vector<FinishedFile>& now_done) {
-                                  result.files_done = count_done(now_done);
-                                  report("正在安装", result.files_done, result.files_total);
-                                });
+  for (const auto& rar : rars) {
+    RarExtract options;
+    options.staging_root = staging_root;
+    options.journal_path = journal_path;
+    options.written = &written;
+    options.stop_after_output_bytes = request.stop_after_output_bytes;
+    options.cancel = request.cancel;
+    options.prefetch = request.prefetch;
+    options.on_file_done = [&](const std::vector<FinishedFile>& now_done) {
+      result.files_done = count_done(now_done);
+      report("正在安装", result.files_done, result.files_total);
+    };
+    error = extract_rar_entries(drive, sink, rar.parts, options, &done);
+    result.files_done = count_done(done);
     if (error == kInterrupted) {
       result.status = "interrupted";
-      result.files_done = count_done(finished);
       result.message = "已中断，已完成 " + std::to_string(result.files_done) + " 个文件，再次执行安装会继续";
       return result;
     }
-    if (!error.empty()) {
-      result.status = "error";
-      result.message = error;
-      return result;
-    }
-    done.clear();
-    for (const auto& file : finished) done.push_back(DoneFile{file.name, file.size, file.crc});
+    if (!error.empty()) return fail(error);
   }
 
   error = finish_install(sink, staging_root, final_root, members, expected, marker_path);
-  if (!error.empty()) {
-    result.status = "error";
-    result.message = error;
-    return result;
-  }
+  if (!error.empty()) return fail(error);
   clean_staging(sink, staging_root, journal_path, members);
   result.status = "installed";
   result.files_done = result.files_total;
@@ -693,17 +695,25 @@ int run_scan_cli(DrivePlugin& drive, const std::string& dir) {
 
 int run_install_cli(DrivePlugin& drive, int argc, char** argv) {
   if (argc < 3) {
-    std::cerr << "用法: panplay install <网盘游戏目录> --to <本机目录或 ftp://主机:端口> [--prefix /mnt/usb0/homebrew]\n";
+    std::cerr << "用法: panplay install <网盘游戏目录> --to <本机目录或 ftp://主机:端口> [--prefix /mnt/usb0/homebrew]"
+                 " [--connections N] [--block-mb M] [--blocks K]\n";
     return 1;
   }
   std::string to;
   std::string prefix = "/mnt/usb0/homebrew";
+  PrefetchOptions prefetch;
   for (int i = 3; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--to" && i + 1 < argc) {
       to = argv[++i];
     } else if (arg == "--prefix" && i + 1 < argc) {
       prefix = argv[++i];
+    } else if (arg == "--connections" && i + 1 < argc) {
+      prefetch.connections = std::max(1, std::atoi(argv[++i]));
+    } else if (arg == "--block-mb" && i + 1 < argc) {
+      prefetch.block_size = static_cast<std::size_t>(std::max(1, std::atoi(argv[++i]))) << 20;
+    } else if (arg == "--blocks" && i + 1 < argc) {
+      prefetch.max_blocks = static_cast<std::size_t>(std::max(1, std::atoi(argv[++i])));
     } else {
       std::cerr << "无法识别的参数\n";
       return 1;
@@ -728,6 +738,10 @@ int run_install_cli(DrivePlugin& drive, int argc, char** argv) {
   InstallRequest request;
   request.source_dir = argv[2];
   request.dest_prefix = prefix;
+  if (prefetch.max_blocks < static_cast<std::size_t>(prefetch.connections) * 2) {
+    prefetch.max_blocks = static_cast<std::size_t>(prefetch.connections) * 2;
+  }
+  request.prefetch = prefetch;
   const InstallResult result = install_game(drive, *sink, request);
   if (result.status == "error") {
     std::cerr << result.message << "\n";

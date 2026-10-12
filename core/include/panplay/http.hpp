@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -10,6 +12,8 @@ struct HttpResponse {
   int status = 0;
   std::string body;
   std::string error;
+  // 跟随重定向后实际请求的地址。
+  std::string final_url;
 };
 
 struct HttpRequest {
@@ -20,6 +24,37 @@ struct HttpRequest {
   int timeout_ms = 0;  // 0 = default (30s receive)
 };
 
+// 边收边读的响应体。
+class HttpStream {
+ public:
+  virtual ~HttpStream() = default;
+  virtual int status() const = 0;
+  // 服务器没给长度时返回 -1。
+  virtual std::int64_t content_length() const = 0;
+  // 跟随重定向后实际请求的地址。
+  virtual std::string final_url() const = 0;
+  // 返回读到的字节数，0 表示响应体结束。
+  virtual std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) = 0;
+  // 可以从其他线程调用，让阻塞中的 read 立刻失败返回。
+  virtual void abort() = 0;
+};
+
+// 持有一个长期会话，同一主机的 TCP 和 TLS 连接会被复用。可以多线程同时使用。
+class HttpClient {
+ public:
+  HttpClient();
+  ~HttpClient();
+  HttpClient(const HttpClient&) = delete;
+  HttpClient& operator=(const HttpClient&) = delete;
+
+  HttpResponse send(const HttpRequest& request);
+  std::unique_ptr<HttpStream> open(const HttpRequest& request, std::string* error);
+
+ private:
+  void* session_ = nullptr;
+};
+
+// 走进程内共享的 HttpClient。
 HttpResponse http_send(const HttpRequest& request);
 
 std::string url_encode(const std::string& value);

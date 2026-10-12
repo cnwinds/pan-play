@@ -69,6 +69,9 @@ HANDLE PASCAL RAROpenArchiveEx(struct RAROpenArchiveDataEx *r)
     // Open shared mode is added by request of dll users, who need to
     // browse and unpack archives while downloading.
     Data->Cmd.OpenShared = true;
+    // panplay: archives are read over the network; quick open jumps to the archive
+    // end before every header, which breaks sequential streaming.
+    Data->Cmd.QOpenMode=QOPEN_NONE;
     if (!Data->Arc.Open(ArcName,FMF_OPENSHARED))
     {
       r->OpenResult=ERAR_EOPEN;

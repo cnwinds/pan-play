@@ -7,10 +7,20 @@
 
 namespace panplay {
 
+// 连续写一个文件。没调用 finish 就销毁时，已写的数据保留，但不保证完整。
+class FileWriter {
+ public:
+  virtual ~FileWriter() = default;
+  virtual std::string write(const std::uint8_t* data, std::size_t size) = 0;
+  virtual std::string finish() = 0;
+};
+
 // 安装写入目标。PC 上可以是本机目录，也可以是模拟 PS5 存放目录的 FTP。
 class InstallSink {
  public:
   virtual ~InstallSink() = default;
+  // 新建或覆盖文件。写入期间不能对同一个 sink 做别的操作。
+  virtual std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) = 0;
   virtual std::string ensure_dir(const std::string& path) = 0;
   // 文件不存在时返回 -1，且不设置 error。
   virtual std::int64_t file_size(const std::string& path, std::string* error) = 0;
@@ -25,10 +35,6 @@ class InstallSink {
   // 只删除空目录。
   virtual std::string remove_dir(const std::string& path) = 0;
 };
-
-// 远端大小必须等于已提交字节才追加。不一致时不写入，调用方应从头 store。
-std::string write_continuing(InstallSink& sink, const std::string& path, std::int64_t committed,
-                             const std::uint8_t* data, std::size_t size);
 
 struct FtpEndpoint {
   std::string host = "127.0.0.1";

@@ -6,6 +6,8 @@
 #include <windows.h>
 #include <winhttp.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cctype>
 
 namespace panplay {
@@ -18,6 +20,77 @@ std::wstring widen(const std::string& value) {
   MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), size);
   return out;
 }
+
+std::string narrow(const std::wstring& value) {
+  if (value.empty()) return {};
+  int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+  std::string out(size, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), size, nullptr, nullptr);
+  return out;
+}
+
+class WinHttpStream final : public HttpStream {
+ public:
+  WinHttpStream(HINTERNET connect, HINTERNET request) : connect_(connect), request_(request) {
+    DWORD status = 0;
+    DWORD size = sizeof(status);
+    WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                        &status, &size, WINHTTP_NO_HEADER_INDEX);
+    status_ = static_cast<int>(status);
+    wchar_t length[32]{};
+    DWORD length_size = sizeof(length);
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX, length, &length_size,
+                            WINHTTP_NO_HEADER_INDEX)) {
+      content_length_ = _wcstoi64(length, nullptr, 10);
+    }
+    DWORD url_size = 0;
+    WinHttpQueryOption(request, WINHTTP_OPTION_URL, nullptr, &url_size);
+    if (url_size > 0) {
+      std::wstring url(url_size / sizeof(wchar_t), L'\0');
+      if (WinHttpQueryOption(request, WINHTTP_OPTION_URL, url.data(), &url_size)) {
+        url.resize(url_size / sizeof(wchar_t));
+        while (!url.empty() && url.back() == L'\0') url.pop_back();
+        final_url_ = narrow(url);
+      }
+    }
+  }
+
+  ~WinHttpStream() override {
+    abort();
+    WinHttpCloseHandle(connect_);
+  }
+
+  int status() const override { return status_; }
+  std::int64_t content_length() const override { return content_length_; }
+  std::string final_url() const override { return final_url_; }
+
+  std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) override {
+    HINTERNET request = request_.load();
+    if (request == nullptr) {
+      *error = "下载已中止";
+      return 0;
+    }
+    DWORD got = 0;
+    const DWORD want = static_cast<DWORD>(std::min<std::size_t>(size, 1u << 30));
+    if (!WinHttpReadData(request, dst, want, &got)) {
+      *error = request_.load() == nullptr ? "下载已中止" : "下载连接中断";
+      return 0;
+    }
+    return got;
+  }
+
+  void abort() override {
+    HINTERNET request = request_.exchange(nullptr);
+    if (request != nullptr) WinHttpCloseHandle(request);
+  }
+
+ private:
+  HINTERNET connect_ = nullptr;
+  std::atomic<HINTERNET> request_{nullptr};
+  int status_ = 0;
+  std::int64_t content_length_ = -1;
+  std::string final_url_;
+};
 
 }  // namespace
 
@@ -36,8 +109,20 @@ std::string url_encode(const std::string& value) {
   return out;
 }
 
-HttpResponse http_send(const HttpRequest& request) {
-  HttpResponse response;
+HttpClient::HttpClient() {
+  session_ = WinHttpOpen(L"panplay/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                         WINHTTP_NO_PROXY_BYPASS, 0);
+}
+
+HttpClient::~HttpClient() {
+  if (session_ != nullptr) WinHttpCloseHandle(static_cast<HINTERNET>(session_));
+}
+
+std::unique_ptr<HttpStream> HttpClient::open(const HttpRequest& request, std::string* error) {
+  if (session_ == nullptr) {
+    *error = "winhttp open failed";
+    return nullptr;
+  }
   const std::wstring url = widen(request.url);
   URL_COMPONENTS parts{};
   parts.dwStructSize = sizeof(parts);
@@ -51,23 +136,13 @@ HttpResponse http_send(const HttpRequest& request) {
   parts.lpszExtraInfo = extra;
   parts.dwExtraInfoLength = 8192;
   if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) {
-    response.error = "invalid url";
-    return response;
+    *error = "invalid url";
+    return nullptr;
   }
-
-  HINTERNET session = WinHttpOpen(L"panplay/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                                  WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!session) {
-    response.error = "winhttp open failed";
-    return response;
-  }
-  const int timeout = request.timeout_ms > 0 ? request.timeout_ms : 30000;
-  WinHttpSetTimeouts(session, 10000, 10000, 20000, timeout);
-  HINTERNET connect = WinHttpConnect(session, host, parts.nPort, 0);
+  HINTERNET connect = WinHttpConnect(static_cast<HINTERNET>(session_), host, parts.nPort, 0);
   if (!connect) {
-    WinHttpCloseHandle(session);
-    response.error = "winhttp connect failed";
-    return response;
+    *error = "winhttp connect failed";
+    return nullptr;
   }
   std::wstring target = path;
   target += extra;
@@ -77,12 +152,12 @@ HttpResponse http_send(const HttpRequest& request) {
                                         WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
   if (!handle) {
     WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
-    response.error = "winhttp request failed";
-    return response;
+    *error = "winhttp request failed";
+    return nullptr;
   }
-
-  DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+  const int timeout = request.timeout_ms > 0 ? request.timeout_ms : 30000;
+  WinHttpSetTimeouts(handle, 10000, 10000, 20000, timeout);
+  DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
   WinHttpSetOption(handle, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof(redirect));
 
   std::wstring header_block;
@@ -97,36 +172,37 @@ HttpResponse http_send(const HttpRequest& request) {
                                  request.body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(request.body.data()),
                                  static_cast<DWORD>(request.body.size()), static_cast<DWORD>(request.body.size()), 0);
   if (!sent || !WinHttpReceiveResponse(handle, nullptr)) {
-    response.error = "request failed";
     WinHttpCloseHandle(handle);
     WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
-    return response;
+    *error = "request failed";
+    return nullptr;
   }
+  return std::make_unique<WinHttpStream>(connect, handle);
+}
 
-  DWORD status = 0;
-  DWORD status_size = sizeof(status);
-  WinHttpQueryHeaders(handle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
-                      &status, &status_size, WINHTTP_NO_HEADER_INDEX);
-  response.status = static_cast<int>(status);
-
-  std::string body;
+HttpResponse HttpClient::send(const HttpRequest& request) {
+  HttpResponse response;
+  auto stream = open(request, &response.error);
+  if (!stream) return response;
+  response.status = stream->status();
+  response.final_url = stream->final_url();
+  std::uint8_t buffer[65536];
   for (;;) {
-    DWORD available = 0;
-    if (!WinHttpQueryDataAvailable(handle, &available)) break;
-    if (available == 0) break;
-    std::string chunk(available, '\0');
-    DWORD read = 0;
-    if (!WinHttpReadData(handle, chunk.data(), available, &read)) break;
-    chunk.resize(read);
-    body += chunk;
+    std::string error;
+    const std::size_t got = stream->read(buffer, sizeof(buffer), &error);
+    if (!error.empty()) {
+      response.error = error;
+      break;
+    }
+    if (got == 0) break;
+    response.body.append(reinterpret_cast<const char*>(buffer), got);
   }
-  response.body = std::move(body);
-
-  WinHttpCloseHandle(handle);
-  WinHttpCloseHandle(connect);
-  WinHttpCloseHandle(session);
   return response;
+}
+
+HttpResponse http_send(const HttpRequest& request) {
+  static HttpClient client;
+  return client.send(request);
 }
 
 }  // namespace panplay

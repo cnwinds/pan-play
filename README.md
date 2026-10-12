@@ -79,7 +79,7 @@ $unrar = @(
   "unpack","headers","threadpool","rs16","cmddata","ui","largepage","filestr","scantree","dll","qopen","isnt","motw"
 ) | ForEach-Object { "third_party/unrar/$_.cpp" }
 $src = @(Get-ChildItem core\src\*.cpp, pc\src\*.cpp | ForEach-Object { $_.FullName }) + $unrar
-& "D:\tools\msys64\mingw64\bin\g++.exe" -std=c++17 -O2 -DRARDLL -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -I core/include -I pc/src -I third_party/unrar @src -lwinhttp -lws2_32 -lz -lole32 -luuid -ladvapi32 -lpowrprof -o build/panplay.exe
+& "D:\tools\msys64\mingw64\bin\g++.exe" -std=c++17 -O2 -DRARDLL -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -I core/include -I pc/src -I third_party/unrar @src -lwinhttp -lws2_32 -lz -lole32 -luuid -ladvapi32 -lpowrprof -lshell32 -o build/panplay.exe
 .\build\panplay.exe self-test
 ```
 

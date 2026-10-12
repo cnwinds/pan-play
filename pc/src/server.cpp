@@ -36,13 +36,23 @@ namespace {
 
 std::string session_path() { return (panplay::app_data_dir() / "baidu-session.json").u8string(); }
 
-std::unique_ptr<panplay::DrivePlugin> open_drive() {
+// 进程内只留一个百度插件实例，下载地址缓存和令牌刷新都在它里面；密钥改了才换新实例。
+std::shared_ptr<panplay::DrivePlugin> open_drive() {
+  static std::mutex mu;
+  static std::shared_ptr<panplay::DrivePlugin> drive;
+  static std::string key;
   const AppSettings settings = load_settings();
-  panplay::BaiduConfig config;
-  config.app_key = settings.app_key;
-  config.secret_key = settings.secret_key;
-  config.session_path = session_path();
-  return panplay::make_baidu_drive(std::move(config));
+  const std::string wanted = settings.app_key + "\n" + settings.secret_key;
+  std::lock_guard<std::mutex> lock(mu);
+  if (!drive || key != wanted) {
+    panplay::BaiduConfig config;
+    config.app_key = settings.app_key;
+    config.secret_key = settings.secret_key;
+    config.session_path = session_path();
+    drive = panplay::make_baidu_drive(std::move(config));
+    key = wanted;
+  }
+  return drive;
 }
 
 std::filesystem::path ui_root() {
@@ -68,6 +78,7 @@ struct Job {
   bool running = false;
   std::string path;
   panplay::InstallResult result;
+  std::shared_ptr<panplay::CancelToken> cancel;
   std::thread worker;
 };
 
@@ -105,7 +116,7 @@ std::string game_state(panplay::InstallSink& sink, const std::string& prefix, co
   std::string error;
   if (sink.file_size(marker, &error) >= 0 && error.empty()) return "installed";
   const std::string journal =
-      panplay::join_storage_path(panplay::join_storage_path(prefix, ".panplay-staging/" + folder), ".panplay-journal.json");
+      panplay::join_storage_path(panplay::join_storage_path(prefix, ".panplay-staging/" + folder), ".panplay-journal.jsonl");
   error.clear();
   if (sink.file_size(journal, &error) >= 0 && error.empty()) return "continue";
   return "install";
@@ -319,7 +330,7 @@ void publish_progress(const panplay::InstallResult& snapshot) {
   job.result.files_total = snapshot.files_total;
 }
 
-void run_install(std::string path) {
+void run_install(std::string path, std::shared_ptr<panplay::CancelToken> cancel) {
   panplay::InstallResult result;
   try {
     panplay::InstallResult starting;
@@ -342,6 +353,7 @@ void run_install(std::string path) {
         request.source_dir = path;
         request.dest_prefix = settings.prefix;
         request.on_progress = publish_progress;
+        request.cancel = cancel.get();
         result = panplay::install_game(*drive, *sink, request);
       }
     }
@@ -677,7 +689,8 @@ void handle_client(SOCKET client) {
       job.running = true;
       job.path = json.str("path");
       job.result = {};
-      job.worker = std::thread(run_install, job.path);
+      job.cancel = std::make_shared<panplay::CancelToken>();
+      job.worker = std::thread(run_install, job.path, job.cancel);
     }
     if (previous.joinable()) previous.join();
     reply_json(client, 200, "{\"ok\":true}");
