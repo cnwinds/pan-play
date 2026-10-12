@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>盘游</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Serif+SC:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="room">
+    <header class="mast">
+      <div class="brand">
+        <h1 class="wordmark">盘游</h1>
+        <p class="lede" id="lede">从网盘把游戏装进主机目录。</p>
+      </div>
+      <nav class="tabs" aria-label="主视图">
+        <button type="button" id="show-shelf" class="tab">游戏</button>
+        <button type="button" id="show-settings" class="tab">设置</button>
+      </nav>
+    </header>
+
+    <main id="shelf-view" class="view view-shelf">
+      <section class="login" id="login-box">
+        <div class="login-panel">
+          <div class="crt-frame">
+            <div class="crt-screen">
+              <p class="login-status" id="login-text">正在确认登录…</p>
+              <button type="button" id="start-login" class="login-action">显示二维码</button>
+              <figure class="qr-wrap">
+                <img id="qr" alt="" hidden>
+              </figure>
+              <p class="user-code" id="user-code"></p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div class="shelf-stage">
+        <nav class="shelf-pager" id="shelf-pager" hidden aria-label="游戏列表翻页">
+          <button type="button" id="shelf-prev" class="pager-btn">上一页</button>
+          <p class="pager-info" id="shelf-pager-info">第 1 / 1 页，共 0 个</p>
+          <button type="button" id="shelf-next" class="pager-btn">下一页</button>
+        </nav>
+        <section class="shelf" id="shelf" aria-label="游戏封面墙"></section>
+        <div class="shelf-plank" aria-hidden="true"></div>
+      </div>
+
+    </main>
+
+    <main id="settings-view" class="view view-settings" hidden>
+      <div class="settings-panel">
+        <header class="settings-head">
+          <h2>连接与路径</h2>
+          <p>填写百度网盘凭证和 PS5 安装路径，保存在本机。</p>
+        </header>
+        <form id="settings-form">
+          <fieldset class="field-group">
+            <legend>百度网盘</legend>
+            <label>AppKey<input name="app_key" autocomplete="off" spellcheck="false"></label>
+            <label>SecretKey<input name="secret_key" type="password" autocomplete="off" spellcheck="false"></label>
+          </fieldset>
+          <fieldset class="field-group">
+            <legend>安装路径</legend>
+            <label>游戏库目录<input name="library_path" placeholder="/apps/应用名" spellcheck="false"></label>
+            <label>存放位置<input name="dest" placeholder="本机目录，或 ftp://127.0.0.1:2121" spellcheck="false"></label>
+            <label>主机目录前缀<input name="prefix" spellcheck="false"></label>
+          </fieldset>
+          <div class="settings-actions">
+            <button type="submit" class="save-btn">保存设置</button>
+            <p class="settings-note" id="settings-note"></p>
+          </div>
+        </form>
+        <section class="catalog-panel" aria-labelledby="catalog-heading">
+          <header class="settings-head">
+            <h2 id="catalog-heading">游戏资料库</h2>
+            <p>Title ID 与名称来自 PlayStation-Titles（MIT）。serve 启动后会自动在后台同步，无需手动运行脚本。</p>
+          </header>
+          <p class="catalog-status" id="catalog-status">正在读取资料库状态…</p>
+          <div class="settings-actions">
+            <button type="button" class="save-btn catalog-reload-btn" id="catalog-reload">重新加载资料库</button>
+            <p class="settings-note" id="catalog-note"></p>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div class="detail-overlay" id="detail-overlay" hidden>
+    <button type="button" class="detail-backdrop" id="detail-backdrop" tabindex="-1" aria-label="关闭详情"></button>
+    <section class="detail" id="detail" role="dialog" aria-modal="true" aria-label="游戏详情">
+      <button type="button" class="detail-close" id="detail-close" aria-label="关闭">&times;</button>
+      <div class="detail-body" id="detail-body"></div>
+    </section>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
