@@ -44,11 +44,14 @@
         <div class="filters" role="group" aria-label="筛选">
           <button type="button" class="filter" data-filter="all" aria-pressed="true">全部</button>
           <button type="button" class="filter" data-filter="installed" aria-pressed="false">已安装</button>
+          <button type="button" class="filter" data-filter="continue" aria-pressed="false">未装完</button>
           <button type="button" class="filter" data-filter="todo" aria-pressed="false">未安装</button>
         </div>
       </header>
       <div class="shelf" id="shelf"></div>
       <p class="empty" id="shelf-empty" hidden></p>
+      <p class="shelf-more" id="shelf-more" role="status" hidden></p>
+      <div class="shelf-end" id="shelf-end" aria-hidden="true"></div>
     </section>
   </main>
 
@@ -106,16 +109,26 @@
     </section>
   </main>
 
-  <aside class="dock" id="dock" hidden aria-label="安装进度">
-    <button type="button" class="dock-open" id="dock-open">
-      <span class="dock-art" id="dock-art"></span>
-      <span class="dock-text">
-        <strong id="dock-title"></strong>
-        <span id="dock-status" role="status"></span>
-      </span>
-    </button>
-    <span class="meter dock-meter" aria-hidden="true"><span id="dock-meter"></span></span>
-    <button type="button" class="btn quiet small" id="dock-action">取消</button>
+  <aside class="dock" id="dock" hidden aria-label="安装队列">
+    <div class="dock-panel" id="dock-panel" hidden>
+      <div class="dock-panel-head">
+        <h2>安装队列</h2>
+        <button type="button" class="link" id="dock-clear">清除已完成</button>
+      </div>
+      <ol class="queue-list" id="queue-list"></ol>
+    </div>
+    <div class="dock-bar">
+      <button type="button" class="dock-open" id="dock-toggle" aria-expanded="false" aria-controls="dock-panel">
+        <span class="dock-art" id="dock-art"></span>
+        <span class="dock-text">
+          <strong id="dock-title"></strong>
+          <span id="dock-status" role="status"></span>
+        </span>
+        <span class="chevron" aria-hidden="true"></span>
+      </button>
+      <span class="meter dock-meter" aria-hidden="true"><span id="dock-meter"></span></span>
+      <button type="button" class="btn quiet small" id="dock-action">取消</button>
+    </div>
   </aside>
 
   <div class="drawer-root" id="detail-overlay" hidden>

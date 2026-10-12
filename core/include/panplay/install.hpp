@@ -21,6 +21,8 @@ struct InstallResult {
   // 按压缩包读到的位置算的进度。RAR 要解压完才知道有多少文件，安装中 files_total 可能一直是 0。
   std::int64_t bytes_done = 0;
   std::int64_t bytes_total = 0;
+  // 失败原因在压缩包本身（比如是 PKG 安装包）时为 false，再装一次结果也一样。
+  bool retryable = true;
 };
 
 struct InstallRequest {

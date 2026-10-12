@@ -22,6 +22,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -73,16 +74,34 @@ std::string read_file(const std::filesystem::path& path) {
   return buffer.str();
 }
 
-struct Job {
-  std::mutex mu;
-  bool running = false;
+struct InstallTask {
   std::string path;
   panplay::InstallResult result;
   std::shared_ptr<panplay::CancelToken> cancel;
+};
+
+// 安装队列：一次只装一个，装完自动接着装下一个。正在装的和排队的会存到磁盘，程序重开后接着装。
+// finished 是这次运行里装完、失败或取消的，最近的在前，用户可以清掉。
+struct InstallQueue {
+  std::mutex mu;
+  std::unique_ptr<InstallTask> current;
+  std::deque<InstallTask> waiting;
+  std::deque<InstallTask> finished;
+  bool worker_running = false;
   std::thread worker;
 };
 
-Job job;
+InstallQueue installs;
+constexpr std::size_t kFinishedKept = 50;
+
+// 正在装的是 "installing"，排队的是 "queued"，不在队列里没有记录。
+std::map<std::string, std::string> queue_states() {
+  std::lock_guard<std::mutex> lock(installs.mu);
+  std::map<std::string, std::string> states;
+  if (installs.current) states[installs.current->path] = "installing";
+  for (const auto& task : installs.waiting) states[task.path] = "queued";
+  return states;
+}
 
 void send_all(SOCKET socket, const std::string& data) {
   std::size_t sent = 0;
@@ -136,15 +155,11 @@ std::string formats_of(const panplay::GameFolder& game) {
 struct ShelfPlacement {
   std::unordered_set<std::string> installed_dirs;
   std::unordered_set<std::string> staging_dirs;
-  std::string active_path;
+  std::map<std::string, std::string> queued;
 };
 
 ShelfPlacement read_shelf_placement(panplay::InstallSink& sink, const std::string& prefix) {
   ShelfPlacement placement;
-  {
-    std::lock_guard<std::mutex> lock(job.mu);
-    if (job.running) placement.active_path = job.path;
-  }
   std::string error;
   for (const auto& name : sink.list_children(prefix, &error)) {
     if (name != ".panplay-staging") placement.installed_dirs.insert(name);
@@ -159,7 +174,8 @@ ShelfPlacement read_shelf_placement(panplay::InstallSink& sink, const std::strin
 std::string shelf_state(const ShelfPlacement& placement, const std::string& name, const std::string& title_id,
                         const std::string& path) {
   const std::string folder = title_id.empty() ? name : title_id;
-  if (!placement.active_path.empty() && placement.active_path == path) return "installing";
+  const auto queued = placement.queued.find(path);
+  if (queued != placement.queued.end()) return queued->second;
   if (placement.staging_dirs.count(folder) != 0) return "continue";
   if (placement.installed_dirs.count(folder) != 0) return "installed";
   return "install";
@@ -190,8 +206,9 @@ using NameOverrides = std::map<std::string, std::string>;
 std::string name_key(const std::string& name, const std::string& title_id) { return title_id.empty() ? name : title_id; }
 
 // 展示名：手动改名 > 商店名称 > PlayStation-Titles 英文名 > 目录名（由页面兜底）。
+// search_text 不为空时写入展示名和英文名，供游戏库搜索用。
 std::string game_meta_fields(const std::string& name, const std::string& title_id, const NameOverrides& overrides,
-                             bool detail) {
+                             bool detail, std::string* search_text = nullptr) {
   panplay::CatalogMatch match;
   if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
   const std::int64_t concept_id = match.found ? match.entry.concept_id : 0;
@@ -213,6 +230,8 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
     display_name = match.entry.name;
     name_source = "catalog";
   }
+
+  if (search_text != nullptr) *search_text = display_name + "\n" + (match.found ? match.entry.name : "");
 
   std::string cover_url;
   if (meta.has_cover) cover_url = "/api/cover/" + std::to_string(concept_id) + "?v=" + std::to_string(meta.fetched_at);
@@ -241,12 +260,11 @@ std::string meta_json(const std::string& name, const NameOverrides& overrides, b
          game_meta_fields(name, title_id, overrides, detail) + "}";
 }
 
-std::string folder_json(const std::string& name, const std::string& path, const std::string& state,
-                        const NameOverrides& overrides) {
-  const std::string title_id = panplay::find_title_id(name);
+std::string folder_json(const std::string& name, const std::string& path, const std::string& title_id,
+                        const std::string& state, const std::string& meta_fields) {
   return "{\"name\":\"" + panplay::json_escape(name) + "\",\"path\":\"" + panplay::json_escape(path) + "\",\"title_id\":\"" +
          panplay::json_escape(title_id) + "\",\"archive_bytes\":0,\"formats\":\"\",\"state\":\"" + state + "\"" +
-         game_meta_fields(name, title_id, overrides, false) + "}";
+         meta_fields + "}";
 }
 
 std::string folder_name_of(const std::string& path) {
@@ -260,35 +278,125 @@ std::string image_type(const std::string& bytes) {
   return "image/jpeg";
 }
 
-std::string games_json(panplay::DrivePlugin& drive) {
-  const AppSettings settings = load_settings();
-  std::string error;
-  const auto children = drive.list(settings.library_path, &error);
-  if (!error.empty()) return json_error(error);
-  panplay::Destination destination;
-  const bool dest_ready = !settings.dest.empty() && panplay::parse_destination(settings.dest, &destination, &error);
-  std::unique_ptr<panplay::InstallSink> sink;
+// 游戏库目录和主机上的安装情况。读一次要列网盘目录、连主机，约两秒，所以缓存起来：
+// 翻页、搜索、切换筛选都用缓存，只有页面要求刷新（首次打开、装完一个游戏）或设置变了才重读。
+struct ShelfListing {
+  struct Folder {
+    std::string name;
+    std::string path;
+    std::string title_id;
+  };
+  std::string key;
+  std::vector<Folder> folders;
+  bool dest_ready = false;
+  bool sink_ready = false;
   ShelfPlacement placement;
-  if (dest_ready) {
-    sink = panplay::open_destination(destination, &error);
-    if (sink) placement = read_shelf_placement(*sink, settings.prefix);
-  }
-  const NameOverrides overrides = load_name_overrides();
-  std::string json = "{\"games\":[";
-  bool first = true;
+};
+
+std::mutex shelf_mu;
+std::shared_ptr<const ShelfListing> shelf_cache;
+
+std::shared_ptr<const ShelfListing> shelf_listing(panplay::DrivePlugin& drive, bool fresh, std::string* error) {
+  const AppSettings settings = load_settings();
+  const std::string key = settings.library_path + "\n" + settings.dest + "\n" + settings.prefix;
+  std::lock_guard<std::mutex> lock(shelf_mu);
+  if (!fresh && shelf_cache && shelf_cache->key == key) return shelf_cache;
+  const auto children = drive.list(settings.library_path, error);
+  if (!error->empty()) return nullptr;
+  auto listing = std::make_shared<ShelfListing>();
+  listing->key = key;
   for (const auto& child : children) {
     if (!child.is_dir) continue;
-    if (!first) json += ",";
-    first = false;
     const std::string path = child.path.empty() ? panplay::join_storage_path(settings.library_path, child.name) : child.path;
-    const std::string title_id = panplay::find_title_id(child.name);
-    std::string state = "need-settings";
-    if (sink) state = shelf_state(placement, child.name, title_id, path);
-    else if (dest_ready) state = "install";
-    json += folder_json(child.name, path, state, overrides);
+    listing->folders.push_back({child.name, path, panplay::find_title_id(child.name)});
   }
-  json += "]}";
-  return json;
+  panplay::Destination destination;
+  std::string dest_error;
+  listing->dest_ready = !settings.dest.empty() && panplay::parse_destination(settings.dest, &destination, &dest_error);
+  if (listing->dest_ready) {
+    if (auto sink = panplay::open_destination(destination, &dest_error)) {
+      listing->sink_ready = true;
+      listing->placement = read_shelf_placement(*sink, settings.prefix);
+    }
+  }
+  shelf_cache = listing;
+  return listing;
+}
+
+std::string url_decode(const std::string& text) {
+  std::string out;
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '+') {
+      out += ' ';
+    } else if (text[i] == '%' && i + 2 < text.size() && std::isxdigit(static_cast<unsigned char>(text[i + 1])) &&
+               std::isxdigit(static_cast<unsigned char>(text[i + 2]))) {
+      out += static_cast<char>(std::stoi(text.substr(i + 1, 2), nullptr, 16));
+      i += 2;
+    } else {
+      out += text[i];
+    }
+  }
+  return out;
+}
+
+std::string query_param(const std::string& query, const std::string& key) {
+  std::size_t start = 0;
+  while (start <= query.size()) {
+    const auto end = std::min(query.find('&', start), query.size());
+    const std::string pair = query.substr(start, end - start);
+    const auto eq = pair.find('=');
+    if (pair.substr(0, eq) == key) return eq == std::string::npos ? "" : url_decode(pair.substr(eq + 1));
+    start = end + 1;
+  }
+  return "";
+}
+
+std::string ascii_lower(std::string text) {
+  for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return text;
+}
+
+// 一页游戏。filter 是 all/installed/continue（装到一半）/todo（没装过），q 匹配目录名、Title ID、展示名和英文名。
+// total 是符合筛选的总数，all/installed 是整个游戏库的数量。
+std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
+  const bool fresh = query_param(query, "fresh") == "1";
+  const std::string filter = query_param(query, "filter");
+  const std::string needle = ascii_lower(query_param(query, "q"));
+  const std::size_t offset = static_cast<std::size_t>(std::max(0L, std::strtol(query_param(query, "offset").c_str(), nullptr, 10)));
+  long limit = std::strtol(query_param(query, "limit").c_str(), nullptr, 10);
+  if (limit <= 0 || limit > 500) limit = 500;
+
+  std::string error;
+  const auto listing = shelf_listing(drive, fresh, &error);
+  if (!listing) return json_error(error);
+  ShelfPlacement placement = listing->placement;
+  placement.queued = queue_states();
+  const NameOverrides overrides = load_name_overrides();
+  std::string items;
+  std::size_t matched = 0;
+  std::size_t installed = 0;
+  for (const auto& folder : listing->folders) {
+    std::string state = "need-settings";
+    if (listing->sink_ready) state = shelf_state(placement, folder.name, folder.title_id, folder.path);
+    else if (listing->dest_ready) state = "install";
+    if (state == "installed") ++installed;
+    if (filter == "installed" && state != "installed") continue;
+    if (filter == "todo" && (state == "installed" || state == "continue")) continue;
+    if (filter == "continue" && state != "continue") continue;
+    std::string search_text;
+    const std::string meta = game_meta_fields(folder.name, folder.title_id, overrides, false, &search_text);
+    if (!needle.empty() &&
+        ascii_lower(folder.name + "\n" + folder.title_id + "\n" + search_text).find(needle) == std::string::npos) {
+      continue;
+    }
+    const std::size_t index = matched++;
+    if (index < offset || index >= offset + static_cast<std::size_t>(limit)) continue;
+    if (!items.empty()) items += ",";
+    items += folder_json(folder.name, folder.path, folder.title_id, state, meta);
+  }
+  return "{\"games\":[" + items + "],\"offset\":" + std::to_string(offset) + ",\"total\":" + std::to_string(matched) +
+         ",\"all\":" + std::to_string(listing->folders.size()) + ",\"installed\":" + std::to_string(installed) +
+         ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + "}";
 }
 
 std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) {
@@ -312,10 +420,8 @@ std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) 
   }
   if (sink) state = game_state(*sink, settings.prefix, game);
   else if (!settings.dest.empty()) state = "install";
-  {
-    std::lock_guard<std::mutex> lock(job.mu);
-    if (job.running && job.path == path) state = "installing";
-  }
+  const auto queued = queue_states();
+  if (queued.count(path) != 0) state = queued.at(path);
   return "{\"name\":\"" + panplay::json_escape(game.name) + "\",\"path\":\"" + panplay::json_escape(game.path) +
          "\",\"title_id\":\"" + panplay::json_escape(game.title_id) + "\",\"archive_bytes\":" +
          std::to_string(game.archive_bytes) + ",\"formats\":\"" + panplay::json_escape(formats_of(game)) +
@@ -323,16 +429,36 @@ std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) 
 }
 
 void publish_progress(const panplay::InstallResult& snapshot) {
-  std::lock_guard<std::mutex> lock(job.mu);
-  if (!job.running || (job.cancel && job.cancel->cancelled())) return;
-  job.result.message = snapshot.message;
-  job.result.files_done = snapshot.files_done;
-  job.result.files_total = snapshot.files_total;
-  job.result.bytes_done = snapshot.bytes_done;
-  job.result.bytes_total = snapshot.bytes_total;
+  std::lock_guard<std::mutex> lock(installs.mu);
+  InstallTask* task = installs.current.get();
+  if (task == nullptr || task->cancel->cancelled()) return;
+  task->result.message = snapshot.message;
+  task->result.files_done = snapshot.files_done;
+  task->result.files_total = snapshot.files_total;
+  task->result.bytes_done = snapshot.bytes_done;
+  task->result.bytes_total = snapshot.bytes_total;
 }
 
-void run_install(std::string path, std::shared_ptr<panplay::CancelToken> cancel) {
+std::filesystem::path queue_file() { return panplay::app_data_dir() / "install-queue.json"; }
+
+void save_queue_locked() {
+  std::string json = "{\"paths\":[";
+  bool first = true;
+  const auto add = [&](const InstallTask& task) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + panplay::json_escape(task.path) + "\"";
+  };
+  if (installs.current) add(*installs.current);
+  for (const auto& task : installs.waiting) add(task);
+  json += "]}";
+  std::error_code ec;
+  std::filesystem::create_directories(queue_file().parent_path(), ec);
+  std::ofstream out(queue_file(), std::ios::binary | std::ios::trunc);
+  out << json;
+}
+
+panplay::InstallResult run_install(const std::string& path, panplay::CancelToken* cancel) {
   panplay::InstallResult result;
   try {
     panplay::InstallResult starting;
@@ -355,7 +481,7 @@ void run_install(std::string path, std::shared_ptr<panplay::CancelToken> cancel)
         request.source_dir = path;
         request.dest_prefix = settings.prefix;
         request.on_progress = publish_progress;
-        request.cancel = cancel.get();
+        request.cancel = cancel;
         result = panplay::install_game(*drive, *sink, request);
       }
     }
@@ -370,9 +496,94 @@ void run_install(std::string path, std::shared_ptr<panplay::CancelToken> cancel)
     result.status = "error";
     result.message = result.message.empty() ? "安装失败" : result.message;
   }
-  std::lock_guard<std::mutex> lock(job.mu);
-  job.result = result;
-  job.running = false;
+  return result;
+}
+
+void queue_worker() {
+  for (;;) {
+    std::string path;
+    std::shared_ptr<panplay::CancelToken> cancel;
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      if (installs.waiting.empty()) {
+        installs.worker_running = false;
+        return;
+      }
+      installs.current = std::make_unique<InstallTask>(std::move(installs.waiting.front()));
+      installs.waiting.pop_front();
+      installs.current->cancel = std::make_shared<panplay::CancelToken>();
+      installs.current->result = {};
+      installs.current->result.message = "正在读取压缩包…";
+      path = installs.current->path;
+      cancel = installs.current->cancel;
+    }
+    const panplay::InstallResult result = run_install(path, cancel.get());
+    std::lock_guard<std::mutex> lock(installs.mu);
+    InstallTask done = std::move(*installs.current);
+    installs.current.reset();
+    done.result = result;
+    done.cancel.reset();
+    installs.finished.push_front(std::move(done));
+    if (installs.finished.size() > kFinishedKept) installs.finished.pop_back();
+    save_queue_locked();
+  }
+}
+
+void start_worker_locked() {
+  if (installs.worker_running || installs.waiting.empty()) return;
+  if (installs.worker.joinable()) installs.worker.join();
+  installs.worker_running = true;
+  installs.worker = std::thread(queue_worker);
+}
+
+void load_queue() {
+  std::string error;
+  const panplay::Json json = panplay::Json::parse(read_file(queue_file()), &error);
+  const panplay::Json* paths = json.get("paths");
+  if (!error.empty() || paths == nullptr) return;
+  std::lock_guard<std::mutex> lock(installs.mu);
+  for (const auto& item : paths->array) {
+    if (item.type != panplay::Json::Type::string || item.text.empty()) continue;
+    InstallTask task;
+    task.path = item.text;
+    installs.waiting.push_back(std::move(task));
+  }
+  start_worker_locked();
+}
+
+std::string task_json(const InstallTask& task, const char* state, const NameOverrides& overrides) {
+  const std::string name = task.path.substr(task.path.find_last_of('/') + 1);
+  const std::string title_id = panplay::find_title_id(name);
+  const panplay::InstallResult& r = task.result;
+  return std::string("{\"path\":\"") + panplay::json_escape(task.path) + "\",\"name\":\"" + panplay::json_escape(name) +
+         "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\",\"state\":\"" + state + "\",\"status\":\"" +
+         panplay::json_escape(r.status) + "\",\"message\":\"" + panplay::json_escape(r.message) +
+         "\",\"files_done\":" + std::to_string(r.files_done) + ",\"files_total\":" + std::to_string(r.files_total) +
+         ",\"bytes_done\":" + std::to_string(r.bytes_done) + ",\"bytes_total\":" + std::to_string(r.bytes_total) +
+         ",\"retryable\":" + (r.retryable ? "true" : "false") + game_meta_fields(name, title_id, overrides, false) + "}";
+}
+
+// 队列顺序：正在装的，排队的，最近完成的。
+std::string queue_json() {
+  const NameOverrides overrides = load_name_overrides();
+  std::lock_guard<std::mutex> lock(installs.mu);
+  std::string items;
+  const auto add = [&](const InstallTask& task, const char* state) {
+    if (!items.empty()) items += ",";
+    items += task_json(task, state, overrides);
+  };
+  if (installs.current) add(*installs.current, "running");
+  for (const auto& task : installs.waiting) add(task, "queued");
+  for (const auto& task : installs.finished) add(task, "done");
+  return "{\"tasks\":[" + items + "]}";
+}
+
+template <typename Tasks>
+bool erase_path(Tasks& tasks, const std::string& path) {
+  const auto it = std::find_if(tasks.begin(), tasks.end(), [&](const InstallTask& task) { return task.path == path; });
+  if (it == tasks.end()) return false;
+  tasks.erase(it);
+  return true;
 }
 
 std::string request_target(const std::string& header) {
@@ -658,57 +869,69 @@ void handle_client(SOCKET client) {
     reply_json(client, payload.rfind("{\"error\"", 0) == 0 ? 400 : 200, payload);
     return;
   }
-  if (method == "GET" && target == "/api/games") {
+  if (method == "GET" && (target == "/api/games" || target.rfind("/api/games?", 0) == 0)) {
     auto drive = open_drive();
-    const std::string json = games_json(*drive);
+    const auto mark = target.find('?');
+    const std::string json = games_json(*drive, mark == std::string::npos ? "" : target.substr(mark + 1));
     reply_json(client, json.rfind("{\"error\"", 0) == 0 ? 400 : 200, json);
     return;
   }
-  if (method == "GET" && target == "/api/job") {
-    std::lock_guard<std::mutex> lock(job.mu);
-    reply_json(client, 200,
-               std::string("{\"running\":") + (job.running ? "true" : "false") + ",\"path\":\"" +
-                   panplay::json_escape(job.path) + "\",\"status\":\"" + panplay::json_escape(job.result.status) +
-                   "\",\"message\":\"" + panplay::json_escape(job.result.message) + "\",\"files_done\":" +
-                   std::to_string(job.result.files_done) + ",\"files_total\":" + std::to_string(job.result.files_total) +
-                   ",\"bytes_done\":" + std::to_string(job.result.bytes_done) +
-                   ",\"bytes_total\":" + std::to_string(job.result.bytes_total) + "}");
+  if (method == "GET" && target == "/api/queue") {
+    reply_json(client, 200, queue_json());
     return;
   }
-  if (method == "POST" && target == "/api/install") {
+  if (method == "POST" && target == "/api/queue/clear") {
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      installs.finished.clear();
+    }
+    reply_json(client, 200, queue_json());
+    return;
+  }
+  // 加入队列（install）、移出或取消（remove）、排到下一个（first）都按游戏目录指定。
+  if (method == "POST" && (target == "/api/install" || target == "/api/queue/remove" || target == "/api/queue/first")) {
     std::string parse_error;
     const panplay::Json json = panplay::Json::parse(body, &parse_error);
-    if (!parse_error.empty() || json.str("path").empty()) {
+    const std::string path = json.str("path");
+    if (!parse_error.empty() || path.empty()) {
       reply_json(client, 400, json_error(parse_error.empty() ? "缺少游戏目录" : parse_error));
       return;
     }
-    std::thread previous;
     {
-      std::lock_guard<std::mutex> lock(job.mu);
-      if (job.running) {
-        reply_json(client, 409, json_error("已经有一个安装在进行"));
+      std::lock_guard<std::mutex> lock(installs.mu);
+      const bool running = installs.current && installs.current->path == path;
+      const auto waiting = std::find_if(installs.waiting.begin(), installs.waiting.end(),
+                                        [&](const InstallTask& task) { return task.path == path; });
+      if (target == "/api/install") {
+        if (running || waiting != installs.waiting.end()) {
+          reply_json(client, 409, json_error("这个游戏已经在安装队列里"));
+          return;
+        }
+        erase_path(installs.finished, path);
+        InstallTask task;
+        task.path = path;
+        installs.waiting.push_back(std::move(task));
+        start_worker_locked();
+      } else if (target == "/api/queue/first") {
+        if (waiting == installs.waiting.end()) {
+          reply_json(client, 409, json_error("这个游戏不在排队"));
+          return;
+        }
+        InstallTask task = std::move(*waiting);
+        installs.waiting.erase(waiting);
+        installs.waiting.push_front(std::move(task));
+      } else if (running) {
+        installs.current->cancel->cancel();
+        installs.current->result.message = "正在取消…";
+      } else if (waiting != installs.waiting.end()) {
+        installs.waiting.erase(waiting);
+      } else if (!erase_path(installs.finished, path)) {
+        reply_json(client, 409, json_error("这个游戏不在安装队列里"));
         return;
       }
-      if (job.worker.joinable()) previous = std::move(job.worker);
-      job.running = true;
-      job.path = json.str("path");
-      job.result = {};
-      job.cancel = std::make_shared<panplay::CancelToken>();
-      job.worker = std::thread(run_install, job.path, job.cancel);
+      save_queue_locked();
     }
-    if (previous.joinable()) previous.join();
-    reply_json(client, 200, "{\"ok\":true}");
-    return;
-  }
-  if (method == "POST" && target == "/api/cancel") {
-    std::lock_guard<std::mutex> lock(job.mu);
-    if (!job.running || !job.cancel) {
-      reply_json(client, 409, json_error("没有正在进行的安装"));
-      return;
-    }
-    job.cancel->cancel();
-    job.result.message = "正在取消…";
-    reply_json(client, 200, "{\"ok\":true}");
+    reply_json(client, 200, queue_json());
     return;
   }
   reply_json(client, 404, json_error("没有这个页面"));
@@ -746,6 +969,7 @@ int run_server(int port) {
     return 1;
   }
   std::cout << "盘游界面 http://127.0.0.1:" << port << "\n按 Ctrl+C 结束" << std::endl;
+  load_queue();
   while (true) {
     SOCKET client = accept(listener, nullptr, nullptr);
     if (client == INVALID_SOCKET) break;

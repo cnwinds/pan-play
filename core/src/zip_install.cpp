@@ -606,6 +606,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   const auto fail = [&](const std::string& message) {
     result.status = message == kInterrupted ? "interrupted" : "error";
     result.message = message == kInterrupted ? "已中断，再次执行安装会继续" : message;
+    result.retryable = !is_install_package_error(message);
     return result;
   };
   const auto interrupted = [&]() {
@@ -655,6 +656,13 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       return fail(zip_error);
     }
     for (auto& member : source.members) member.staged = source.prefix + member.name;
+    const bool any_sys = std::any_of(source.members.begin(), source.members.end(),
+                                     [](const Member& member) { return in_sce_sys(member.name); });
+    for (const auto& member : source.members) {
+      if (!any_sys && !member.directory && is_install_package(member.name, static_cast<std::int64_t>(member.uncomp_size))) {
+        return fail(install_package_error(member.name));
+      }
+    }
     if (auto root_error = find_game_root(source.members, &source.root, &source.has_param); !root_error.empty()) {
       return fail(root_error);
     }
@@ -797,6 +805,12 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       }
       Member& earlier = members[found->second.first];
       if (earlier.directory && final_member.directory) continue;
+      // 资源站往每个压缩包里塞的同一份说明文件之类，内容一样，留一份就行。
+      if (!earlier.directory && !final_member.directory && earlier.uncomp_size == final_member.uncomp_size &&
+          earlier.crc == final_member.crc) {
+        leftovers.push_back(final_member.staged);
+        continue;
+      }
       const bool patch_over_game = found->second.second->has_param && !source->has_param;
       if (earlier.directory != final_member.directory || !patch_over_game) return fail("压缩包里有重复文件");
       leftovers.push_back(earlier.staged);

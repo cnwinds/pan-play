@@ -5,6 +5,8 @@ const settingsView = $("#settings-view");
 const library = $("#library");
 const shelf = $("#shelf");
 const shelfEmpty = $("#shelf-empty");
+const shelfMore = $("#shelf-more");
+const shelfEnd = $("#shelf-end");
 const gameCount = $("#game-count");
 const lede = $("#lede");
 const search = $("#search");
@@ -23,6 +25,10 @@ const dockTitle = $("#dock-title");
 const dockStatus = $("#dock-status");
 const dockMeter = $("#dock-meter");
 const dockAction = $("#dock-action");
+const dockToggle = $("#dock-toggle");
+const dockPanel = $("#dock-panel");
+const dockClear = $("#dock-clear");
+const queueList = $("#queue-list");
 const form = $("#settings-form");
 const settingsNote = $("#settings-note");
 const catalogStatus = $("#catalog-status");
@@ -42,13 +48,20 @@ const metaStateNote = {
 let games = [];
 let filter = "all";
 let query = "";
+let searchTimer = 0;
+// 游戏库按页从服务器取：loaded 是已经取到的位置，total 是符合当前筛选的总数，counts 是整个游戏库的数量。
+let loaded = 0;
+let total = 0;
+let counts = { all: 0, installed: 0, need_settings: false };
+let pageToken = 0;
+let pageLoading = false;
 let loggedIn = false;
 let loginTimer = 0;
 let metaTimer = 0;
 let metaRounds = 0;
-let job = null;
-let jobTimer = 0;
-let dockVisible = false;
+let tasks = [];
+let queueTimer = 0;
+let dockOpen = false;
 let detail = null;
 const tiles = new Map();
 
@@ -131,53 +144,146 @@ function buildArt(game, className) {
   return art;
 }
 
-function jobFraction() {
-  if (!job) return 0;
-  if (job.bytes_total) return Math.min(1, job.bytes_done / job.bytes_total);
-  if (!job.files_total) return 0;
-  return Math.min(1, job.files_done / job.files_total);
+/* 安装队列：服务器一次装一个，tasks 依次是正在装的、排队的、最近完成的 */
+
+function taskFor(path) {
+  return tasks.find((task) => task.path === path) || null;
 }
 
-function jobStarted(current) {
-  return Boolean(current && (current.bytes_total || current.files_total));
+function runningTask() {
+  return tasks.find((task) => task.state === "running") || null;
+}
+
+function queuedTasks() {
+  return tasks.filter((task) => task.state === "queued");
+}
+
+function queuePosition(path) {
+  return queuedTasks().findIndex((task) => task.path === path) + 1;
+}
+
+function queueBusy() {
+  return tasks.some((task) => task.state !== "done");
+}
+
+function taskFraction(task) {
+  if (!task) return 0;
+  if (task.bytes_total) return Math.min(1, task.bytes_done / task.bytes_total);
+  if (!task.files_total) return 0;
+  return Math.min(1, task.files_done / task.files_total);
+}
+
+function taskStarted(task) {
+  return Boolean(task && (task.bytes_total || task.files_total));
 }
 
 function jobFor(game) {
-  return job && job.running && job.path === game.path;
+  const task = taskFor(game.path);
+  return task && task.state === "running" ? task : null;
 }
 
 function paintArt(art, game) {
   art.dataset.state = game.state;
-  const installing = jobFor(game);
-  art.style.setProperty("--p", installing ? jobFraction() : 0);
+  const task = jobFor(game);
+  art.style.setProperty("--p", taskFraction(task));
   const label = art.querySelector(".fill span");
-  if (label) label.textContent = installing && jobStarted(job) ? Math.round(jobFraction() * 100) + "%" : "…";
+  if (label) label.textContent = taskStarted(task) ? Math.round(taskFraction(task) * 100) + "%" : "…";
   art.querySelector(".badge")?.remove();
   if (game.state === "installed") art.append(el("span", "badge installed", "已安装"));
   if (game.state === "continue") art.append(el("span", "badge continue", "未装完"));
+  if (game.state === "queued") art.append(el("span", "badge queued num", "排队 " + (queuePosition(game.path) || "")));
 }
 
 /* 游戏库 */
 
-function matches(game) {
-  if (filter === "installed" && game.state !== "installed") return false;
-  if (filter === "todo" && game.state === "installed") return false;
-  if (!query) return true;
-  const haystack = [displayName(game), game.name, game.title_id, game.catalog_name].join("\n").toLowerCase();
-  return haystack.includes(query);
-}
-
-function renderShelf() {
-  tiles.clear();
-  shelf.replaceChildren();
-  const list = games.filter(matches);
-  for (const game of list) shelf.append(buildTile(game));
-  gameCount.textContent = games.length ? String(games.length) : "";
-  shelfEmpty.hidden = list.length > 0;
-  if (games.length === 0) shelfEmpty.textContent = "游戏库目录里还没有游戏文件夹。";
+function renderCounts() {
+  gameCount.textContent = counts.all ? String(counts.all) : "";
+  shelfEmpty.hidden = loaded > 0;
+  if (!counts.all) shelfEmpty.textContent = "游戏库目录里还没有游戏文件夹。";
   else if (query) shelfEmpty.textContent = `没有找到“${search.value.trim()}”。`;
   else if (filter === "installed") shelfEmpty.textContent = "还没有装到主机上的游戏。";
+  else if (filter === "continue") shelfEmpty.textContent = "没有装到一半的游戏。";
   else shelfEmpty.textContent = "这里没有游戏了。";
+  updateLede();
+}
+
+// 当前窗口放得下几个游戏：按书架实际的列数和行高算，再多一行，好让页面滚得起来。
+function pageSize() {
+  const style = getComputedStyle(shelf);
+  const columns = style.gridTemplateColumns.split(" ").filter((part) => part.endsWith("px"));
+  const perRow = columns.length || Math.max(1, Math.floor((window.innerWidth - 64) / 186));
+  const sample = shelf.firstElementChild;
+  const tileHeight = sample ? sample.getBoundingClientRect().height : (parseFloat(columns[0]) || 164) + 70;
+  const rowHeight = tileHeight + (parseFloat(style.rowGap) || 32);
+  const top = Math.min(Math.max(0, shelf.getBoundingClientRect().top), window.innerHeight);
+  const rows = Math.ceil((window.innerHeight - top) / rowHeight) + 1;
+  return perRow * Math.max(2, rows);
+}
+
+// 取一页游戏。reset 时从头取，替换掉已有的格子；fresh 让服务器重新列网盘目录、重读主机上的安装情况。
+async function fetchShelf({ reset = false, fresh = false } = {}) {
+  if (!reset && (pageLoading || loaded >= total)) return;
+  const token = reset ? ++pageToken : pageToken;
+  pageLoading = true;
+  shelfMore.hidden = reset;
+  shelfMore.textContent = "正在加载更多…";
+  const limit = reset && fresh ? Math.max(loaded, pageSize()) : pageSize();
+  const params = new URLSearchParams({ offset: reset ? 0 : loaded, limit });
+  if (filter !== "all") params.set("filter", filter);
+  if (query) params.set("q", query);
+  if (fresh) params.set("fresh", "1");
+  try {
+    const data = await api("/api/games?" + params);
+    if (token !== pageToken) return;
+    const page = data.games || [];
+    for (const game of page) syncGameState(game);
+    if (reset) {
+      games = [];
+      tiles.clear();
+      shelf.replaceChildren();
+    }
+    for (const game of page) {
+      if (tiles.has(game.path)) continue;
+      games.push(game);
+      shelf.append(buildTile(game));
+    }
+    loaded = (data.offset || 0) + page.length;
+    total = data.total || 0;
+    counts = { all: data.all || 0, installed: data.installed || 0, need_settings: Boolean(data.need_settings) };
+    renderCounts();
+    scheduleMetaPoll(reset);
+    window.requestAnimationFrame(fillViewport);
+  } catch (error) {
+    if (token !== pageToken) return;
+    if (reset) throw error;
+    shelfMore.hidden = false;
+    shelfMore.textContent = "没有加载出来：" + error.message;
+  } finally {
+    if (token === pageToken) {
+      pageLoading = false;
+      if (shelfMore.textContent === "正在加载更多…") shelfMore.hidden = true;
+    }
+  }
+}
+
+// 书架底部离窗口不远了就接着取下一页，直到填满窗口或者全部取完。
+function fillViewport() {
+  if (library.hidden || shelfView.hidden || pageLoading || loaded >= total) return;
+  if (shelfEnd.getBoundingClientRect().top < window.innerHeight + 600) fetchShelf();
+}
+
+new IntersectionObserver((entries) => {
+  if (entries.some((entry) => entry.isIntersecting)) fillViewport();
+}, { rootMargin: "0px 0px 600px 0px" }).observe(shelfEnd);
+window.addEventListener("resize", fillViewport);
+
+function reloadShelf() {
+  fetchShelf({ reset: true }).catch((error) => { lede.textContent = error.message; });
+}
+
+function refreshTile(game) {
+  const entry = tiles.get(game.path);
+  if (entry) entry.tile.replaceWith(buildTile(game));
 }
 
 function buildTile(game) {
@@ -204,33 +310,26 @@ function paintTile(game) {
 
 function updateLede() {
   lede.replaceChildren();
-  if (games.length && games.every((game) => game.state === "need-settings")) {
+  if (counts.all && counts.need_settings) {
     const go = el("button", "", "到设置里填写存放位置");
     go.type = "button";
     go.addEventListener("click", () => show("settings"));
     lede.append(go, "后才能安装。");
     return;
   }
-  const installed = games.filter((game) => game.state === "installed").length;
-  if (games.length) lede.textContent = installed ? `已装到主机 ${installed} 个。` : "点开游戏就能装到主机。";
+  if (counts.all) lede.textContent = counts.installed ? `已装到主机 ${counts.installed} 个。` : "点开游戏就能装到主机。";
 }
 
 async function loadGames() {
   try {
-    const data = await api("/api/games");
-    games = data.games || [];
-    if (job && job.running) {
-      const game = games.find((item) => item.path === job.path);
-      if (game) game.state = "installing";
-    }
+    await fetchShelf({ reset: true, fresh: true });
     setLoggedIn(true);
-    updateLede();
-    renderShelf();
-    scheduleMetaPoll(true);
   } catch (error) {
     if (loginFlowActive()) return;
     if (error.message === "百度未登录") {
       games = [];
+      loaded = 0;
+      total = 0;
       setLoggedIn(false);
       loginText.textContent = signedOutHint;
       return;
@@ -245,8 +344,9 @@ const sharedMetaFields = ["display_name", "name_source", "store_locale", "catalo
 function shareMeta(source) {
   const sameGame = (game) => (source.title_id ? game.title_id === source.title_id : game.name === source.name);
   for (const game of games) {
-    if (game === source || !sameGame(game)) continue;
-    for (const field of sharedMetaFields) game[field] = source[field];
+    if (!sameGame(game)) continue;
+    if (game !== source) for (const field of sharedMetaFields) game[field] = source[field];
+    refreshTile(game);
   }
 }
 
@@ -266,27 +366,25 @@ async function pollMeta() {
   if (detail && detail.game.meta_state === "pending" && !pending.includes(detail.game)) pending.push(detail.game);
   try {
     const data = await api("/api/meta", { names: pending.map((game) => game.name) });
-    let changed = false;
     (data.items || []).forEach((item, index) => {
       const game = pending[index];
       if (!game || game.name !== item.name) return;
-      if (item.meta_state !== game.meta_state || item.display_name !== game.display_name || item.cover_url !== game.cover_url) {
-        changed = true;
-        if (detail && detail.game === game) detail.reload();
-      }
+      const changed = item.meta_state !== game.meta_state || item.display_name !== game.display_name ||
+        item.cover_url !== game.cover_url;
       Object.assign(game, item);
+      if (!changed) return;
+      refreshTile(game);
+      if (detail && detail.game === game) detail.reload();
     });
-    if (changed) renderShelf();
   } catch (error) {
     // 下一轮再试
   }
   scheduleMetaPoll(false);
 }
 
-/* 安装任务：一次只有一个，在整个页面里共享 */
-
 function jobText(current) {
-  if (current.running) {
+  if (current.state === "queued") return `排队中，第 ${queuePosition(current.path)} 个`;
+  if (current.state === "running") {
     if (current.message === "正在取消…") return current.message;
     if (current.message === "正在收尾") return `正在收尾，共 ${current.files_total} 个文件`;
     if (current.bytes_total > 0 && current.message === "正在安装") {
@@ -306,100 +404,212 @@ function settledState(current) {
   return "install";
 }
 
-// 列表刷新后详情里拿的可能是旧对象，所以按路径找出所有要更新的游戏。
-function applyJob() {
-  if (!job) return;
-  const targets = games.filter((item) => item.path === job.path);
-  const inDetail = detail && detail.game.path === job.path;
-  if (inDetail && !targets.includes(detail.game)) targets.push(detail.game);
-  for (const game of targets) {
-    if (job.running) game.state = "installing";
-    else if (job.status && game.state === "installing") game.state = settledState(job);
+// 游戏的状态跟着队列走；离开队列的游戏按安装结果定，等下次刷新游戏库再以主机上的为准。
+function syncGameState(game) {
+  const task = taskFor(game.path);
+  if (task && task.state === "running") game.state = "installing";
+  else if (task && task.state === "queued") game.state = "queued";
+  else if (game.state === "installing" || game.state === "queued") game.state = task ? settledState(task) : "install";
+}
+
+// 列表刷新后详情里拿的可能是旧对象，所以详情里的游戏单独更新。
+function applyQueue() {
+  for (const game of games) {
+    syncGameState(game);
     paintTile(game);
   }
-  if (inDetail) detail.paint();
-  paintDock(targets[0] || null);
-}
-
-let dockArtPath = null;
-
-function paintDock(game) {
-  dock.hidden = !dockVisible || !job;
-  if (dock.hidden) return;
-  const state = job.running ? "installing" : job.status === "installed" || job.status === "already" ? "installed" : "error";
-  dock.dataset.state = state;
-  dockTitle.textContent = game ? displayName(game) : job.path.split("/").pop();
-  dockStatus.textContent = jobText(job);
-  if (dockArtPath !== job.path) {
-    dockArtPath = job.path;
-    dockArt.replaceChildren(buildArt(game || { name: dockTitle.textContent }));
+  if (detail) {
+    syncGameState(detail.game);
+    detail.paint();
   }
-  dockMeter.style.setProperty("--p", state === "installed" ? 1 : jobFraction());
-  dockAction.textContent = job.running ? "取消" : "关闭";
-  dockAction.disabled = job.running && job.message === "正在取消…";
+  paintDock();
 }
 
-async function refreshJob() {
+function setQueue(data) {
+  const active = new Set(tasks.filter((task) => task.state !== "done").map((task) => task.path));
+  tasks = data.tasks || [];
+  const settled = tasks.some((task) => task.state === "done" && active.has(task.path));
+  applyQueue();
+  if (settled) loadGames();
+  if (queueBusy()) watchQueue();
+  else stopQueueWatch();
+}
+
+async function refreshQueue() {
   try {
-    const next = await api("/api/job");
-    const finished = job && job.running && !next.running;
-    job = next;
-    applyJob();
-    if (finished) {
-      stopJobWatch();
-      loadGames();
-    }
+    setQueue(await api("/api/queue"));
   } catch (error) {
     // 下一秒再试
   }
 }
 
-function watchJob() {
-  stopJobWatch();
-  jobTimer = window.setInterval(refreshJob, 1000);
+function watchQueue() {
+  if (!queueTimer) queueTimer = window.setInterval(refreshQueue, 1000);
 }
 
-function stopJobWatch() {
-  window.clearInterval(jobTimer);
-  jobTimer = 0;
+function stopQueueWatch() {
+  window.clearInterval(queueTimer);
+  queueTimer = 0;
+}
+
+// 加入队列、移出、排到下一个、清除都返回新的队列。
+async function queueAction(path, body) {
+  try {
+    setQueue(await api(path, body));
+    return "";
+  } catch (error) {
+    return error.message;
+  }
 }
 
 async function startInstall(game) {
-  try {
-    await api("/api/install", { path: game.path });
-  } catch (error) {
-    if (detail && detail.game === game) detail.fail(error.message);
-    return;
-  }
-  job = { running: true, path: game.path, files_done: 0, files_total: 0, message: "正在读取压缩包…" };
-  dockVisible = true;
-  applyJob();
-  watchJob();
+  const error = await queueAction("/api/install", { path: game.path });
+  if (error && detail && detail.game === game) detail.fail(error);
 }
 
-async function cancelInstall() {
-  try {
-    await api("/api/cancel", {});
-    if (job) job.message = "正在取消…";
-    applyJob();
-  } catch (error) {
-    dockStatus.textContent = error.message;
+function openTask(task) {
+  const game = games.find((item) => item.path === task.path);
+  if (game) {
+    openDetail(game);
+    return;
+  }
+  const stub = { ...task, state: "install" };
+  syncGameState(stub);
+  openDetail(stub);
+}
+
+/* 底部的安装队列：收起时只显示正在装的，展开后列出整个队列 */
+
+let dockArtKey = null;
+const queueRows = new Map();
+
+function dockSummary() {
+  const running = runningTask();
+  const queued = queuedTasks();
+  const done = tasks.filter((task) => task.state === "done");
+  const waitText = queued.length ? ` · 还有 ${queued.length} 个排队` : "";
+  if (running) return { head: running, state: "installing", text: jobText(running) + waitText, p: taskFraction(running) };
+  if (queued.length) return { head: queued[0], state: "installing", text: "准备安装下一个" + waitText, p: 0 };
+  const failed = done.filter((task) => settledState(task) !== "installed").length;
+  let text = jobText(done[0]);
+  if (done.length > 1) text = failed ? `装好 ${done.length - failed} 个，${failed} 个没装完` : `${done.length} 个游戏都装好了`;
+  return { head: done[0], state: failed ? "error" : "installed", text, p: 1 };
+}
+
+function paintDock() {
+  dock.hidden = tasks.length === 0;
+  if (dock.hidden) {
+    dockOpen = false;
+    return;
+  }
+  const summary = dockSummary();
+  const running = runningTask();
+  dock.dataset.state = summary.state;
+  dockTitle.textContent = displayName(summary.head);
+  dockStatus.textContent = summary.text;
+  const artKey = summary.head.path + "\n" + (summary.head.cover_url || "");
+  if (dockArtKey !== artKey) {
+    dockArtKey = artKey;
+    dockArt.replaceChildren(buildArt(summary.head));
+  }
+  dockMeter.style.setProperty("--p", summary.p);
+  dockAction.hidden = !running && queueBusy();
+  dockAction.textContent = running ? "取消" : "关闭";
+  dockAction.disabled = Boolean(running && running.message === "正在取消…");
+  dockToggle.setAttribute("aria-expanded", String(dockOpen));
+  dockPanel.hidden = !dockOpen;
+  dockClear.hidden = !tasks.some((task) => task.state === "done");
+  if (dockOpen) paintQueueList();
+}
+
+function queueButton(text, onClick, className) {
+  const button = el("button", "queue-btn" + (className ? " " + className : ""), text);
+  button.type = "button";
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function queueRowActions(task) {
+  const remove = () => queueAction("/api/queue/remove", { path: task.path });
+  if (task.state === "running") {
+    const cancel = queueButton("取消", remove, "danger");
+    cancel.disabled = task.message === "正在取消…";
+    return [cancel];
+  }
+  if (task.state === "queued") {
+    const buttons = [];
+    if (queuePosition(task.path) > 1) buttons.push(queueButton("先装这个", () => queueAction("/api/queue/first", { path: task.path })));
+    buttons.push(queueButton("移出", remove));
+    return buttons;
+  }
+  const buttons = [];
+  if (settledState(task) !== "installed" && task.retryable !== false) {
+    buttons.push(queueButton(task.status === "interrupted" ? "继续" : "重试", () => queueAction("/api/install", { path: task.path })));
+  }
+  buttons.push(queueButton("移出", remove));
+  return buttons;
+}
+
+function paintQueueList() {
+  const seen = new Set();
+  tasks.forEach((task, index) => {
+    seen.add(task.path);
+    let row = queueRows.get(task.path);
+    if (!row) {
+      const item = el("li", "queue-item");
+      const open = el("button", "queue-open");
+      open.type = "button";
+      const artSlot = el("span", "queue-art");
+      const name = el("strong");
+      const status = el("span");
+      const text = el("span", "queue-text");
+      text.append(name, status);
+      open.append(artSlot, text);
+      const actions = el("div", "queue-actions");
+      const meter = el("span", "meter queue-meter");
+      meter.append(el("span"));
+      item.append(open, actions, meter);
+      row = { item, open, artSlot, name, status, actions, meter, artKey: null, actionKey: null, task };
+      open.addEventListener("click", () => openTask(row.task));
+      queueRows.set(task.path, row);
+    }
+    row.task = task;
+    row.item.dataset.state = task.state === "done" ? settledState(task) : task.state;
+    row.name.textContent = displayName(task);
+    row.status.textContent = jobText(task);
+    const artKey = task.cover_url || "";
+    if (row.artKey !== artKey) {
+      row.artKey = artKey;
+      row.artSlot.replaceChildren(buildArt(task));
+    }
+    row.meter.hidden = task.state !== "running";
+    row.meter.style.setProperty("--p", taskFraction(task));
+    const actionKey = [task.state, task.status, task.retryable, task.message === "正在取消…", queuePosition(task.path) > 1].join("|");
+    if (row.actionKey !== actionKey) {
+      row.actionKey = actionKey;
+      row.actions.replaceChildren(...queueRowActions(task));
+    }
+    if (queueList.children[index] !== row.item) queueList.insertBefore(row.item, queueList.children[index] || null);
+  });
+  for (const [path, row] of queueRows) {
+    if (seen.has(path)) continue;
+    row.item.remove();
+    queueRows.delete(path);
   }
 }
 
 dockAction.addEventListener("click", () => {
-  if (job && job.running) {
-    cancelInstall();
-    return;
-  }
-  dockVisible = false;
-  paintDock(null);
+  const running = runningTask();
+  if (running) queueAction("/api/queue/remove", { path: running.path });
+  else queueAction("/api/queue/clear", {});
 });
 
-$("#dock-open").addEventListener("click", () => {
-  const game = job && games.find((item) => item.path === job.path);
-  if (game) openDetail(game);
+dockToggle.addEventListener("click", () => {
+  dockOpen = !dockOpen;
+  paintDock();
 });
+
+dockClear.addEventListener("click", () => queueAction("/api/queue/clear", {}));
 
 /* 详情抽屉 */
 
@@ -462,9 +672,19 @@ function openDetail(game, opener) {
   const meter = el("span", "meter");
   meter.append(el("span"));
   progress.append(meter, progressRow);
+  const queueRow = el("div", "progress-row queue-row");
+  const queueText = el("span");
+  queueText.setAttribute("role", "status");
+  const queueLinks = el("span", "queue-links");
+  const first = el("button", "link", "先装这个");
+  first.type = "button";
+  const leave = el("button", "link", "移出队列");
+  leave.type = "button";
+  queueLinks.append(first, leave);
+  queueRow.append(queueText, queueLinks);
   const status = el("p", "status-text");
   status.setAttribute("role", "status");
-  install.append(action, progress, status);
+  install.append(action, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -479,7 +699,6 @@ function openDetail(game, opener) {
   const rename = buildRenameForm(game, () => {
     detail?.paint();
     shareMeta(game);
-    renderShelf();
     scheduleMetaPoll(true);
   });
   namingBody.append(origin, rename.form);
@@ -489,7 +708,7 @@ function openDetail(game, opener) {
 
   let coverKey = null;
   const paint = () => {
-    if (jobFor(game)) game.state = "installing";
+    syncGameState(game);
     title.textContent = displayName(game);
     facts.replaceChildren(...detailFacts(game).map((text) => el("span", "", text)));
     if (coverKey !== (game.cover_url || "")) {
@@ -499,21 +718,36 @@ function openDetail(game, opener) {
     }
     paintArt(artSlot.firstChild, game);
 
-    const running = jobFor(game);
-    action.textContent = actionText[game.state] || "安装到主机";
+    const task = taskFor(game.path);
+    const running = task && task.state === "running";
+    const queued = task && task.state === "queued";
+    const position = queued ? queuePosition(game.path) : 0;
+    const refused = task && task.state === "done" && task.retryable === false;
+    let label = actionText[game.state] || "安装到主机";
+    if (queued) label = "已加入安装队列";
+    else if (refused) label = "不能直接安装";
+    else if (queueBusy() && (game.state === "install" || game.state === "continue")) {
+      label = game.state === "continue" ? "排队继续安装" : "加入安装队列";
+    }
+    action.textContent = label;
     action.classList.toggle("done", game.state === "installed");
-    action.disabled = running || ["installed", "unsupported", "empty"].includes(game.state) ||
+    action.disabled = running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
       (game.state !== "need-settings" && !game.formats);
     progress.hidden = !running;
     if (running) {
-      progressText.textContent = jobText(job);
-      meter.style.setProperty("--p", jobFraction());
-      cancel.disabled = job.message === "正在取消…";
+      progressText.textContent = jobText(task);
+      meter.style.setProperty("--p", taskFraction(task));
+      cancel.disabled = task.message === "正在取消…";
     }
-    const finished = job && !job.running && job.path === game.path && job.status;
-    status.hidden = running || !finished;
-    status.className = "status-text" + (finished && settledState(job) !== "installed" ? " warn" : "");
-    if (finished) status.textContent = jobText(job);
+    queueRow.hidden = !queued;
+    if (queued) {
+      queueText.textContent = position === 1 ? "排在第 1 个，当前这个装完就开始" : `排在第 ${position} 个`;
+      first.hidden = position <= 1;
+    }
+    const finished = task && task.state === "done";
+    status.hidden = !finished;
+    status.className = "status-text" + (finished && settledState(task) !== "installed" ? " warn" : "");
+    if (finished) status.textContent = jobText(task);
 
     desc.textContent = game.description || "";
     desc.hidden = !game.description;
@@ -542,7 +776,9 @@ function openDetail(game, opener) {
     status.hidden = true;
     startInstall(game);
   });
-  cancel.addEventListener("click", cancelInstall);
+  cancel.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
+  first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));
+  leave.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
 
   const reload = () => api("/api/game", { path: game.path }).then((data) => {
     if (!detail || detail.game !== game) return;
@@ -821,16 +1057,22 @@ $("#show-shelf").addEventListener("click", () => show("shelf"));
 $("#show-settings").addEventListener("click", () => show("settings"));
 
 search.addEventListener("input", () => {
-  query = search.value.trim().toLowerCase();
   if (shelfView.hidden) show("shelf");
-  renderShelf();
+  window.clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(() => {
+    const next = search.value.trim().toLowerCase();
+    if (next === query) return;
+    query = next;
+    reloadShelf();
+  }, 250);
 });
 
 for (const button of filterButtons) {
   button.addEventListener("click", () => {
+    if (filter === button.dataset.filter) return;
     filter = button.dataset.filter;
     for (const other of filterButtons) other.setAttribute("aria-pressed", String(other === button));
-    renderShelf();
+    reloadShelf();
   });
 }
 
@@ -845,17 +1087,8 @@ async function boot() {
       loginText.textContent = signedOutHint;
       return;
     }
-    try {
-      job = await api("/api/job");
-    } catch (error) {
-      job = null;
-    }
+    await refreshQueue();
     await loadGames();
-    if (job && job.running) {
-      dockVisible = true;
-      applyJob();
-      watchJob();
-    }
   } catch (error) {
     setLoggedIn(false);
     loginText.textContent = loginErrorText(error.message);

@@ -4,8 +4,10 @@
 #include "panplay/storage_path.hpp"
 #include "socket_util.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -199,7 +201,24 @@ class FtpSink : public InstallSink {
     return "";
   }
 
-  std::string begin_upload(const std::string& path, SOCKET* data_socket) {
+  // 上传中途断了：换一条控制连接，问主机已经存下多少字节，再从那里续传。
+  std::string resume_upload(const std::string& path, std::int64_t* stored, SOCKET* data_socket) {
+    std::string error;
+    if (!reconnect_unlocked(&error)) return error.empty() ? "FTP 重新连接失败" : error;
+    std::string reply;
+    int code = 0;
+    if (!roundtrip("SIZE " + path, &reply, &code, &error)) return error;
+    if (code == 550) {
+      *stored = 0;
+    } else if (code == 213 && reply.find(' ') != std::string::npos) {
+      *stored = std::stoll(reply.substr(reply.find(' ') + 1));
+    } else {
+      return reply;
+    }
+    return begin_upload(path, data_socket, *stored > 0 ? "APPE" : "STOR");
+  }
+
+  std::string begin_upload(const std::string& path, SOCKET* data_socket, const char* verb = "STOR") {
     std::string reply;
     int code = 0;
     std::string error;
@@ -210,7 +229,7 @@ class FtpSink : public InstallSink {
     if (!parse_pasv(reply, &host, &port)) return "无法解析 PASV";
     SOCKET socket = connect_tcp(host, port, &error);
     if (socket == INVALID_SOCKET) return error;
-    if (!roundtrip("STOR " + path, &reply, &code, &error)) {
+    if (!roundtrip(std::string(verb) + " " + path, &reply, &code, &error)) {
       closesocket(socket);
       return error;
     }
@@ -509,34 +528,104 @@ class FtpSink : public InstallSink {
 };
 
 // 一个文件一条数据连接。写入期间持有控制连接的锁，保活线程不会插入命令。
+// 网盘读得慢时数据连接可能空闲太久被主机断开，所以留着最近发出的一段数据，断了就续传。
 class FtpWriter final : public FileWriter {
  public:
-  FtpWriter(FtpSink& sink, std::unique_lock<std::mutex> lock, SOCKET data_socket)
-      : sink_(sink), lock_(std::move(lock)), data_(data_socket) {}
+  FtpWriter(FtpSink& sink, std::unique_lock<std::mutex> lock, std::string path, SOCKET data_socket)
+      : sink_(sink), lock_(std::move(lock)), path_(std::move(path)), data_(data_socket) {}
 
   ~FtpWriter() override {
     if (data_ != INVALID_SOCKET) sink_.end_upload(data_, false);
   }
 
   std::string write(const std::uint8_t* data, std::size_t size) override {
-    if (data_ == INVALID_SOCKET) return "写入已结束";
+    if (finished_) return "写入已结束";
     if (size == 0) return "";
-    if (!send_all(data_, reinterpret_cast<const char*>(data), size)) return "发送数据失败";
-    return "";
+    remember(data, size);
+    sent_ += static_cast<std::int64_t>(size);
+    if (data_ != INVALID_SOCKET && send_all(data_, reinterpret_cast<const char*>(data), size)) return "";
+    return recover();
   }
 
   std::string finish() override {
-    if (data_ == INVALID_SOCKET) return "写入已结束";
-    const std::string error = sink_.end_upload(data_, true);
-    data_ = INVALID_SOCKET;
-    lock_.unlock();
-    return error;
+    if (finished_) return "写入已结束";
+    for (int attempt = 0;; ++attempt) {
+      std::string error = data_ == INVALID_SOCKET ? "发送数据失败" : sink_.end_upload(data_, true);
+      data_ = INVALID_SOCKET;
+      if (error.empty() || attempt >= kRetries) {
+        finished_ = true;
+        lock_.unlock();
+        return error;
+      }
+      if (!(error = recover()).empty()) {
+        finished_ = true;
+        lock_.unlock();
+        return error;
+      }
+    }
   }
 
  private:
+  static constexpr std::size_t kKeepBytes = 32u << 20;
+  static constexpr int kRetries = 3;
+
+  // 环形缓冲：文件第 pos 个字节放在 pos % kKeepBytes，小文件只占自己那么大。
+  void remember(const std::uint8_t* data, std::size_t size) {
+    std::int64_t pos = sent_;
+    if (size > kKeepBytes) {
+      pos += static_cast<std::int64_t>(size - kKeepBytes);
+      data += size - kKeepBytes;
+      size = kKeepBytes;
+    }
+    while (size > 0) {
+      const auto at = static_cast<std::size_t>(pos % static_cast<std::int64_t>(kKeepBytes));
+      const std::size_t n = std::min(size, kKeepBytes - at);
+      if (ring_.size() < at + n) ring_.resize(at + n);
+      std::memcpy(ring_.data() + at, data, n);
+      data += n;
+      pos += static_cast<std::int64_t>(n);
+      size -= n;
+    }
+  }
+
+  bool resend_from(std::int64_t pos) {
+    while (pos < sent_) {
+      const auto at = static_cast<std::size_t>(pos % static_cast<std::int64_t>(kKeepBytes));
+      const std::size_t n = static_cast<std::size_t>(std::min<std::int64_t>(sent_ - pos, static_cast<std::int64_t>(kKeepBytes - at)));
+      if (!send_all(data_, reinterpret_cast<const char*>(ring_.data() + at), n)) return false;
+      pos += static_cast<std::int64_t>(n);
+    }
+    return true;
+  }
+
+  // 主机存下的字节数要落在留着的这段里，才能把缺的部分补发过去。
+  std::string recover() {
+    std::string error = "发送数据失败";
+    const std::int64_t kept_from = std::max<std::int64_t>(0, sent_ - static_cast<std::int64_t>(kKeepBytes));
+    for (int attempt = 0; attempt < kRetries; ++attempt) {
+      if (data_ != INVALID_SOCKET) {
+        closesocket(data_);
+        data_ = INVALID_SOCKET;
+      }
+      std::int64_t stored = 0;
+      SOCKET socket = INVALID_SOCKET;
+      error = sink_.resume_upload(path_, &stored, &socket);
+      if (!error.empty()) continue;
+      data_ = socket;
+      if (stored < kept_from || stored > sent_) return "发送数据失败，主机上的文件大小对不上";
+      if (resend_from(stored)) return "";
+      error = "发送数据失败";
+    }
+    return error;
+  }
+
   FtpSink& sink_;
   std::unique_lock<std::mutex> lock_;
+  std::string path_;
   SOCKET data_ = INVALID_SOCKET;
+  std::int64_t sent_ = 0;
+  std::vector<std::uint8_t> ring_;
+  bool finished_ = false;
 };
 
 std::unique_ptr<FileWriter> FtpSink::open_writer(const std::string& path, std::string* error) {
@@ -544,7 +633,7 @@ std::unique_ptr<FileWriter> FtpSink::open_writer(const std::string& path, std::s
   SOCKET data_socket = INVALID_SOCKET;
   *error = begin_upload(path, &data_socket);
   if (!error->empty()) return nullptr;
-  return std::make_unique<FtpWriter>(*this, std::move(lock), data_socket);
+  return std::make_unique<FtpWriter>(*this, std::move(lock), path, data_socket);
 }
 
 std::vector<std::uint8_t> pattern(std::size_t size, std::uint8_t seed) {
@@ -692,6 +781,51 @@ int run_install_sink_self_test() {
     std::string idle_error;
     if (sink->file_size("/no-such-file", &idle_error) != -1 || !idle_error.empty()) {
       std::cerr << "ftp: " << (idle_error.empty() ? "空闲后 SIZE 行为变了" : idle_error) << "\n";
+      return 1;
+    }
+  }
+  {
+    // 网盘读得慢时，主机会掐掉空闲的数据连接；写入方要重新连上，从主机已存下的位置续传。
+    const std::filesystem::path ftp_root = root / "ftp-idle";
+    std::string error;
+    DummyFtp server(ftp_root, 0);
+    server.set_data_timeout_ms(300);
+    if (!server.start(&error)) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+    FtpEndpoint endpoint;
+    endpoint.port = server.port();
+    auto sink = make_ftp_sink(endpoint, &error);
+    if (!sink) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+    if (auto made = sink->ensure_dir("/slow"); !made.empty()) {
+      std::cerr << "ftp-idle: " << made << "\n";
+      return 1;
+    }
+    const std::vector<std::uint8_t> parts[] = {pattern(10000, 3), pattern(200000, 4), pattern(30000, 5)};
+    std::vector<std::uint8_t> whole;
+    auto writer = sink->open_writer("/slow/file.bin", &error);
+    if (!writer) {
+      std::cerr << "ftp-idle: " << error << "\n";
+      return 1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    for (const auto& part : parts) {
+      if (error.empty()) error = writer->write(part.data(), part.size());
+      whole.insert(whole.end(), part.begin(), part.end());
+      std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    }
+    if (error.empty()) error = writer->finish();
+    writer.reset();
+    if (!error.empty()) {
+      std::cerr << "ftp-idle: 断开后没有续传: " << error << "\n";
+      return 1;
+    }
+    if (read_file(ftp_root / "slow" / "file.bin") != whole) {
+      std::cerr << "ftp-idle: 续传后的文件内容不对\n";
       return 1;
     }
   }

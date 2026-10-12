@@ -67,6 +67,7 @@ struct DummyFtp::Impl {
   std::uint16_t requested = 0;
   std::atomic<std::uint16_t> bound{0};
   std::atomic<bool> running{false};
+  std::atomic<int> data_timeout_ms{10000};
   std::mutex sockets_mu;
   SOCKET listen_socket = INVALID_SOCKET;
   SOCKET active_socket = INVALID_SOCKET;
@@ -324,7 +325,7 @@ struct DummyFtp::Impl {
             send_line(client, "425 data connection failed");
             continue;
           }
-          set_socket_timeout(data, 10000);
+          set_socket_timeout(data, data_timeout_ms.load());
           if (!std::filesystem::exists(local.parent_path())) {
             closesocket(data);
             send_line(client, "550 parent directory missing");
@@ -424,6 +425,8 @@ void DummyFtp::stop() {
 }
 
 std::uint16_t DummyFtp::port() const { return impl_->bound.load(); }
+
+void DummyFtp::set_data_timeout_ms(int ms) { impl_->data_timeout_ms = ms; }
 
 int run_dummy_ftp(std::uint16_t port, const std::string& root) {
   std::string error;

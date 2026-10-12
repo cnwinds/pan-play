@@ -2,6 +2,8 @@
 
 #include "panplay/json.hpp"
 
+#include <cctype>
+
 #include <zlib.h>
 
 namespace panplay {
@@ -10,6 +12,41 @@ std::string parent_path(const std::string& path) {
   const auto slash = path.rfind('/');
   if (slash == std::string::npos || slash == 0) return "/";
   return path.substr(0, slash);
+}
+
+namespace {
+
+std::string lower_copy(std::string text) {
+  for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return text;
+}
+
+}  // namespace
+
+bool is_install_package(const std::string& name, std::int64_t size) {
+  const std::string lower = lower_copy(name);
+  return size >= kInstallPackageMinBytes && lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".pkg") == 0;
+}
+
+bool in_sce_sys(const std::string& name) {
+  const std::string lower = lower_copy(name);
+  return lower.rfind("sce_sys/", 0) == 0 || lower.find("/sce_sys/") != std::string::npos;
+}
+
+namespace {
+
+constexpr char kInstallPackagePrefix[] = "这是 PKG 安装包（";
+
+}  // namespace
+
+std::string install_package_error(const std::string& name) {
+  const auto slash = name.find_last_of('/');
+  return kInstallPackagePrefix + (slash == std::string::npos ? name : name.substr(slash + 1)) +
+         "），要在主机上用安装包工具安装；盘游和 ShadowMountPlus 只能用解压好的游戏文件夹";
+}
+
+bool is_install_package_error(const std::string& message) {
+  return message.rfind(kInstallPackagePrefix, 0) == 0;
 }
 
 OutputFile::OutputFile(InstallSink& sink, std::string path, std::int64_t stop, std::int64_t* written)

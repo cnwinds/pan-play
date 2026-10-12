@@ -4,6 +4,8 @@
 #include "panplay/library.hpp"
 #include "panplay/prefetch.hpp"
 
+#include "install_common.hpp"
+
 #include <zlib.h>
 
 #include <atomic>
@@ -759,6 +761,85 @@ int game_root_test() {
   return 0;
 }
 
+// 只有 .pkg 安装包的压缩包要尽早拒绝；各个压缩包里内容一样的同名文件（资源站的说明文件）留一份。
+int package_and_duplicate_test() {
+  const auto ad = pattern(200, 11);
+  const std::vector<std::uint8_t> pkg(static_cast<std::size_t>(kInstallPackageMinBytes), 0);
+  const auto has_pkg = [](const MemorySink& sink) {
+    for (const auto& entry : sink.files) {
+      if (entry.first.size() > 4 && entry.first.compare(entry.first.size() - 4, 4, ".pkg") == 0) return true;
+    }
+    return false;
+  };
+
+  FakeDrive drive;
+  drive.add("/apps/panplay/Pkg CUSA20000/base.zip",
+            make_zip({{"2468c.com.txt", ad, false}, {"Game_CUSA20000_v1.00.pkg", pkg, true}}, {}).front());
+
+  const auto rar_dir = std::filesystem::temp_directory_path() / "panplay-pkg-src";
+  std::error_code ignored;
+  std::filesystem::remove_all(rar_dir, ignored);
+  std::filesystem::create_directories(rar_dir);
+  {
+    std::ofstream(rar_dir / "2468c.com.txt", std::ios::binary).write(reinterpret_cast<const char*>(ad.data()), 200);
+    std::ofstream big(rar_dir / "Game_CUSA20002_v1.07.pkg", std::ios::binary);
+    big.write(reinterpret_cast<const char*>(pkg.data()), static_cast<std::streamsize>(pkg.size()));
+  }
+  const auto rar_path = rar_dir / "patch.rar";
+  const std::string cmd = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" a -ep -idq -y -ma5 -m1 \"" + rar_path.string() + "\" \"" +
+                          (rar_dir / "2468c.com.txt").string() + "\" \"" + (rar_dir / "Game_CUSA20002_v1.07.pkg").string() +
+                          "\"\"";
+  if (std::system(cmd.c_str()) != 0) return fail("WinRAR 没能生成 PKG 测试 RAR");
+  {
+    std::ifstream in(rar_path, std::ios::binary);
+    drive.add("/apps/panplay/Pkg CUSA20002/patch.rar", std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in), {}));
+  }
+  std::filesystem::remove_all(rar_dir, ignored);
+
+  for (const char* dir : {"/apps/panplay/Pkg CUSA20000", "/apps/panplay/Pkg CUSA20002"}) {
+    MemorySink sink;
+    InstallRequest request;
+    request.source_dir = dir;
+    const InstallResult refused = install_game(drive, sink, request);
+    if (refused.status != "error" || refused.message.find("PKG 安装包") == std::string::npos) {
+      return fail(std::string("PKG 安装包没有被认出来: ") + dir + " " + refused.message);
+    }
+    if (refused.retryable) return fail(std::string("PKG 安装包失败不该能重试: ") + dir);
+    if (has_pkg(sink)) return fail(std::string("认出 PKG 之前就把它写到主机上了: ") + dir);
+  }
+
+  const auto a = pattern(3000, 12);
+  const auto b = pattern(4000, 13);
+  drive.add("/apps/panplay/Dup CUSA20001/a.zip", make_zip({{"data/a.bin", a, true}, {"2468c.com.txt", ad, false}}, {}).front());
+  drive.add("/apps/panplay/Dup CUSA20001/b.zip", make_zip({{"data/b.bin", b, true}, {"2468c.com.txt", ad, false}}, {}).front());
+  MemorySink sink;
+  InstallRequest request;
+  request.source_dir = "/apps/panplay/Dup CUSA20001";
+  const InstallResult installed = install_game(drive, sink, request);
+  if (installed.status != "installed" || installed.files_total != 3) {
+    return fail("内容一样的同名文件不该算重复: " + installed.message);
+  }
+  const std::string root = "/mnt/usb0/homebrew/CUSA20001/";
+  if (sink.files[root + "data/a.bin"].bytes != a || sink.files[root + "data/b.bin"].bytes != b ||
+      sink.files[root + "2468c.com.txt"].bytes != ad) {
+    return fail("去重后的文件内容不对");
+  }
+  for (const auto& entry : sink.files) {
+    if (entry.first.find(".panplay-staging") != std::string::npos) return fail("去掉的重复文件留在了暂存区: " + entry.first);
+  }
+
+  drive.add("/apps/panplay/Clash CUSA20003/a.zip", make_zip({{"data/a.bin", a, true}, {"readme.txt", ad, false}}, {}).front());
+  drive.add("/apps/panplay/Clash CUSA20003/b.zip", make_zip({{"data/b.bin", b, true}, {"readme.txt", b, false}}, {}).front());
+  MemorySink clash_sink;
+  request.source_dir = "/apps/panplay/Clash CUSA20003";
+  const InstallResult clash = install_game(drive, clash_sink, request);
+  if (clash.status != "error" || clash.message.find("重复文件") == std::string::npos) {
+    return fail("内容不同的同名文件应该报重复");
+  }
+  if (!clash.retryable) return fail("普通失败应该能重试");
+  return 0;
+}
+
 int many_files_test() {
   FakeDrive drive;
   std::vector<ZipInput> inputs;
@@ -1009,12 +1090,19 @@ int run_install_pipeline_self_test() {
   const auto split_dir = rar_dir / "Split";
   std::filesystem::create_directories(split_dir);
   const auto split_data = pattern(150000, 5);
+  const auto split_head = pattern(30000, 6);
+  const auto split_tail = pattern(30000, 7);
   {
+    std::ofstream head(split_dir / "a.bin", std::ios::binary);
+    head.write(reinterpret_cast<const char*>(split_head.data()), static_cast<std::streamsize>(split_head.size()));
     std::ofstream big(split_dir / "big.bin", std::ios::binary);
     big.write(reinterpret_cast<const char*>(split_data.data()), static_cast<std::streamsize>(split_data.size()));
+    std::ofstream tail(split_dir / "c.bin", std::ios::binary);
+    tail.write(reinterpret_cast<const char*>(split_tail.data()), static_cast<std::streamsize>(split_tail.size()));
   }
   const std::string split_cmd = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" a -ep -idq -y -ma5 -m0 -v40k \"" +
-                                (split_dir / "split.rar").string() + "\" \"" + (split_dir / "big.bin").string() + "\"\"";
+                                (split_dir / "split.rar").string() + "\" \"" + (split_dir / "a.bin").string() + "\" \"" +
+                                (split_dir / "big.bin").string() + "\" \"" + (split_dir / "c.bin").string() + "\"\"";
   if (std::system(split_cmd.c_str()) != 0) return fail("WinRAR 没能生成跨卷测试 RAR");
   int split_parts = 0;
   for (const auto& entry : std::filesystem::directory_iterator(split_dir)) {
@@ -1136,6 +1224,25 @@ int run_install_pipeline_self_test() {
     if (!error.empty() || got != split_data) return fail("跨卷文件内容不对");
   }
 
+  // 一次停在跨卷文件中间；一次停在它之后，续装时要跳过已装好的跨卷文件。
+  for (const std::int64_t stop : {std::int64_t{30000 + 5000}, std::int64_t{30000 + 150000 + 5000}}) {
+    auto local = make_local_sink((root / ("rar-split-resume-" + std::to_string(stop))).u8string());
+    InstallRequest request;
+    request.source_dir = "/apps/panplay/Split CUSA66666";
+    request.dest_prefix = "/mnt/usb0/homebrew";
+    request.stop_after_output_bytes = stop;
+    const InstallResult first = install_game(drive, *local, request);
+    if (first.status != "interrupted") return fail("跨卷 RAR 没有在中途停下: " + first.status + " " + first.message);
+    request.stop_after_output_bytes = -1;
+    const InstallResult resumed = install_game(drive, *local, request);
+    if (resumed.status != "installed") return fail("跨卷 RAR 继续安装失败: " + resumed.message);
+    std::vector<std::uint8_t> got;
+    error = local->read_file("/mnt/usb0/homebrew/CUSA66666/big.bin", &got, 1 << 20);
+    if (!error.empty() || got != split_data) return fail("继续安装后跨卷文件内容不对");
+    error = local->read_file("/mnt/usb0/homebrew/CUSA66666/c.bin", &got, 1 << 20);
+    if (!error.empty() || got != split_tail) return fail("继续安装后跨卷文件后面的文件不对");
+  }
+
   {
     const auto local_root = root / "rar-wrap";
     auto local = make_local_sink(local_root.u8string());
@@ -1174,6 +1281,7 @@ int run_install_pipeline_self_test() {
 
   if (const int code = prefetch_tests()) return code;
   if (const int code = game_root_test()) return code;
+  if (const int code = package_and_duplicate_test()) return code;
   if (const int code = many_files_test()) return code;
   if (const int code = zip64_split_test()) return code;
   if (const int code = cancel_install_test()) return code;

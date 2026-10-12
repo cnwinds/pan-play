@@ -15,6 +15,14 @@ inline constexpr const char* kInterrupted = "interrupted";
 
 std::string parent_path(const std::string& path);
 
+// 索尼的 .pkg 安装包要在主机上用安装工具安装，解压到 homebrew 里主机和 ShadowMountPlus 都不认。
+// 压缩包里没有 sce_sys、却有这么大的 .pkg，就当作安装包拒绝；小的 .pkg 可能是游戏自己的数据文件。
+inline constexpr std::int64_t kInstallPackageMinBytes = 64ll << 20;
+bool is_install_package(const std::string& name, std::int64_t size);
+bool in_sce_sys(const std::string& name);
+std::string install_package_error(const std::string& name);
+bool is_install_package_error(const std::string& message);
+
 // 解压出的一个文件：第一次写入时才建目录、开写入流，同时算 CRC。
 // stop >= 0 时，累计写满 stop 字节就返回 kInterrupted，供自测模拟中断。
 class OutputFile {

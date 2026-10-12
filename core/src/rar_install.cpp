@@ -349,6 +349,7 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
   RarWrite writer;
   active_write = &writer;
   std::string failure;
+  bool seen_sys = false;
   while (failure.empty()) {
     RARHeaderDataEx header{};
     const int code = RARReadHeaderEx(handle, &header);
@@ -378,8 +379,23 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       failure = name_error;
       break;
     }
+    // 跳过跨卷文件时 UnRAR 不会接着读后面的卷，而是在后面每一卷再给出这个文件的续段；续段跟着跳过。
+    // 解压时 UnRAR 自己接卷，不会出现续段。
+    if ((header.Flags & RHDF_SPLITBEFORE) != 0) {
+      if (RARProcessFileW(handle, RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
+        failure = process_failure("跳过跨卷文件失败: " + name);
+        break;
+      }
+      report_bytes(false);
+      continue;
+    }
     const bool directory = (header.Flags & RHDF_DIRECTORY) != 0 || (!name.empty() && name.back() == '/');
     const std::uint64_t size = unpacked_size(header);
+    seen_sys = seen_sys || in_sce_sys(name);
+    if (!directory && !seen_sys && is_install_package(name, static_cast<std::int64_t>(size))) {
+      failure = install_package_error(name);
+      break;
+    }
     listed->push_back(ListedRarEntry{name, directory, solid, header.FileCRC, size});
     const std::string staged = options.staging_prefix + name;
     const auto before = finished_before.find(staged);
@@ -400,7 +416,7 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       break;
     }
     if (processed != ERAR_SUCCESS) {
-      failure = process_failure("解压 RAR 失败: " + name);
+      failure = process_failure("解压 RAR 失败（错误码 " + std::to_string(processed) + "）: " + name);
       break;
     }
     report_bytes(false);

@@ -18,6 +18,8 @@ class DummyFtp {
   bool start(std::string* error);
   void stop();
   std::uint16_t port() const;
+  // 数据连接空闲多久就断开，默认 10 秒。自测里调短，模拟主机掐掉慢连接。
+  void set_data_timeout_ms(int ms);
 
  private:
   struct Impl;
