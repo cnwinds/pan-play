@@ -8,6 +8,7 @@
 
 #include <zlib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -518,8 +519,13 @@ int resume_on(InstallSink& raw, FakeDrive& drive, const std::vector<std::uint8_t
 
   sink.reset();
   request.stop_after_output_bytes = -1;
+  bool reported_check = false;
+  request.on_progress = [&](const InstallResult& snapshot) {
+    if (snapshot.message == "正在核对" && snapshot.files_checked == 1 && snapshot.files_to_check == 1) reported_check = true;
+  };
   InstallResult second = install_game(drive, sink, request);
   if (second.status != "installed" || second.files_done != 2) return fail("继续后没有装完: " + second.message);
+  if (!reported_check) return fail("继续安装时没有报告正在核对已装好的文件");
   if (sink.writes_ending("/param.sfo") != 0) return fail("已校验文件被重写了");
   if (sink.writes_ending("/eboot.bin") != 1) return fail("未完成文件没有从头重写一次");
 
@@ -1104,15 +1110,19 @@ int run_install_pipeline_self_test() {
                                 (split_dir / "split.rar").string() + "\" \"" + (split_dir / "a.bin").string() + "\" \"" +
                                 (split_dir / "big.bin").string() + "\" \"" + (split_dir / "c.bin").string() + "\"\"";
   if (std::system(split_cmd.c_str()) != 0) return fail("WinRAR 没能生成跨卷测试 RAR");
-  int split_parts = 0;
+  std::vector<std::pair<std::string, std::vector<std::uint8_t>>> split_volumes;
   for (const auto& entry : std::filesystem::directory_iterator(split_dir)) {
     if (entry.path().extension() != ".rar") continue;
     std::ifstream part_in(entry.path(), std::ios::binary);
-    drive.add("/apps/panplay/Split CUSA66666/" + entry.path().filename().string(),
-              std::vector<std::uint8_t>(std::istreambuf_iterator<char>(part_in), {}));
-    ++split_parts;
+    split_volumes.emplace_back(entry.path().filename().string(),
+                               std::vector<std::uint8_t>(std::istreambuf_iterator<char>(part_in), {}));
   }
-  if (split_parts < 3) return fail("跨卷测试 RAR 没有切开");
+  if (split_volumes.size() < 3 || split_volumes.size() > 9) return fail("跨卷测试 RAR 分卷数不对");
+  std::sort(split_volumes.begin(), split_volumes.end());
+  for (std::size_t i = 0; i < split_volumes.size(); ++i) {
+    drive.add("/apps/panplay/Split CUSA66666/" + split_volumes[i].first, split_volumes[i].second);
+    if (i + 1 < split_volumes.size()) drive.add("/apps/panplay/Cut CUSA66667/" + split_volumes[i].first, split_volumes[i].second);
+  }
   std::filesystem::remove_all(rar_dir, rar_remove);
   drive.add("/apps/panplay/Wrapped PPSA88888/game.rar", std::move(wrap_bytes));
   const std::vector<std::uint8_t> fixed_eboot{'e', 'b', 'o', 'o', 't', '-', 'f', 'i', 'x'};
@@ -1241,6 +1251,19 @@ int run_install_pipeline_self_test() {
     if (!error.empty() || got != split_data) return fail("继续安装后跨卷文件内容不对");
     error = local->read_file("/mnt/usb0/homebrew/CUSA66666/c.bin", &got, 1 << 20);
     if (!error.empty() || got != split_tail) return fail("继续安装后跨卷文件后面的文件不对");
+  }
+
+  // 少了最后一卷时 UnRAR 只报压缩包结束，不能把已经读到的文件当作装完。
+  {
+    auto local = make_local_sink((root / "rar-cut").u8string());
+    InstallRequest request;
+    request.source_dir = "/apps/panplay/Cut CUSA66667";
+    const InstallResult cut = install_game(drive, *local, request);
+    if (cut.status != "error") return fail("少了最后一卷的 RAR 不该装成功: " + cut.status + " " + cut.message);
+    std::vector<std::uint8_t> marker;
+    if (local->read_file("/mnt/usb0/homebrew/CUSA66667/.panplay-done.json", &marker, 1 << 20).empty()) {
+      return fail("少了最后一卷的 RAR 写了安装完成标记");
+    }
   }
 
   {

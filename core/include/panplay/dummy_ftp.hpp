@@ -20,6 +20,8 @@ class DummyFtp {
   std::uint16_t port() const;
   // 数据连接空闲多久就断开，默认 10 秒。自测里调短，模拟主机掐掉慢连接。
   void set_data_timeout_ms(int ms);
+  // 上传结束后过多久才关文件、写出缓冲。自测里用来模拟主机磁盘慢，旧传输还没写完续传就开始了。
+  void set_close_delay_ms(int ms);
 
  private:
   struct Impl;

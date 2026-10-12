@@ -5,10 +5,14 @@
 
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cerrno>
+#include <condition_variable>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <cstdio>
+#include <set>
 #include <thread>
 
 namespace panplay {
@@ -68,9 +72,13 @@ struct DummyFtp::Impl {
   std::atomic<std::uint16_t> bound{0};
   std::atomic<bool> running{false};
   std::atomic<int> data_timeout_ms{10000};
+  std::atomic<int> close_delay_ms{0};
+  // 像主机上的 FTP 一样可以同时连多个客户端：安装占着一条连接时，游戏库还要另开一条查安装情况。
   std::mutex sockets_mu;
+  std::condition_variable sessions_done;
   SOCKET listen_socket = INVALID_SOCKET;
-  SOCKET active_socket = INVALID_SOCKET;
+  std::set<SOCKET> clients;
+  int sessions = 0;
   std::thread worker;
 
   std::string resolve(const std::string& cwd, const std::string& path, std::filesystem::path* out) const {
@@ -339,21 +347,34 @@ struct DummyFtp::Impl {
             send_line(client, "550 cannot open file");
             continue;
           }
+          std::setvbuf(file, nullptr, _IOFBF, 1 << 20);
           send_line(client, "150 opening data connection");
           char buffer[64 * 1024];
           bool failed = false;
+          bool full = false;
           for (;;) {
             const int n = recv(data, buffer, sizeof(buffer), 0);
             if (n == 0) break;
-            if (n < 0 || std::fwrite(buffer, 1, static_cast<std::size_t>(n), file) != static_cast<std::size_t>(n)) {
+            if (n < 0) {
               failed = true;
               break;
             }
+            if (std::fwrite(buffer, 1, static_cast<std::size_t>(n), file) != static_cast<std::size_t>(n)) {
+              failed = true;
+              full = errno == ENOSPC;
+              break;
+            }
           }
-          if (std::fclose(file) != 0) failed = true;
+          if (const int delay = close_delay_ms.load(); delay > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+          }
+          if (std::fclose(file) != 0) {
+            failed = true;
+            full = full || errno == ENOSPC;
+          }
           closesocket(data);
           if (failed) {
-            send_line(client, "426 transfer aborted");
+            send_line(client, full ? "452 insufficient storage space" : "426 transfer aborted");
             continue;
           }
           send_line(client, "226 transfer complete");
@@ -389,20 +410,20 @@ bool DummyFtp::start(std::string* error) {
     while (impl_->running.load()) {
       SOCKET client = accept(impl_->listen_socket, nullptr, nullptr);
       if (client == INVALID_SOCKET) break;
-      {
-        std::lock_guard<std::mutex> lock(impl_->sockets_mu);
-        impl_->active_socket = client;
+      std::lock_guard<std::mutex> lock(impl_->sockets_mu);
+      if (!impl_->running.load()) {
+        closesocket(client);
+        break;
       }
-      impl_->handle(client);
-      SOCKET to_close = INVALID_SOCKET;
-      {
-        std::lock_guard<std::mutex> lock(impl_->sockets_mu);
-        if (impl_->active_socket == client) {
-          impl_->active_socket = INVALID_SOCKET;
-          to_close = client;
-        }
-      }
-      if (to_close != INVALID_SOCKET) closesocket(to_close);
+      impl_->clients.insert(client);
+      ++impl_->sessions;
+      std::thread([this, client]() {
+        impl_->handle(client);
+        std::lock_guard<std::mutex> done(impl_->sockets_mu);
+        if (impl_->clients.erase(client) != 0) closesocket(client);
+        --impl_->sessions;
+        impl_->sessions_done.notify_all();
+      }).detach();
     }
   });
   return true;
@@ -411,22 +432,24 @@ bool DummyFtp::start(std::string* error) {
 void DummyFtp::stop() {
   if (!impl_->running.exchange(false) && impl_->listen_socket == INVALID_SOCKET) return;
   SOCKET listen_socket = INVALID_SOCKET;
-  SOCKET active = INVALID_SOCKET;
   {
     std::lock_guard<std::mutex> lock(impl_->sockets_mu);
     listen_socket = impl_->listen_socket;
     impl_->listen_socket = INVALID_SOCKET;
-    active = impl_->active_socket;
-    impl_->active_socket = INVALID_SOCKET;
   }
   if (listen_socket != INVALID_SOCKET) closesocket(listen_socket);
-  if (active != INVALID_SOCKET) closesocket(active);
   if (impl_->worker.joinable()) impl_->worker.join();
+  std::unique_lock<std::mutex> lock(impl_->sockets_mu);
+  for (SOCKET client : impl_->clients) closesocket(client);
+  impl_->clients.clear();
+  impl_->sessions_done.wait(lock, [this]() { return impl_->sessions == 0; });
 }
 
 std::uint16_t DummyFtp::port() const { return impl_->bound.load(); }
 
 void DummyFtp::set_data_timeout_ms(int ms) { impl_->data_timeout_ms = ms; }
+
+void DummyFtp::set_close_delay_ms(int ms) { impl_->close_delay_ms = ms; }
 
 int run_dummy_ftp(std::uint16_t port, const std::string& root) {
   std::string error;

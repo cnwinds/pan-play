@@ -21,6 +21,9 @@ struct InstallResult {
   // 按压缩包读到的位置算的进度。RAR 要解压完才知道有多少文件，安装中 files_total 可能一直是 0。
   std::int64_t bytes_done = 0;
   std::int64_t bytes_total = 0;
+  // 续装时核对上次装好的文件：核对过几个、上次一共装好几个。
+  int files_checked = 0;
+  int files_to_check = 0;
   // 失败原因在压缩包本身（比如是 PKG 安装包）时为 false，再装一次结果也一样。
   bool retryable = true;
 };
@@ -68,6 +71,8 @@ struct RarExtract {
   // 解压到暂存区时加在压缩包内路径前面（带结尾斜杠）；进度日志里记的也是加了前缀的名字。
   std::string staging_prefix;
   std::function<void(const std::vector<FinishedFile>& done)> on_file_done;
+  // 每读到一个文件调用一次；already 表示上次已经装好，这次只核对后跳过。
+  std::function<void(bool already)> on_entry;
   // 已读到整组分卷的第几个字节。
   std::function<void(std::int64_t archive_bytes)> on_bytes;
 };

@@ -387,6 +387,7 @@ function jobText(current) {
   if (current.state === "running") {
     if (current.message === "正在取消…") return current.message;
     if (current.message === "正在收尾") return `正在收尾，共 ${current.files_total} 个文件`;
+    if (current.message === "正在核对") return `核对已装文件 ${current.files_checked} / ${current.files_to_check}`;
     if (current.bytes_total > 0 && current.message === "正在安装") {
       return `已处理 ${formatBytes(current.bytes_done)} / ${formatBytes(current.bytes_total)} · ${current.files_done} 个文件`;
     }
@@ -517,6 +518,7 @@ function paintDock() {
   dockAction.textContent = running ? "取消" : "关闭";
   dockAction.disabled = Boolean(running && running.message === "正在取消…");
   dockToggle.setAttribute("aria-expanded", String(dockOpen));
+  dockToggle.setAttribute("aria-label", dockOpen ? "收起安装队列" : "展开安装队列");
   dockPanel.hidden = !dockOpen;
   dockClear.hidden = !tasks.some((task) => task.state === "done");
   if (dockOpen) paintQueueList();
@@ -602,6 +604,10 @@ dockAction.addEventListener("click", () => {
   const running = runningTask();
   if (running) queueAction("/api/queue/remove", { path: running.path });
   else queueAction("/api/queue/clear", {});
+});
+
+$("#dock-open").addEventListener("click", () => {
+  if (tasks.length) openTask(dockSummary().head);
 });
 
 dockToggle.addEventListener("click", () => {
@@ -707,6 +713,7 @@ function openDetail(game, opener) {
   detailBody.append(hero, install, about, naming);
 
   let coverKey = null;
+  let archivesRead = false;
   const paint = () => {
     syncGameState(game);
     title.textContent = displayName(game);
@@ -732,7 +739,7 @@ function openDetail(game, opener) {
     action.textContent = label;
     action.classList.toggle("done", game.state === "installed");
     action.disabled = running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
-      (game.state !== "need-settings" && !game.formats);
+      (game.state !== "need-settings" && archivesRead && !game.formats);
     progress.hidden = !running;
     if (running) {
       progressText.textContent = jobText(task);
@@ -780,9 +787,21 @@ function openDetail(game, opener) {
   first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));
   leave.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
 
+  // 简介等资料在本机缓存里，马上就有；压缩包大小和格式要列网盘目录，慢一些，分开取。
+  const loadMeta = () => api("/api/meta", { names: [game.name], detail: true }).then((data) => {
+    const item = (data.items || [])[0];
+    if (!item || !detail || detail.game !== game || item.name !== game.name) return;
+    Object.assign(game, item);
+    paint();
+    rename.sync();
+  }).catch(() => {
+    // 网盘那边的请求也会带回资料
+  });
+
   const reload = () => api("/api/game", { path: game.path }).then((data) => {
     if (!detail || detail.game !== game) return;
     Object.assign(game, data);
+    archivesRead = true;
     paint();
     rename.sync();
   }).catch((error) => {
@@ -801,6 +820,7 @@ function openDetail(game, opener) {
     },
   };
   paint();
+  loadMeta();
   reload();
   $("#detail-close").focus();
 }

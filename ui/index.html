@@ -118,12 +118,15 @@
       <ol class="queue-list" id="queue-list"></ol>
     </div>
     <div class="dock-bar">
-      <button type="button" class="dock-open" id="dock-toggle" aria-expanded="false" aria-controls="dock-panel">
+      <button type="button" class="dock-open" id="dock-open">
         <span class="dock-art" id="dock-art"></span>
         <span class="dock-text">
           <strong id="dock-title"></strong>
           <span id="dock-status" role="status"></span>
         </span>
+      </button>
+      <button type="button" class="dock-toggle" id="dock-toggle" aria-expanded="false" aria-controls="dock-panel"
+              aria-label="展开安装队列">
         <span class="chevron" aria-hidden="true"></span>
       </button>
       <span class="meter dock-meter" aria-hidden="true"><span id="dock-meter"></span></span>

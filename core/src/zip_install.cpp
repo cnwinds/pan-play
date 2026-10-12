@@ -601,6 +601,8 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     snapshot.files_total = result.files_total;
     snapshot.bytes_done = result.bytes_done;
     snapshot.bytes_total = result.bytes_total;
+    snapshot.files_checked = result.files_checked;
+    snapshot.files_to_check = result.files_to_check;
     request.on_progress(snapshot);
   };
   const auto fail = [&](const std::string& message) {
@@ -703,7 +705,15 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     if (auto write_error = write_journal(sink, journal_path, done); !write_error.empty()) return fail(write_error);
   }
   result.files_done = static_cast<int>(done.size());
-  report("正在安装");
+  result.files_to_check = static_cast<int>(done.size());
+  // 续装时先顺着压缩包把上次装好的文件逐个核对、跳过，这段时间显示“正在核对”。
+  const char* phase = done.empty() ? "正在安装" : "正在核对";
+  const auto enter_entry = [&](bool already) {
+    if (already) ++result.files_checked;
+    phase = already ? "正在核对" : "正在安装";
+    report(phase);
+  };
+  report(phase);
 
   std::int64_t written = 0;
   JournalWriter journal(sink, journal_path);
@@ -721,12 +731,13 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       options.staging_prefix = source.prefix;
       options.on_file_done = [&](const std::vector<FinishedFile>& now_done) {
         result.files_done = static_cast<int>(now_done.size());
-        report("正在安装");
+        report(phase);
       };
       options.on_bytes = [&](std::int64_t bytes) {
         result.bytes_done = source.start + bytes;
-        report("正在安装");
+        report(phase);
       };
+      options.on_entry = enter_entry;
       std::vector<ListedRarEntry> listed;
       error = extract_rar_entries(drive, sink, source.set->parts, options, &done, &listed);
       result.files_done = static_cast<int>(done.size());
@@ -755,12 +766,13 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
               [](const Member* left, const Member* right) { return left->local_offset < right->local_offset; });
     ZipStream stream(drive, source.volumes, request.cancel, request.prefetch);
     for (const Member* member : ordered) {
+      if (!member->directory) enter_entry(already_done(context, *member));
       error = extract_member(stream, context, *member, &done);
       result.files_done = static_cast<int>(done.size());
       if (error == kInterrupted) return interrupted();
       if (!error.empty()) return fail(error);
       result.bytes_done = source.start + member->local_offset + static_cast<std::int64_t>(member->comp_size);
-      report("正在安装");
+      report(phase);
     }
   }
 

@@ -575,7 +575,16 @@ body.drawer-open { overflow: hidden; }
   font-size: 0.88rem;
 }
 
+.progress-row > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .progress-row .link {
+  flex: none;
+  white-space: nowrap;
   padding: 0;
   border: 0;
   background: none;
@@ -719,9 +728,9 @@ body.drawer-open { overflow: hidden; }
 
 .dock-bar {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr auto auto;
   grid-template-rows: auto auto;
-  column-gap: 1rem;
+  column-gap: 0.5rem;
   row-gap: 0.55rem;
   align-items: center;
   padding: 0.75rem 0.85rem 0.85rem;
@@ -738,19 +747,32 @@ body.drawer-open { overflow: hidden; }
   text-align: left;
 }
 
-.dock-open .chevron {
-  flex: none;
+.dock-open:hover .dock-text strong { text-decoration: underline; text-underline-offset: 3px; }
+
+.dock-toggle {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: none;
+}
+
+.dock-toggle:hover { background: rgba(255, 255, 255, 0.06); }
+
+.dock-toggle .chevron {
   width: 8px;
   height: 8px;
-  margin: 0 0.25rem 0 auto;
   border-right: 1.6px solid var(--muted);
   border-bottom: 1.6px solid var(--muted);
-  transform: rotate(-135deg) translate(-2px, -2px);
+  transform: translateY(2px) rotate(-135deg);
   transition: transform 0.15s;
 }
 
-.dock-open[aria-expanded="true"] .chevron { transform: rotate(45deg) translate(-2px, -2px); }
-.dock-open:hover .chevron { border-color: var(--text); }
+.dock-toggle[aria-expanded="true"] .chevron { transform: translateY(-2px) rotate(45deg); }
+.dock-toggle:hover .chevron { border-color: var(--text); }
 
 .dock-panel {
   display: flex;
@@ -894,7 +916,7 @@ body.drawer-open { overflow: hidden; }
 }
 
 .dock-meter { grid-column: 1 / -1; grid-row: 2; height: 4px; }
-#dock-action { grid-column: 2; grid-row: 1; }
+#dock-action { grid-column: 3; grid-row: 1; }
 .dock[data-state="installed"] .dock-meter > span { background: var(--mint); }
 .dock[data-state="error"] .dock-meter > span { background: var(--danger); }
 

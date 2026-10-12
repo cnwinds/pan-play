@@ -190,30 +190,61 @@ class FtpSink : public InstallSink {
 
   std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) override;
 
-  // 写入流结束时调用，读回传输结果。
-  std::string end_upload(SOCKET data_socket, bool finished) {
+  // 主机答复 452/552 是存储空间不够，重试也没用。
+  static bool out_of_space(int code) { return code == 452 || code == 552; }
+  static std::string out_of_space_error(const std::string& reply) { return "主机存储空间不足（" + reply + "）"; }
+
+  // 写入流结束时调用，读回传输结果。replied 表示收到了主机的答复，也就是主机已经关掉了文件。
+  std::string end_upload(SOCKET data_socket, bool finished, bool* replied = nullptr, bool* fatal = nullptr) {
     shutdown(data_socket, SD_SEND);
     closesocket(data_socket);
     std::string reply;
     int code = 0;
-    if (!reader_.read_reply(&reply, &code)) return "没有收到传输结果";
+    const bool got = reader_.read_reply(&reply, &code);
+    if (replied != nullptr) *replied = got;
+    if (!got) return "没有收到传输结果";
+    if (out_of_space(code)) {
+      if (fatal != nullptr) *fatal = true;
+      return out_of_space_error(reply);
+    }
     if (finished && code != 226) return reply;
     return "";
   }
 
-  // 上传中途断了：换一条控制连接，问主机已经存下多少字节，再从那里续传。
-  std::string resume_upload(const std::string& path, std::int64_t* stored, SOCKET* data_socket) {
+  // 上传中途断了：问主机已经存下多少字节，再从那里续传。
+  // 主机可能还在把断掉那次传输收到的数据写进文件，这时问到的大小偏小，续传会把文件写坏。
+  // 所以先等主机答复断掉的那次传输（答复了说明文件已关闭）；控制连接也断了只能重连时，连问两次大小一致才算数。
+  // fatal 表示不用再试了（主机空间不足）。
+  std::string resume_upload(const std::string& path, bool reply_pending, std::int64_t* stored, SOCKET* data_socket,
+                            bool* fatal) {
     std::string error;
-    if (!reconnect_unlocked(&error)) return error.empty() ? "FTP 重新连接失败" : error;
     std::string reply;
     int code = 0;
-    if (!roundtrip("SIZE " + path, &reply, &code, &error)) return error;
-    if (code == 550) {
-      *stored = 0;
-    } else if (code == 213 && reply.find(' ') != std::string::npos) {
-      *stored = std::stoll(reply.substr(reply.find(' ') + 1));
-    } else {
-      return reply;
+    bool settled = !reply_pending && control_ != INVALID_SOCKET;
+    if (reply_pending && control_ != INVALID_SOCKET) settled = reader_.read_reply(&reply, &code);
+    if (settled && out_of_space(code)) {
+      *fatal = true;
+      return out_of_space_error(reply);
+    }
+    if (!settled && !reconnect_unlocked(&error)) return error.empty() ? "FTP 重新连接失败" : error;
+    std::int64_t previous = -1;
+    for (int check = 0;; ++check) {
+      if (!exchange("SIZE " + path, &reply, &code)) {
+        settled = false;
+        if (!reconnect_unlocked(&error)) return error.empty() ? "FTP 重新连接失败" : error;
+        if (!exchange("SIZE " + path, &reply, &code)) return "FTP 控制连接中断";
+      }
+      if (code == 550) {
+        *stored = 0;
+      } else if (code == 213 && reply.find(' ') != std::string::npos) {
+        *stored = std::stoll(reply.substr(reply.find(' ') + 1));
+      } else {
+        return reply;
+      }
+      if (settled || *stored == previous) break;
+      if (check >= 10) return "主机上的文件一直在变，没法续传";
+      previous = *stored;
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     return begin_upload(path, data_socket, *stored > 0 ? "APPE" : "STOR");
   }
@@ -550,9 +581,15 @@ class FtpWriter final : public FileWriter {
   std::string finish() override {
     if (finished_) return "写入已结束";
     for (int attempt = 0;; ++attempt) {
-      std::string error = data_ == INVALID_SOCKET ? "发送数据失败" : sink_.end_upload(data_, true);
+      std::string error = "发送数据失败";
+      bool fatal = false;
+      if (data_ != INVALID_SOCKET) {
+        bool replied = false;
+        error = sink_.end_upload(data_, true, &replied, &fatal);
+        awaiting_reply_ = !replied;
+      }
       data_ = INVALID_SOCKET;
-      if (error.empty() || attempt >= kRetries) {
+      if (error.empty() || fatal || attempt >= kRetries) {
         finished_ = true;
         lock_.unlock();
         return error;
@@ -567,7 +604,7 @@ class FtpWriter final : public FileWriter {
 
  private:
   static constexpr std::size_t kKeepBytes = 32u << 20;
-  static constexpr int kRetries = 3;
+  static constexpr int kRetries = 5;
 
   // 环形缓冲：文件第 pos 个字节放在 pos % kKeepBytes，小文件只占自己那么大。
   void remember(const std::uint8_t* data, std::size_t size) {
@@ -598,18 +635,22 @@ class FtpWriter final : public FileWriter {
     return true;
   }
 
-  // 主机存下的字节数要落在留着的这段里，才能把缺的部分补发过去。
+  // 主机存下的字节数要落在留着的这段里，才能把缺的部分补发过去。主机一时忙不过来时，隔一会儿再试，间隔逐次翻倍。
   std::string recover() {
     std::string error = "发送数据失败";
     const std::int64_t kept_from = std::max<std::int64_t>(0, sent_ - static_cast<std::int64_t>(kKeepBytes));
     for (int attempt = 0; attempt < kRetries; ++attempt) {
+      if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(500 << attempt));
       if (data_ != INVALID_SOCKET) {
         closesocket(data_);
         data_ = INVALID_SOCKET;
       }
       std::int64_t stored = 0;
       SOCKET socket = INVALID_SOCKET;
-      error = sink_.resume_upload(path_, &stored, &socket);
+      bool fatal = false;
+      error = sink_.resume_upload(path_, awaiting_reply_, &stored, &socket, &fatal);
+      awaiting_reply_ = true;
+      if (fatal) return error;
       if (!error.empty()) continue;
       data_ = socket;
       if (stored < kept_from || stored > sent_) return "发送数据失败，主机上的文件大小对不上";
@@ -625,6 +666,8 @@ class FtpWriter final : public FileWriter {
   SOCKET data_ = INVALID_SOCKET;
   std::int64_t sent_ = 0;
   std::vector<std::uint8_t> ring_;
+  // 当前这次传输的结果主机还没答复（续传前要先读掉，确认主机已关掉文件）。
+  bool awaiting_reply_ = true;
   bool finished_ = false;
 };
 
@@ -784,12 +827,14 @@ int run_install_sink_self_test() {
       return 1;
     }
   }
-  {
-    // 网盘读得慢时，主机会掐掉空闲的数据连接；写入方要重新连上，从主机已存下的位置续传。
-    const std::filesystem::path ftp_root = root / "ftp-idle";
+  // 网盘读得慢时，主机会掐掉空闲的数据连接；写入方要重新连上，从主机已存下的位置续传。
+  // 第二遍让主机断开后过一秒才把缓冲写进文件：续传要等它写完再问大小，否则会把文件写坏。
+  for (const int close_delay : {0, 1000}) {
+    const std::filesystem::path ftp_root = root / ("ftp-idle-" + std::to_string(close_delay));
     std::string error;
     DummyFtp server(ftp_root, 0);
     server.set_data_timeout_ms(300);
+    server.set_close_delay_ms(close_delay);
     if (!server.start(&error)) {
       std::cerr << error << "\n";
       return 1;

@@ -123,13 +123,16 @@ void reply_json(SOCKET socket, int status, const std::string& body) { reply(sock
 
 std::string json_error(const std::string& message) { return "{\"error\":\"" + panplay::json_escape(message) + "\"}"; }
 
-std::string game_state(panplay::InstallSink& sink, const std::string& prefix, const panplay::GameFolder& game) {
-  bool only_unsupported = !game.sets.empty();
-  for (const auto& set : game.sets) {
-    if (set.format == "zip" || set.format == "rar") only_unsupported = false;
-  }
+// 压缩包本身装不了时返回 "empty" 或 "unsupported"，能装返回空。
+std::string archive_problem(const panplay::GameFolder& game) {
   if (game.sets.empty()) return "empty";
-  if (only_unsupported) return "unsupported";
+  for (const auto& set : game.sets) {
+    if (set.format == "zip" || set.format == "rar") return "";
+  }
+  return "unsupported";
+}
+
+std::string game_state(panplay::InstallSink& sink, const std::string& prefix, const panplay::GameFolder& game) {
   const std::string folder = game.title_id.empty() ? game.name : game.title_id;
   const std::string marker = panplay::join_storage_path(panplay::join_storage_path(prefix, folder), ".panplay-done.json");
   std::string error;
@@ -296,9 +299,19 @@ struct ShelfListing {
 std::mutex shelf_mu;
 std::shared_ptr<const ShelfListing> shelf_cache;
 
+std::string shelf_key(const AppSettings& settings) {
+  return settings.library_path + "\n" + settings.dest + "\n" + settings.prefix;
+}
+
+// 游戏库列表读到的主机安装情况，还没读过或设置变了时为空。
+std::shared_ptr<const ShelfListing> cached_shelf(const AppSettings& settings) {
+  std::lock_guard<std::mutex> lock(shelf_mu);
+  return shelf_cache && shelf_cache->key == shelf_key(settings) ? shelf_cache : nullptr;
+}
+
 std::shared_ptr<const ShelfListing> shelf_listing(panplay::DrivePlugin& drive, bool fresh, std::string* error) {
   const AppSettings settings = load_settings();
-  const std::string key = settings.library_path + "\n" + settings.dest + "\n" + settings.prefix;
+  const std::string key = shelf_key(settings);
   std::lock_guard<std::mutex> lock(shelf_mu);
   if (!fresh && shelf_cache && shelf_cache->key == key) return shelf_cache;
   const auto children = drive.list(settings.library_path, error);
@@ -412,14 +425,23 @@ std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) 
   for (const auto& set : game.sets) {
     for (const auto& part : set.parts) game.archive_bytes += part.size;
   }
+  // 主机上的安装情况优先用游戏库列表读过的：安装时主机的 FTP 可能正忙，再连一次要等很久。
   std::string state = "need-settings";
-  std::unique_ptr<panplay::InstallSink> sink;
-  panplay::Destination destination;
-  if (!settings.dest.empty() && panplay::parse_destination(settings.dest, &destination, &error)) {
-    sink = panplay::open_destination(destination, &error);
+  if (const auto listing = cached_shelf(settings)) {
+    if (listing->dest_ready) state = archive_problem(game);
+    if (listing->dest_ready && state.empty()) {
+      state = listing->sink_ready ? shelf_state(listing->placement, game.name, game.title_id, path) : "install";
+    }
+  } else {
+    std::unique_ptr<panplay::InstallSink> sink;
+    panplay::Destination destination;
+    if (!settings.dest.empty() && panplay::parse_destination(settings.dest, &destination, &error)) {
+      sink = panplay::open_destination(destination, &error);
+    }
+    if (sink) state = archive_problem(game);
+    if (sink && state.empty()) state = game_state(*sink, settings.prefix, game);
+    else if (!sink && !settings.dest.empty()) state = "install";
   }
-  if (sink) state = game_state(*sink, settings.prefix, game);
-  else if (!settings.dest.empty()) state = "install";
   const auto queued = queue_states();
   if (queued.count(path) != 0) state = queued.at(path);
   return "{\"name\":\"" + panplay::json_escape(game.name) + "\",\"path\":\"" + panplay::json_escape(game.path) +
@@ -437,6 +459,8 @@ void publish_progress(const panplay::InstallResult& snapshot) {
   task->result.files_total = snapshot.files_total;
   task->result.bytes_done = snapshot.bytes_done;
   task->result.bytes_total = snapshot.bytes_total;
+  task->result.files_checked = snapshot.files_checked;
+  task->result.files_to_check = snapshot.files_to_check;
 }
 
 std::filesystem::path queue_file() { return panplay::app_data_dir() / "install-queue.json"; }
@@ -560,6 +584,7 @@ std::string task_json(const InstallTask& task, const char* state, const NameOver
          panplay::json_escape(r.status) + "\",\"message\":\"" + panplay::json_escape(r.message) +
          "\",\"files_done\":" + std::to_string(r.files_done) + ",\"files_total\":" + std::to_string(r.files_total) +
          ",\"bytes_done\":" + std::to_string(r.bytes_done) + ",\"bytes_total\":" + std::to_string(r.bytes_total) +
+         ",\"files_checked\":" + std::to_string(r.files_checked) + ",\"files_to_check\":" + std::to_string(r.files_to_check) +
          ",\"retryable\":" + (r.retryable ? "true" : "false") + game_meta_fields(name, title_id, overrides, false) + "}";
 }
 
@@ -709,10 +734,11 @@ void handle_client(SOCKET client) {
       const NameOverrides overrides = load_name_overrides();
       std::string out = "{\"items\":[";
       const panplay::Json* names = json.get("names");
+      const bool detail = json.boolean_or("detail", false);
       if (names != nullptr) {
         for (std::size_t i = 0; i < names->array.size() && i < 500; ++i) {
           if (i > 0) out += ",";
-          out += meta_json(names->array[i].text, overrides, false);
+          out += meta_json(names->array[i].text, overrides, detail);
         }
       }
       reply_json(client, 200, out + "]}");

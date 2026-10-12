@@ -353,7 +353,18 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
   while (failure.empty()) {
     RARHeaderDataEx header{};
     const int code = RARReadHeaderEx(handle, &header);
-    if (code == ERAR_END_ARCHIVE) break;
+    // 网盘读出错、安装被取消、接不上下一卷时，UnRAR 也常常只报压缩包结束；这些都不能当作读完了。
+    if (code == ERAR_END_ARCHIVE) {
+      const int last = static_cast<int>(guard.state.volumes.size()) - 1;
+      if (!guard.state.read_error.empty()) {
+        failure = guard.state.read_error;
+      } else if (options.cancel != nullptr && options.cancel->cancelled()) {
+        failure = kInterrupted;
+      } else if (guard.state.index < last) {
+        failure = "RAR 没有读完：停在第 " + std::to_string(guard.state.index + 1) + " 卷，共 " + std::to_string(last + 1) + " 卷";
+      }
+      break;
+    }
     if (code != ERAR_SUCCESS) {
       failure = process_failure("读取 RAR 文件头失败");
       break;
@@ -401,6 +412,7 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
     const auto before = finished_before.find(staged);
     const bool already = before != finished_before.end() && before->second.first == static_cast<std::int64_t>(size) &&
                          before->second.second == header.FileCRC;
+    if (!directory && options.on_entry) options.on_entry(already);
     if (!directory && !already) {
       writer.out = std::make_unique<OutputFile>(sink, join_storage_path(options.staging_root, staged),
                                                 options.stop_after_output_bytes, options.written);
