@@ -1,0 +1,66 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      # 自测要用 RAR 命令行现做测试压缩包。
+      - name: 下载 RAR 命令行
+        run: |
+          path=$(curl -fsSL https://www.rarlab.com/download.htm | grep -oE 'rar/rarlinux-x64-[0-9]+\.tar\.gz' | head -1)
+          curl -fsSL "https://www.rarlab.com/$path" -o rar.tar.gz
+          tar xzf rar.tar.gz
+          echo "PANPLAY_RAR=$PWD/rar/rar" >> "$GITHUB_ENV"
+
+      - name: 编译
+        run: |
+          cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux
+
+      - name: 自测
+        run: ./build-linux/panplay self-test
+
+      - name: HTTPS 连通
+        run: |
+          ./build-linux/panplay http-get https://pan.baidu.com/
+          ./build-linux/panplay http-get https://raw.githubusercontent.com/andshrew/PlayStation-Titles/main/README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panplay-linux
+          path: build-linux/panplay
+
+  ps5:
+    runs-on: ubuntu-24.04
+    env:
+      PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang-18 lld-18 llvm-18 unzip
+
+      - name: 安装 ps5-payload-sdk
+        run: |
+          curl -fsSL https://github.com/ps5-payload-dev/sdk/releases/download/v0.44/ps5-payload-sdk.zip -o sdk.zip
+          sudo unzip -q -d /opt sdk.zip
+
+      - name: 编译
+        run: |
+          "$PS5_PAYLOAD_SDK/bin/prospero-cmake" -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-ps5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panplay-ps5
+          path: build-ps5/panplay.elf

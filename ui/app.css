@@ -199,6 +199,21 @@ button:disabled { cursor: default; }
 
 .login-card h1 { font-size: 1.45rem; font-weight: 700; }
 
+/* 局域网访问时先输口令，盖住整个页面 */
+.unlock {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: var(--night);
+}
+
+.unlock[hidden] { display: none; }
+
+.unlock .field { justify-self: stretch; }
+
 .login-text { color: var(--muted); }
 
 .qr-wrap {

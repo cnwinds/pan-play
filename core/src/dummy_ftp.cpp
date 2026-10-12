@@ -1,7 +1,7 @@
 #include "panplay/dummy_ftp.hpp"
 
 #include "panplay/storage_path.hpp"
-#include "socket_util.hpp"
+#include "panplay/socket_util.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -34,6 +34,14 @@ std::string command_name(const std::string& line, std::string* argument) {
   return upper_copy(line.substr(0, space));
 }
 
+FILE* open_file(const std::filesystem::path& path, bool write, bool append) {
+#if defined(_WIN32)
+  return _wfopen(path.wstring().c_str(), write ? (append ? L"ab" : L"wb") : L"rb");
+#else
+  return std::fopen(path.c_str(), write ? (append ? "ab" : "wb") : "rb");
+#endif
+}
+
 SOCKET listen_on(std::uint16_t port, std::uint16_t* bound, std::string* error) {
   if (!net_startup(error)) return INVALID_SOCKET;
   SOCKET socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -41,7 +49,7 @@ SOCKET listen_on(std::uint16_t port, std::uint16_t* bound, std::string* error) {
     *error = "无法创建套接字";
     return INVALID_SOCKET;
   }
-  BOOL reuse = TRUE;
+  const int reuse = 1;
   setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
   sockaddr_in address{};
   address.sin_family = AF_INET;
@@ -58,7 +66,7 @@ SOCKET listen_on(std::uint16_t port, std::uint16_t* bound, std::string* error) {
     return INVALID_SOCKET;
   }
   sockaddr_in actual{};
-  int length = sizeof(actual);
+  socklen length = sizeof(actual);
   getsockname(socket, reinterpret_cast<sockaddr*>(&actual), &length);
   *bound = ntohs(actual.sin_port);
   return socket;
@@ -237,11 +245,7 @@ struct DummyFtp::Impl {
             send_line(client, "550 not a directory");
             continue;
           }
-          fd_set fds;
-          FD_ZERO(&fds);
-          FD_SET(passive, &fds);
-          timeval wait{10, 0};
-          if (select(0, &fds, nullptr, nullptr, &wait) <= 0) {
+          if (!wait_readable(passive, 10000)) {
             close_passive();
             send_line(client, "425 data connection timeout");
             continue;
@@ -274,11 +278,7 @@ struct DummyFtp::Impl {
             send_line(client, "550 not found");
             continue;
           }
-          fd_set fds;
-          FD_ZERO(&fds);
-          FD_SET(passive, &fds);
-          timeval wait{10, 0};
-          if (select(0, &fds, nullptr, nullptr, &wait) <= 0) {
+          if (!wait_readable(passive, 10000)) {
             close_passive();
             send_line(client, "425 data connection timeout");
             continue;
@@ -290,7 +290,7 @@ struct DummyFtp::Impl {
             continue;
           }
           set_socket_timeout(data, 10000);
-          FILE* file = _wfopen(local.wstring().c_str(), L"rb");
+          FILE* file = open_file(local, false, false);
           if (!file) {
             closesocket(data);
             send_line(client, "550 cannot open file");
@@ -318,11 +318,7 @@ struct DummyFtp::Impl {
             send_line(client, "425 use pasv first");
             continue;
           }
-          fd_set fds;
-          FD_ZERO(&fds);
-          FD_SET(passive, &fds);
-          timeval wait{10, 0};
-          if (select(0, &fds, nullptr, nullptr, &wait) <= 0) {
+          if (!wait_readable(passive, 10000)) {
             close_passive();
             send_line(client, "425 data connection timeout");
             continue;
@@ -341,7 +337,7 @@ struct DummyFtp::Impl {
           }
           // 直接写目标文件。中断后 SIZE 就是已落盘字节，和已提交字节不一致时由客户端改为 STOR 覆盖。
           const bool append = name == "APPE";
-          FILE* file = _wfopen(local.wstring().c_str(), append ? L"ab" : L"wb");
+          FILE* file = open_file(local, true, append);
           if (!file) {
             closesocket(data);
             send_line(client, "550 cannot open file");
@@ -437,11 +433,11 @@ void DummyFtp::stop() {
     listen_socket = impl_->listen_socket;
     impl_->listen_socket = INVALID_SOCKET;
   }
-  if (listen_socket != INVALID_SOCKET) closesocket(listen_socket);
+  if (listen_socket != INVALID_SOCKET) close_socket_now(listen_socket);
   if (impl_->worker.joinable()) impl_->worker.join();
   std::unique_lock<std::mutex> lock(impl_->sockets_mu);
-  for (SOCKET client : impl_->clients) closesocket(client);
-  impl_->clients.clear();
+  // 只 shutdown 叫醒会话线程，由会话线程自己 close，免得句柄号被别的连接复用后又被它读写。
+  for (SOCKET client : impl_->clients) shutdown(client, SD_BOTH);
   impl_->sessions_done.wait(lock, [this]() { return impl_->sessions == 0; });
 }
 

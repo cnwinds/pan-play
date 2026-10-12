@@ -99,6 +99,10 @@ AppSettings load_settings() {
   if (!env_secret.empty()) settings.secret_key = env_secret;
   if (settings.prefix.empty()) settings.prefix = "/mnt/usb0/homebrew";
   if (settings.library_path.empty()) settings.library_path = "/apps";
+#if defined(PANPLAY_PS5)
+  // 在主机上直接写本机文件系统，主机目录就是真实路径。
+  if (settings.dest.empty()) settings.dest = "/";
+#endif
   return settings;
 }
 

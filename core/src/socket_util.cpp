@@ -1,4 +1,4 @@
-#include "socket_util.hpp"
+#include "panplay/socket_util.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -7,8 +7,10 @@
 namespace panplay {
 namespace {
 
+#if defined(_WIN32)
 // Windows 10 起的 SO_REUSE_UNICASTPORT，MinGW 头文件里没有。
 constexpr int kReuseUnicastPort = 0x3007;
+#endif
 
 bool trace_enabled() {
   const char* value = std::getenv("PANPLAY_FTP_TRACE");
@@ -18,6 +20,7 @@ bool trace_enabled() {
 }  // namespace
 
 bool net_startup(std::string* error) {
+#if defined(_WIN32)
   static bool ready = false;
   if (ready) return true;
   WSADATA data;
@@ -26,19 +29,51 @@ bool net_startup(std::string* error) {
     return false;
   }
   ready = true;
+#else
+  (void)error;
+#endif
   return true;
 }
 
 void set_socket_timeout(SOCKET socket, int milliseconds) {
+#if defined(_WIN32)
   const DWORD timeout = static_cast<DWORD>(milliseconds);
   setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
   setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+  timeval timeout{};
+  timeout.tv_sec = milliseconds / 1000;
+  timeout.tv_usec = (milliseconds % 1000) * 1000;
+  setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+}
+
+void close_socket_now(SOCKET socket) {
+  if (socket == INVALID_SOCKET) return;
+  shutdown(socket, SD_BOTH);
+  closesocket(socket);
+}
+
+bool wait_readable(SOCKET socket, int milliseconds) {
+  fd_set fds;
+  FD_ZERO(&fds);
+  FD_SET(socket, &fds);
+  timeval wait{};
+  wait.tv_sec = milliseconds / 1000;
+  wait.tv_usec = (milliseconds % 1000) * 1000;
+  return select(static_cast<int>(socket) + 1, &fds, nullptr, nullptr, &wait) > 0;
 }
 
 bool send_all(SOCKET socket, const char* data, std::size_t size) {
+#if defined(MSG_NOSIGNAL)
+  constexpr int flags = MSG_NOSIGNAL;
+#else
+  constexpr int flags = 0;
+#endif
   std::size_t sent = 0;
   while (sent < size) {
-    const int n = ::send(socket, data + sent, static_cast<int>(size - sent), 0);
+    const int n = static_cast<int>(::send(socket, data + sent, static_cast<int>(size - sent), flags));
     if (n <= 0) return false;
     sent += static_cast<std::size_t>(n);
   }
@@ -53,7 +88,7 @@ bool send_line(SOCKET socket, const std::string& line) {
 
 bool recv_some(SOCKET socket, std::string* pending) {
   char buffer[4096];
-  const int n = ::recv(socket, buffer, sizeof(buffer), 0);
+  const int n = static_cast<int>(::recv(socket, buffer, sizeof(buffer), 0));
   if (n <= 0) return false;
   pending->append(buffer, static_cast<std::size_t>(n));
   return pending->size() <= 1024 * 1024;
@@ -109,6 +144,7 @@ SOCKET connect_tcp(const std::string& host, std::uint16_t port, std::string* err
     *error = "地址无效";
     return INVALID_SOCKET;
   }
+#if defined(_WIN32)
   // FTP 每传一个文件开一条数据连接，且由本机先关，关掉的连接在 TIME_WAIT 里占着本机端口约两分钟；
   // 小文件多时一两分钟就能把临时端口用光。打开这个选项并绑端口 0，系统改在 connect 时按完整的
   // 四元组选端口，还在 TIME_WAIT 的端口也能连别的地址。系统不支持这个选项时照旧。
@@ -118,6 +154,7 @@ SOCKET connect_tcp(const std::string& host, std::uint16_t port, std::string* err
     local.sin_family = AF_INET;
     bind(socket, reinterpret_cast<sockaddr*>(&local), sizeof(local));
   }
+#endif
   if (connect(socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
     closesocket(socket);
     *error = "连接失败";

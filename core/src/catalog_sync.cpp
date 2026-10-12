@@ -30,7 +30,11 @@ std::int64_t unix_now() {
 std::string utc_now_iso8601() {
   const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   std::tm tm{};
+#if defined(_WIN32)
   gmtime_s(&tm, &now);
+#else
+  gmtime_r(&now, &tm);
+#endif
   char buffer[32]{};
   std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &tm);
   return buffer;

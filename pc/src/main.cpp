@@ -1,6 +1,7 @@
 #include "panplay/app_paths.hpp"
 #include "panplay/drive.hpp"
 #include "panplay/dummy_ftp.hpp"
+#include "panplay/http.hpp"
 #include "panplay/install.hpp"
 #include "panplay/json.hpp"
 #include "panplay/prefetch.hpp"
@@ -18,13 +19,22 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
 #include <windows.h>
 #include <shellapi.h>
+#else
+#include <csignal>
+#endif
+
+#if defined(PANPLAY_PS5)
+extern "C" int sceNotificationSend(int user_id, bool is_logged, const char* payload);
+#endif
 
 namespace {
 
 std::vector<std::string> utf8_args() {
   std::vector<std::string> out;
+#if defined(_WIN32)
   int count = 0;
   LPWSTR* wide = CommandLineToArgvW(GetCommandLineW(), &count);
   if (!wide) return out;
@@ -35,14 +45,56 @@ std::vector<std::string> utf8_args() {
     out.push_back(std::move(arg));
   }
   LocalFree(wide);
+#endif
   return out;
+}
+
+#if defined(PANPLAY_PS5)
+// 主机右上角弹一条通知。
+void notify(const std::string& text) {
+  constexpr int kSystemUser = 0xFE;
+  const std::string payload =
+      "{\"rawData\":{\"viewTemplateType\":\"InteractiveToastTemplateB\",\"channelType\":\"Downloads\","
+      "\"useCaseId\":\"IDC\",\"toastOverwriteType\":\"No\",\"isImmediate\":true,\"priority\":100,"
+      "\"viewData\":{\"icon\":{\"type\":\"Predefined\",\"parameters\":{\"icon\":\"download\"}},"
+      "\"message\":{\"body\":\"" + panplay::json_escape(text) + "\"}}},"
+      "\"createdDateTime\":\"2026-01-01T00:00:00.000Z\",\"localNotificationId\":\"73726\"}";
+  sceNotificationSend(kSystemUser, true, payload.c_str());
+}
+#endif
+
+// 排查网络用：打印状态码、长度和跳转后的地址，不打印内容。
+int http_get(const std::string& url) {
+  panplay::HttpRequest request;
+  request.url = url;
+  const panplay::HttpResponse response = panplay::http_send(request);
+  if (!response.error.empty()) {
+    std::cerr << response.error << "\n";
+    return 1;
+  }
+  std::cout << "HTTP " << response.status << "，" << response.body.size() << " 字节，" << response.final_url << "\n";
+  return response.status >= 200 && response.status < 400 ? 0 : 1;
+}
+
+// panplay serve [端口] [--lan]
+int serve(int argc, char** argv) {
+  ServerOptions options;
+  for (int i = 2; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--lan") {
+      options.lan = true;
+    } else {
+      options.port = std::stoi(arg);
+    }
+  }
+  return run_server(options);
 }
 
 std::string session_path() { return (panplay::app_data_dir() / "baidu-session.json").u8string(); }
 
 void print_usage() {
   std::cout << "盘游 Panplay\n"
-            << "  panplay serve [端口]\n"
+            << "  panplay serve [端口] [--lan]   --lan 让局域网里的手机也能打开，要访问口令\n"
             << "  panplay self-test\n"
             << "  panplay bench-prefetch\n"
             << "  panplay bench-download <网盘目录> [秒] [连接数] [块MB]\n"
@@ -53,6 +105,7 @@ void print_usage() {
             << "  panplay install <游戏目录> --to <本机目录或 ftp://主机:端口>\n"
             << "  panplay read <fsid> <offset> <length>\n"
             << "  panplay store-meta <conceptId>\n"
+            << "  panplay http-get <地址>\n"
             << "\n密钥在界面的设置页保存。开发时环境变量 PANPLAY_BAIDU_APP_KEY 和 PANPLAY_BAIDU_SECRET_KEY 仍可覆盖。\n";
 }
 
@@ -234,6 +287,10 @@ int bench_download(const std::string& dir, int seconds, int connections, int blo
 }  // namespace
 
 int main(int argc, char** argv) {
+#if !defined(_WIN32)
+  // 对方先关了连接时 send 会触发 SIGPIPE，默认会结束进程。
+  std::signal(SIGPIPE, SIG_IGN);
+#endif
   std::vector<std::string> args = utf8_args();
   std::vector<char*> utf8_argv;
   if (static_cast<int>(args.size()) == argc) {
@@ -241,12 +298,25 @@ int main(int argc, char** argv) {
     utf8_argv.push_back(nullptr);
     argv = utf8_argv.data();
   }
+#if defined(PANPLAY_PS5)
+  // 载荷由 ELF 加载器启动，通常不带参数：直接开局域网界面。
+  if (argc < 2) {
+    ServerOptions options;
+    options.lan = true;
+    options.on_ready = [](const std::string& url, const std::string& code) {
+      notify("盘游已启动 " + url + " 口令 " + code);
+    };
+    const int code = run_server(options);
+    if (code != 0) notify("盘游没能启动：端口 " + std::to_string(options.port) + " 可能已被占用");
+    return code;
+  }
+#endif
   if (argc < 2) {
     print_usage();
     return 1;
   }
   const std::string command = argv[1];
-  if (command == "serve") return run_server(argc >= 3 ? std::stoi(argv[2]) : 8734);
+  if (command == "serve") return serve(argc, argv);
   if (command == "bench-prefetch") return panplay::run_prefetch_bench();
   if (command == "bench-download" && argc >= 3) {
     return bench_download(argv[2], argc >= 4 ? std::stoi(argv[3]) : 20, argc >= 5 ? std::stoi(argv[4]) : 0,
@@ -273,6 +343,7 @@ int main(int argc, char** argv) {
   }
   if (command == "read" && argc >= 5) return read_range(argv[2], argv[3], argv[4]);
   if (command == "store-meta" && argc >= 3) return panplay::run_store_meta_cli(argv[2]);
+  if (command == "http-get" && argc >= 3) return http_get(argv[2]);
   print_usage();
   return 1;
 }

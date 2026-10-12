@@ -65,13 +65,52 @@ let dockOpen = false;
 let detail = null;
 const tiles = new Map();
 
+// 局域网访问时服务器要口令；同时等口令的请求共用一次输入。
+let unlocking = null;
+
+function unlock() {
+  if (unlocking) return unlocking;
+  const box = $("#unlock-box");
+  const form = $("#unlock-form");
+  const note = $("#unlock-note");
+  box.hidden = false;
+  form.elements.code.focus();
+  unlocking = new Promise((resolve) => {
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      note.textContent = "";
+      const response = await fetch("/api/unlock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: form.elements.code.value.trim() }),
+      }).catch(() => null);
+      const data = response ? await response.json().catch(() => ({})) : {};
+      if (!response || !response.ok) {
+        note.textContent = data.error || "没有连上主机";
+        return;
+      }
+      box.hidden = true;
+      form.reset();
+      unlocking = null;
+      resolve();
+    };
+  });
+  return unlocking;
+}
+
 async function api(path, body) {
-  const response = await fetch(path, body === undefined ? undefined : {
+  const send = () => fetch(path, body === undefined ? undefined : {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await response.json().catch(() => ({}));
+  let response = await send();
+  let data = await response.json().catch(() => ({}));
+  if (response.status === 401 && data.locked) {
+    await unlock();
+    response = await send();
+    data = await response.json().catch(() => ({}));
+  }
   if (!response.ok) throw new Error(data.error || "请求没有完成");
   return data;
 }

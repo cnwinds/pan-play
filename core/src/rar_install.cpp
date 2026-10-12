@@ -4,10 +4,14 @@
 #include "panplay/library.hpp"
 #include "panplay/prefetch.hpp"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif !defined(_UNIX)
+#define _UNIX
+#endif
 
 #include "dll.hpp"
 
@@ -52,19 +56,62 @@ struct RarSession {
 // UnRAR 的读取回调不带上下文；解压在调用线程里同步进行，所以按线程保存。
 thread_local RarSession* session = nullptr;
 
+// wchar_t 在 Windows 上是 UTF-16，在其他平台上是 UTF-32。
 std::wstring utf8_to_wide(const std::string& text) {
-  if (text.empty()) return {};
-  const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-  std::wstring wide(size > 0 ? size - 1 : 0, L'\0');
-  if (size > 1) MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), size);
+  std::wstring wide;
+  std::size_t i = 0;
+  while (i < text.size()) {
+    const auto lead = static_cast<unsigned char>(text[i]);
+    const int extra = lead < 0x80 ? 0 : lead >= 0xF0 ? 3 : lead >= 0xE0 ? 2 : lead >= 0xC0 ? 1 : -1;
+    std::uint32_t point = extra == 0 ? lead : extra == 1 ? lead & 0x1F : extra == 2 ? lead & 0x0F : lead & 0x07;
+    bool valid = extra >= 0 && i + static_cast<std::size_t>(extra) < text.size();
+    for (int k = 1; valid && k <= extra; ++k) {
+      const auto next = static_cast<unsigned char>(text[i + static_cast<std::size_t>(k)]);
+      if ((next & 0xC0) != 0x80) valid = false;
+      point = (point << 6) | (next & 0x3F);
+    }
+    if (!valid) {
+      wide.push_back(static_cast<wchar_t>(0xFFFD));
+      ++i;
+      continue;
+    }
+    i += static_cast<std::size_t>(extra) + 1;
+    if (sizeof(wchar_t) == 2 && point >= 0x10000) {
+      point -= 0x10000;
+      wide.push_back(static_cast<wchar_t>(0xD800 + (point >> 10)));
+      wide.push_back(static_cast<wchar_t>(0xDC00 + (point & 0x3FF)));
+    } else {
+      wide.push_back(static_cast<wchar_t>(point));
+    }
+  }
   return wide;
 }
 
 std::string wide_to_utf8(const wchar_t* text) {
-  if (text == nullptr || text[0] == L'\0') return {};
-  const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
-  std::string utf8(size > 0 ? size - 1 : 0, '\0');
-  if (size > 1) WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8.data(), size, nullptr, nullptr);
+  std::string utf8;
+  if (text == nullptr) return utf8;
+  for (; *text != L'\0'; ++text) {
+    std::uint32_t point = static_cast<std::uint32_t>(*text);
+    if (sizeof(wchar_t) == 2 && point >= 0xD800 && point < 0xDC00 && text[1] >= 0xDC00 && text[1] < 0xE000) {
+      point = 0x10000 + ((point - 0xD800) << 10) + (static_cast<std::uint32_t>(text[1]) - 0xDC00);
+      ++text;
+    }
+    if (point < 0x80) {
+      utf8.push_back(static_cast<char>(point));
+    } else if (point < 0x800) {
+      utf8.push_back(static_cast<char>(0xC0 | (point >> 6)));
+      utf8.push_back(static_cast<char>(0x80 | (point & 0x3F)));
+    } else if (point < 0x10000) {
+      utf8.push_back(static_cast<char>(0xE0 | (point >> 12)));
+      utf8.push_back(static_cast<char>(0x80 | ((point >> 6) & 0x3F)));
+      utf8.push_back(static_cast<char>(0x80 | (point & 0x3F)));
+    } else {
+      utf8.push_back(static_cast<char>(0xF0 | (point >> 18)));
+      utf8.push_back(static_cast<char>(0x80 | ((point >> 12) & 0x3F)));
+      utf8.push_back(static_cast<char>(0x80 | ((point >> 6) & 0x3F)));
+      utf8.push_back(static_cast<char>(0x80 | (point & 0x3F)));
+    }
+  }
   return utf8;
 }
 

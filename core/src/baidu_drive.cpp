@@ -3,10 +3,12 @@
 #include "panplay/http.hpp"
 #include "panplay/json.hpp"
 
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -38,7 +40,13 @@ bool write_file_atomic(const std::string& path, const std::string& text) {
     out << text;
     if (!out) return false;
   }
+#if defined(_WIN32)
   return MoveFileExW(temp.wstring().c_str(), target.wstring().c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+  std::error_code ec;
+  std::filesystem::rename(temp, target, ec);
+  return !ec;
+#endif
 }
 
 bool link_expired_status(int status) { return status == 403 || status == 404 || status == 410; }

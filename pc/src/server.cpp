@@ -9,14 +9,12 @@
 #include "panplay/install.hpp"
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
+#include "panplay/socket_util.hpp"
 #include "panplay/store_meta.hpp"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
+#if defined(PANPLAY_EMBED_UI)
+#include "embedded_ui.hpp"
 #endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
 
 #include <algorithm>
 #include <cctype>
@@ -29,6 +27,8 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <random>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -74,6 +74,65 @@ std::string read_file(const std::filesystem::path& path) {
   return buffer.str();
 }
 
+// 磁盘上有 ui/ 目录时优先用它，改界面不用重新编译；没有时用打包进程序的那份。
+std::string ui_file(const std::string& name) {
+  std::string bytes = read_file(ui_root() / name);
+#if defined(PANPLAY_EMBED_UI)
+  if (bytes.empty()) {
+    for (std::size_t i = 0; i < panplay_embedded::file_count; ++i) {
+      const auto& file = panplay_embedded::files[i];
+      if (name == file.name) return std::string(reinterpret_cast<const char*>(file.data), file.size);
+    }
+  }
+#endif
+  return bytes;
+}
+
+// 局域网模式：别的设备也能打开界面，所以要访问口令。口令存在数据目录，通过后发一个会话 Cookie。
+struct LanAccess {
+  bool enabled = false;
+  std::string code;
+  std::mutex mu;
+  std::set<std::string> sessions;
+};
+
+LanAccess lan;
+
+std::string random_digits(std::size_t count) {
+  std::random_device device;
+  std::string out;
+  for (std::size_t i = 0; i < count; ++i) out.push_back(static_cast<char>('0' + device() % 10));
+  return out;
+}
+
+std::string random_token() {
+  static const char* hex = "0123456789abcdef";
+  std::random_device device;
+  std::string out;
+  for (int i = 0; i < 32; ++i) out.push_back(hex[device() % 16]);
+  return out;
+}
+
+std::string access_code_path() { return (panplay::app_data_dir() / "access-code.txt").u8string(); }
+
+std::string load_or_create_access_code() {
+  const std::string path = access_code_path();
+  std::string code = read_file(std::filesystem::u8path(path));
+  while (!code.empty() && std::isspace(static_cast<unsigned char>(code.back()))) code.pop_back();
+  if (code.size() >= 4) return code;
+  code = random_digits(6);
+  std::ofstream out(std::filesystem::u8path(path), std::ios::trunc);
+  out << code << "\n";
+  return code;
+}
+
+bool same_text(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+  return diff == 0;
+}
+
 struct InstallTask {
   std::string path;
   panplay::InstallResult result;
@@ -103,14 +162,7 @@ std::map<std::string, std::string> queue_states() {
   return states;
 }
 
-void send_all(SOCKET socket, const std::string& data) {
-  std::size_t sent = 0;
-  while (sent < data.size()) {
-    const int n = ::send(socket, data.data() + sent, static_cast<int>(data.size() - sent), 0);
-    if (n <= 0) return;
-    sent += static_cast<std::size_t>(n);
-  }
-}
+void send_all(SOCKET socket, const std::string& data) { panplay::send_all(socket, data.data(), data.size()); }
 
 void reply(SOCKET socket, int status, const std::string& type, const std::string& body, const std::string& extra = "") {
   const std::string text = "HTTP/1.1 " + std::to_string(status) + (status == 200 ? " OK" : " Error") +
@@ -278,6 +330,7 @@ std::string folder_name_of(const std::string& path) {
 std::string image_type(const std::string& bytes) {
   if (bytes.size() >= 4 && bytes.compare(1, 3, "PNG") == 0) return "image/png";
   if (bytes.size() >= 12 && bytes.compare(8, 4, "WEBP") == 0) return "image/webp";
+  if (bytes.size() >= 12 && bytes.compare(4, 4, "ftyp") == 0) return "image/avif";
   return "image/jpeg";
 }
 
@@ -659,13 +712,64 @@ bool is_loopback_host(std::string host) {
   return host == "127.0.0.1" || host == "localhost";
 }
 
-// 只服务本机页面：Host 挡 DNS 重绑定；POST 要求 JSON 让浏览器跨站请求必须预检，而这里不响应预检。
+// 本机模式只服务本机页面：Host 挡 DNS 重绑定。局域网模式靠口令换来的 Cookie，重绑定来的页面拿不到它。
+// POST 要求 JSON 让浏览器跨站请求必须预检，而这里不响应预检；带了 Origin 时还要和 Host 对得上。
 bool trusted_request(const std::string& header, const std::string& method) {
-  if (!is_loopback_host(header_value(header, "Host"))) return false;
+  const std::string host = header_value(header, "Host");
+  if (!lan.enabled && !is_loopback_host(host)) return false;
   if (method != "POST") return true;
   const std::string origin = header_value(header, "Origin");
-  if (!origin.empty() && !is_loopback_host(origin)) return false;
+  if (!origin.empty()) {
+    if (lan.enabled ? origin != "http://" + host : !is_loopback_host(origin)) return false;
+  }
   return header_value(header, "Content-Type").rfind("application/json", 0) == 0;
+}
+
+std::string cookie_value(const std::string& header, const std::string& name) {
+  const std::string cookies = header_value(header, "Cookie");
+  std::size_t start = 0;
+  while (start < cookies.size()) {
+    std::size_t end = cookies.find(';', start);
+    if (end == std::string::npos) end = cookies.size();
+    std::string pair = cookies.substr(start, end - start);
+    const std::size_t first = pair.find_first_not_of(' ');
+    pair = first == std::string::npos ? "" : pair.substr(first);
+    if (pair.rfind(name + "=", 0) == 0) return pair.substr(name.size() + 1);
+    start = end + 1;
+  }
+  return "";
+}
+
+bool unlocked(const std::string& header) {
+  if (!lan.enabled) return true;
+  const std::string token = cookie_value(header, "panplay_session");
+  std::lock_guard<std::mutex> lock(lan.mu);
+  return !token.empty() && lan.sessions.count(token) != 0;
+}
+
+// 口令核对一次只做一个，错了停一秒，挡住并发猜口令。
+void handle_unlock(SOCKET client, const std::string& body) {
+  if (!lan.enabled) {
+    reply_json(client, 200, "{}");
+    return;
+  }
+  const panplay::Json json = panplay::Json::parse(body, nullptr);
+  static std::mutex attempts;
+  {
+    std::lock_guard<std::mutex> one_at_a_time(attempts);
+    if (!same_text(json.str("code"), lan.code)) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      reply_json(client, 403, json_error("口令不对"));
+      return;
+    }
+  }
+  const std::string token = random_token();
+  {
+    std::lock_guard<std::mutex> lock(lan.mu);
+    lan.sessions.insert(token);
+  }
+  reply(client, 200, "application/json; charset=utf-8", "{}",
+        "Set-Cookie: panplay_session=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000\r\n");
 }
 
 void handle_client(SOCKET client) {
@@ -694,22 +798,29 @@ void handle_client(SOCKET client) {
 
   const std::string method = request_method(header);
   const std::string target = request_target(header);
-  const std::filesystem::path ui = ui_root();
   if (!trusted_request(header, method)) {
     reply_json(client, 403, json_error("只接受本机页面的请求"));
     return;
   }
 
   if (method == "GET" && (target == "/" || target == "/index.html")) {
-    reply(client, 200, "text/html; charset=utf-8", read_file(ui / "index.html"));
+    reply(client, 200, "text/html; charset=utf-8", ui_file("index.html"));
     return;
   }
   if (method == "GET" && target == "/app.css") {
-    reply(client, 200, "text/css; charset=utf-8", read_file(ui / "app.css"));
+    reply(client, 200, "text/css; charset=utf-8", ui_file("app.css"));
     return;
   }
   if (method == "GET" && target == "/app.js") {
-    reply(client, 200, "text/javascript; charset=utf-8", read_file(ui / "app.js"));
+    reply(client, 200, "text/javascript; charset=utf-8", ui_file("app.js"));
+    return;
+  }
+  if (method == "POST" && target == "/api/unlock") {
+    handle_unlock(client, body);
+    return;
+  }
+  if (!unlocked(header)) {
+    reply_json(client, 401, "{\"error\":\"需要访问口令\",\"locked\":true}");
     return;
   }
   if (method == "GET" && target.rfind("/api/cover/", 0) == 0) {
@@ -963,9 +1074,32 @@ void handle_client(SOCKET client) {
   reply_json(client, 404, json_error("没有这个页面"));
 }
 
+// 本机在局域网里的地址：向外连一个 UDP 套接字（不发包），看系统选了哪个本地地址。
+std::string lan_address() {
+  SOCKET probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (probe == INVALID_SOCKET) return "";
+  sockaddr_in remote{};
+  remote.sin_family = AF_INET;
+  remote.sin_port = htons(53);
+  inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
+  std::string address;
+  if (connect(probe, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) == 0) {
+    sockaddr_in local{};
+    panplay::socklen length = sizeof(local);
+    char text[INET_ADDRSTRLEN]{};
+    if (getsockname(probe, reinterpret_cast<sockaddr*>(&local), &length) == 0 &&
+        inet_ntop(AF_INET, &local.sin_addr, text, sizeof(text)) != nullptr) {
+      address = text;
+    }
+  }
+  closesocket(probe);
+  return address;
+}
+
 }  // namespace
 
-int run_server(int port) {
+int run_server(const ServerOptions& options) {
+  const int port = options.port;
   {
     std::string catalog_error;
     if (panplay::GameCatalog::instance().load_default(&catalog_error)) {
@@ -978,29 +1112,39 @@ int run_server(int port) {
     store_meta->start();
   }
 
-  WSADATA data;
-  if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
-    std::cerr << "Winsock 初始化失败\n";
+  std::string net_error;
+  if (!panplay::net_startup(&net_error)) {
+    std::cerr << net_error << "\n";
     return 1;
   }
+  lan.enabled = options.lan;
+  if (lan.enabled) lan.code = load_or_create_access_code();
+  const char* bind_host = lan.enabled ? "0.0.0.0" : "127.0.0.1";
   SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  BOOL reuse = TRUE;
+  const int reuse = 1;
   setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
   sockaddr_in address{};
   address.sin_family = AF_INET;
-  address.sin_port = htons(static_cast<u_short>(port));
-  inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+  address.sin_port = htons(static_cast<std::uint16_t>(port));
+  inet_pton(AF_INET, bind_host, &address.sin_addr);
   if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(listener, 8) != 0) {
-    std::cerr << "无法在 127.0.0.1:" << port << " 监听\n";
+    std::cerr << "无法在 " << bind_host << ":" << port << " 监听\n";
     return 1;
   }
-  std::cout << "盘游界面 http://127.0.0.1:" << port << "\n按 Ctrl+C 结束" << std::endl;
+  std::string url = "http://127.0.0.1:" + std::to_string(port);
+  if (lan.enabled) {
+    const std::string here = lan_address();
+    if (!here.empty()) url = "http://" + here + ":" + std::to_string(port);
+    std::cout << "盘游界面 " << url << "\n访问口令 " << lan.code << "（" << access_code_path() << "）" << std::endl;
+  } else {
+    std::cout << "盘游界面 " << url << "\n按 Ctrl+C 结束" << std::endl;
+  }
+  if (options.on_ready) options.on_ready(url, lan.code);
   load_queue();
   while (true) {
     SOCKET client = accept(listener, nullptr, nullptr);
     if (client == INVALID_SOCKET) break;
-    const DWORD timeout_ms = 30000;
-    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+    panplay::set_socket_timeout(client, 30000);
     std::thread([client] {
       try {
         handle_client(client);

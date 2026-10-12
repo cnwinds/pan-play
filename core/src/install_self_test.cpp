@@ -31,6 +31,19 @@ namespace {
 
 using Generator = std::function<void(std::int64_t offset, std::uint8_t* dst, std::size_t size)>;
 
+std::string shell_quoted(const std::filesystem::path& path) { return "\"" + path.string() + "\""; }
+
+// 用 RAR 命令行生成测试压缩包：Windows 上是 WinRAR，其他平台是 PATH 里的 rar，也可以用 PANPLAY_RAR 指定。
+bool run_rar(const std::string& args) {
+#if defined(_WIN32)
+  const std::string command = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" " + args + "\"";
+#else
+  const char* custom = std::getenv("PANPLAY_RAR");
+  const std::string command = std::string("\"") + (custom != nullptr && *custom != 0 ? custom : "rar") + "\" " + args;
+#endif
+  return std::system(command.c_str()) == 0;
+}
+
 struct FakeFile {
   std::int64_t size = 0;
   Generator fill;
@@ -792,10 +805,10 @@ int package_and_duplicate_test() {
     big.write(reinterpret_cast<const char*>(pkg.data()), static_cast<std::streamsize>(pkg.size()));
   }
   const auto rar_path = rar_dir / "patch.rar";
-  const std::string cmd = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" a -ep -idq -y -ma5 -m1 \"" + rar_path.string() + "\" \"" +
-                          (rar_dir / "2468c.com.txt").string() + "\" \"" + (rar_dir / "Game_CUSA20002_v1.07.pkg").string() +
-                          "\"\"";
-  if (std::system(cmd.c_str()) != 0) return fail("WinRAR 没能生成 PKG 测试 RAR");
+  if (!run_rar("a -ep -idq -y -ma5 -m1 " + shell_quoted(rar_path) + " " + shell_quoted(rar_dir / "2468c.com.txt") + " " +
+               shell_quoted(rar_dir / "Game_CUSA20002_v1.07.pkg"))) {
+    return fail("RAR 没能生成 PKG 测试 RAR");
+  }
   {
     std::ifstream in(rar_path, std::ios::binary);
     drive.add("/apps/panplay/Pkg CUSA20002/patch.rar", std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in), {}));
@@ -1065,9 +1078,9 @@ int run_install_pipeline_self_test() {
     note << "rar-ok";
   }
   const auto rar_file = rar_dir / "game.rar";
-  const std::string rar_cmd = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" a -ep -idq -y -ma5 \"" + rar_file.string() +
-                              "\" \"" + (rar_dir / "note.txt").string() + "\"\"";
-  if (std::system(rar_cmd.c_str()) != 0) return fail("WinRAR 没能生成测试 RAR");
+  if (!run_rar("a -ep -idq -y -ma5 " + shell_quoted(rar_file) + " " + shell_quoted(rar_dir / "note.txt"))) {
+    return fail("RAR 没能生成测试 RAR");
+  }
   std::vector<std::uint8_t> rar_bytes;
   {
     std::ifstream rar_in(rar_file, std::ios::binary);
@@ -1085,9 +1098,9 @@ int run_install_pipeline_self_test() {
     std::ofstream(wrap_dir / "readme.txt", std::ios::binary) << "skip me";
   }
   const auto wrap_rar = rar_dir / "wrap.rar";
-  const std::string wrap_cmd = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" a -r -ep1 -idq -y -ma5 \"" + wrap_rar.string() +
-                               "\" \"" + wrap_dir.string() + "\"\"";
-  if (std::system(wrap_cmd.c_str()) != 0) return fail("WinRAR 没能生成带外层目录的测试 RAR");
+  if (!run_rar("a -r -ep1 -idq -y -ma5 " + shell_quoted(wrap_rar) + " " + shell_quoted(wrap_dir))) {
+    return fail("RAR 没能生成带外层目录的测试 RAR");
+  }
   std::vector<std::uint8_t> wrap_bytes;
   {
     std::ifstream wrap_in(wrap_rar, std::ios::binary);
@@ -1106,10 +1119,10 @@ int run_install_pipeline_self_test() {
     std::ofstream tail(split_dir / "c.bin", std::ios::binary);
     tail.write(reinterpret_cast<const char*>(split_tail.data()), static_cast<std::streamsize>(split_tail.size()));
   }
-  const std::string split_cmd = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" a -ep -idq -y -ma5 -m0 -v40k \"" +
-                                (split_dir / "split.rar").string() + "\" \"" + (split_dir / "a.bin").string() + "\" \"" +
-                                (split_dir / "big.bin").string() + "\" \"" + (split_dir / "c.bin").string() + "\"\"";
-  if (std::system(split_cmd.c_str()) != 0) return fail("WinRAR 没能生成跨卷测试 RAR");
+  if (!run_rar("a -ep -idq -y -ma5 -m0 -v40k " + shell_quoted(split_dir / "split.rar") + " " + shell_quoted(split_dir / "a.bin") + " " +
+               shell_quoted(split_dir / "big.bin") + " " + shell_quoted(split_dir / "c.bin"))) {
+    return fail("RAR 没能生成跨卷测试 RAR");
+  }
   std::vector<std::pair<std::string, std::vector<std::uint8_t>>> split_volumes;
   for (const auto& entry : std::filesystem::directory_iterator(split_dir)) {
     if (entry.path().extension() != ".rar") continue;

@@ -59,6 +59,8 @@
 ## 这一版能做的事
 
 - `panplay serve`：在 `http://127.0.0.1:8734` 打开界面。设置页填写 AppKey、SecretKey、游戏库目录和存放位置，只保存在这台电脑。
+- `panplay serve 8734 --lan`：监听所有网卡，局域网里的手机也能打开。第一次打开要输访问口令，口令在数据目录的 `access-code.txt`。
+- `panplay http-get <地址>`：排查网络，打印状态码、长度和跳转后的地址。
 - `panplay login` / `ls` / `scan` / `install` / `read`：同一套安装流程的命令行
 - `panplay dummy-ftp <端口> <根目录>`：在 `127.0.0.1` 上模拟主机 FTP 目录
 - `panplay self-test`：检查 JSON、FTP 续写、ZIP 分卷续传，以及单卷 RAR 安装
@@ -89,5 +91,24 @@ $src = @(Get-ChildItem core\src\*.cpp, pc\src\*.cpp | ForEach-Object { $_.FullNa
 cmake -S . -B build
 cmake --build build --config Release
 ```
+
+### Linux 和 PS5
+
+Windows 以外的平台用自带的 HTTPS 客户端（mbedTLS），mbedTLS、zlib 和根证书包（curl.se 的 `cacert.pem`）在 CMake 配置时下载。Linux 上自测需要 PATH 里有 `rar`，或者用 `PANPLAY_RAR` 指定。
+
+```bash
+cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-linux
+```
+
+PS5 载荷用 [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk)（要 clang/lld 18 以上），产物是 `panplay.elf`，界面文件打包在里面：
+
+```bash
+export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+$PS5_PAYLOAD_SDK/bin/prospero-cmake -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-ps5
+```
+
+载荷不带参数启动时，直接以局域网模式在 8734 端口开界面，主机右上角通知里给出地址和访问口令。数据在 `/data/panplay`，游戏装到「主机目录」设置的本机路径（默认 `/mnt/usb0/homebrew`）。
+
+推送后 GitHub Actions（`.github/workflows/build.yml`）会编出 Linux 版并跑自测，再编出 PS5 的 `panplay.elf`，都在运行记录的 Artifacts 里下载。
 
 界面里保存密钥。开发时环境变量 `PANPLAY_BAIDU_APP_KEY` 和 `PANPLAY_BAIDU_SECRET_KEY` 可以覆盖本机设置。会话在数据目录的 `baidu-session.json`。
