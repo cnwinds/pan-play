@@ -429,10 +429,22 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       continue;
     }
     std::string name_error;
-    const std::string name = header_name(header, &name_error);
+    std::string name = header_name(header, &name_error);
     if (!name_error.empty()) {
       failure = name_error;
       break;
+    }
+    const std::string& root = options.game_root;
+    if (!root.empty()) {
+      const bool inside = name.compare(0, root.size(), root) == 0 && name.size() > root.size();
+      if (!inside) {
+        if (RARProcessFileW(handle, solid ? RAR_TEST : RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
+          failure = process_failure("解压 RAR 失败");
+          break;
+        }
+        continue;
+      }
+      name.erase(0, root.size());
     }
     const bool directory = (header.Flags & RHDF_DIRECTORY) != 0 || (!name.empty() && name.back() == '/');
     const std::uint64_t size = unpacked_size(header);

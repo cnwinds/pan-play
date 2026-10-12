@@ -58,6 +58,8 @@ struct RarExtract {
   std::int64_t stop_after_output_bytes = -1;
   const CancelToken* cancel = nullptr;
   PrefetchOptions prefetch;
+  // 只解压这个目录（带结尾斜杠）里的内容，并去掉这层前缀；为空表示全部原样解压。
+  std::string game_root;
   std::function<void(const std::vector<FinishedFile>& done)> on_file_done;
 };
 

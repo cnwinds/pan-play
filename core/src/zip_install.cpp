@@ -8,6 +8,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -327,6 +328,89 @@ std::string marker_json(const std::string& title_id, const std::string& plugin, 
   return json;
 }
 
+// PS5 只认 homebrew/<游戏>/sce_sys 这一层。压缩包里游戏外面常包着一两层目录（如 PPSA05106-app0/），
+// 找出 sce_sys 所在的那层作为游戏根目录，安装时去掉外层；没有 sce_sys 时去掉所有文件共有的外层目录。
+// 返回的根目录带结尾斜杠，为空表示压缩包本身就是一层。
+std::string find_game_root(const std::vector<Member>& members, std::string* root) {
+  root->clear();
+  std::set<std::string> with_param;
+  std::set<std::string> with_sys;
+  for (const auto& member : members) {
+    if (member.directory) continue;
+    std::string lower = member.name;
+    for (char& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    for (std::size_t at = 0; (at = lower.find("sce_sys/", at)) != std::string::npos; ++at) {
+      if (at != 0 && lower[at - 1] != '/') continue;
+      const std::string prefix = member.name.substr(0, at);
+      with_sys.insert(prefix);
+      const std::string rest = lower.substr(at + 8);
+      if (rest == "param.json" || rest == "param.sfo") with_param.insert(prefix);
+      break;
+    }
+  }
+  const std::set<std::string>& candidates = with_param.empty() ? with_sys : with_param;
+  if (!candidates.empty()) {
+    const auto depth = [](const std::string& path) { return std::count(path.begin(), path.end(), '/'); };
+    std::vector<std::string> shallowest;
+    for (const auto& candidate : candidates) {
+      if (!shallowest.empty() && depth(candidate) > depth(shallowest.front())) continue;
+      if (!shallowest.empty() && depth(candidate) < depth(shallowest.front())) shallowest.clear();
+      shallowest.push_back(candidate);
+    }
+    if (shallowest.size() > 1) {
+      return "压缩包里有多个游戏目录（" + shallowest[0] + "、" + shallowest[1] + "），不知道该装哪个";
+    }
+    *root = shallowest.front();
+    return "";
+  }
+  while (true) {
+    std::string top;
+    bool shared = false;
+    for (const auto& member : members) {
+      if (member.directory) continue;
+      const auto slash = member.name.find('/', root->size());
+      if (slash == std::string::npos) return "";
+      const std::string head = member.name.substr(0, slash + 1);
+      if (!shared) {
+        top = head;
+        shared = true;
+      } else if (head != top) {
+        return "";
+      }
+    }
+    if (!shared) return "";
+    *root = top;
+  }
+}
+
+// 换了目录结构重装时，删掉上次装进去、这次不再有的文件，以及因此变空的目录。
+void remove_stale(InstallSink& sink, const std::string& final_root, const std::vector<std::uint8_t>& old_marker,
+                  const std::vector<Member>& members) {
+  std::string parse_error;
+  const Json old = Json::parse(std::string(old_marker.begin(), old_marker.end()), &parse_error);
+  const Json* entries = old.get("entries");
+  if (!parse_error.empty() || entries == nullptr) return;
+  std::set<std::string> current;
+  for (const auto& member : members) current.insert(member.name);
+  std::set<std::string> dirs;
+  for (const auto& entry : entries->array) {
+    const std::string name = entry.str("name");
+    std::string normalized;
+    bool directory = false;
+    if (!safe_zip_name(name, &normalized, &directory) || directory || current.count(normalized) != 0) continue;
+    sink.remove_file(join_storage_path(final_root, normalized));
+    for (auto slash = normalized.rfind('/'); slash != std::string::npos; slash = normalized.rfind('/', slash - 1)) {
+      dirs.insert(normalized.substr(0, slash));
+      if (slash == 0) break;
+    }
+  }
+  std::vector<std::string> ordered(dirs.begin(), dirs.end());
+  std::sort(ordered.begin(), ordered.end(), [](const std::string& a, const std::string& b) {
+    return std::count(a.begin(), a.end(), '/') > std::count(b.begin(), b.end(), '/');
+  });
+  for (const auto& dir : ordered) sink.remove_dir(join_storage_path(final_root, dir));
+}
+
 bool already_done(const std::vector<FinishedFile>& done, const Member& member) {
   for (const auto& file : done) {
     if (file.name == member.name && file.size == static_cast<std::int64_t>(member.uncomp_size) && file.crc == member.crc) {
@@ -538,6 +622,21 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       members.push_back(std::move(member));
     }
   }
+  std::string game_root;
+  if (auto root_error = find_game_root(members, &game_root); !root_error.empty()) return fail(root_error);
+  int outside = 0;
+  if (!game_root.empty()) {
+    std::vector<Member> inside;
+    for (auto& member : members) {
+      if (member.name.compare(0, game_root.size(), game_root) != 0) {
+        if (!member.directory) ++outside;
+        continue;
+      }
+      member.name.erase(0, game_root.size());
+      if (!member.name.empty()) inside.push_back(std::move(member));
+    }
+    members = std::move(inside);
+  }
   std::set<std::string> names;
   for (const auto& member : members) {
     if (member.directory) continue;
@@ -614,6 +713,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     options.stop_after_output_bytes = request.stop_after_output_bytes;
     options.cancel = request.cancel;
     options.prefetch = request.prefetch;
+    options.game_root = game_root;
     options.on_file_done = [&](const std::vector<FinishedFile>& now_done) {
       result.files_done = count_done(now_done);
       report("正在安装", result.files_done, result.files_total);
@@ -630,10 +730,12 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
 
   error = finish_install(sink, staging_root, final_root, members, expected, marker_path);
   if (!error.empty()) return fail(error);
+  if (!existing.empty()) remove_stale(sink, final_root, existing, members);
   clean_staging(sink, staging_root, journal_path, members);
   result.status = "installed";
   result.files_done = result.files_total;
   result.message = "已安装 " + folder + "，" + std::to_string(result.files_done) + " 个文件";
+  if (outside > 0) result.message += "（游戏目录外的 " + std::to_string(outside) + " 个文件没有装）";
   return result;
 }
 

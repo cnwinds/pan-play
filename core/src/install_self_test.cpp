@@ -703,6 +703,59 @@ int prefetch_tests() {
   return 0;
 }
 
+int game_root_test() {
+  const auto param = pattern(300, 1);
+  const auto eboot = pattern(5000, 2);
+  const auto prx = pattern(700, 3);
+  FakeDrive drive;
+  drive.add("/apps/panplay/Wrapped PPSA70000/game.zip",
+            make_zip({{"Release/PPSA70000-app0/sce_sys/param.json", param, true},
+                      {"Release/PPSA70000-app0/eboot.bin", eboot, true},
+                      {"Release/PPSA70000-app0/sce_module/lib.prx", prx, false},
+                      {"Release/PPSA70000-app0/extra/sce_sys/param.json", prx, false},
+                      {"Release/readme.txt", pattern(20, 4), false}},
+                     {})
+                .front());
+  MemorySink sink;
+  const std::string old_file = "/mnt/usb0/homebrew/PPSA70000/PPSA70000-app0/eboot.bin";
+  const std::string old_marker =
+      "{\"entries\":[{\"crc32\":1,\"name\":\"PPSA70000-app0/eboot.bin\",\"size\":5000}],\"plugin\":\"fake\",\"title_id\":\"PPSA70000\"}";
+  sink.store(old_file, eboot.data(), eboot.size());
+  sink.store("/mnt/usb0/homebrew/PPSA70000/.panplay-done.json", reinterpret_cast<const std::uint8_t*>(old_marker.data()),
+             old_marker.size());
+  InstallRequest request;
+  request.source_dir = "/apps/panplay/Wrapped PPSA70000";
+  request.prefetch.connections = 1;
+  const InstallResult result = install_game(drive, sink, request);
+  if (result.status != "installed") return fail("外面包了目录的游戏没装上: " + result.message);
+  if (result.files_total != 4) return fail("游戏目录外的文件不该算进去");
+  if (result.message.find("1 个文件没有装") == std::string::npos) return fail("没有提示跳过了游戏目录外的文件");
+  const std::string root = "/mnt/usb0/homebrew/PPSA70000/";
+  if (sink.files[root + "sce_sys/param.json"].bytes != param) return fail("sce_sys 没有放在游戏目录第一层");
+  if (sink.files[root + "eboot.bin"].bytes != eboot) return fail("eboot.bin 没有放在游戏目录第一层");
+  if (sink.files[root + "sce_module/lib.prx"].bytes != prx) return fail("子目录没有跟着游戏根目录一起上移");
+  for (const auto& [path, file] : sink.files) {
+    if (path.find("Release/") != std::string::npos || path.find("readme.txt") != std::string::npos) {
+      return fail("外层目录或目录外的文件被装进去了: " + path);
+    }
+  }
+  if (sink.files.count(old_file) != 0) return fail("旧目录结构留下的文件没有清掉");
+
+  FakeDrive two;
+  two.add("/apps/panplay/Two PPSA70001/game.zip", make_zip({{"a/sce_sys/param.json", param, false},
+                                                           {"b/sce_sys/param.json", param, false}},
+                                                          {})
+                                                     .front());
+  MemorySink unused;
+  InstallRequest ambiguous;
+  ambiguous.source_dir = "/apps/panplay/Two PPSA70001";
+  const InstallResult refused = install_game(two, unused, ambiguous);
+  if (refused.status != "error" || refused.message.find("多个游戏目录") == std::string::npos) {
+    return fail("有两个游戏目录时应该拒绝安装");
+  }
+  return 0;
+}
+
 int many_files_test() {
   FakeDrive drive;
   std::vector<ZipInput> inputs;
@@ -722,7 +775,7 @@ int many_files_test() {
   if (drive.read_at_calls > 4) return fail("读 ZIP 目录用了 " + std::to_string(drive.read_at_calls.load()) + " 次随机读");
   if (drive.stream_opens > 2) return fail("顺序解压打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
   if (sink.writers_opened() != 3000) return fail("每个文件应该只开一次写入流");
-  const auto& sample = memory.files["/mnt/usb0/homebrew/CUSA30000/data/file2999.bin"];
+  const auto& sample = memory.files["/mnt/usb0/homebrew/CUSA30000/file2999.bin"];
   if (sample.bytes != inputs.back().data) return fail("最后一个文件内容不对");
   return 0;
 }
@@ -933,6 +986,25 @@ int run_install_pipeline_self_test() {
   if (rar_bytes.size() < 7 || std::string(rar_bytes.begin(), rar_bytes.begin() + 4) != "Rar!") return fail("测试 RAR 是空的");
   drive.add("/apps/panplay/Rar CUSA77777/game.rar", std::move(rar_bytes));
 
+  const auto wrap_dir = rar_dir / "Wrap";
+  std::filesystem::create_directories(wrap_dir / "PPSA88888-app0" / "sce_sys");
+  {
+    std::ofstream(wrap_dir / "PPSA88888-app0" / "sce_sys" / "param.json", std::ios::binary) << "{\"titleId\":\"PPSA88888\"}";
+    std::ofstream(wrap_dir / "PPSA88888-app0" / "eboot.bin", std::ios::binary) << "eboot-ok";
+    std::ofstream(wrap_dir / "readme.txt", std::ios::binary) << "skip me";
+  }
+  const auto wrap_rar = rar_dir / "wrap.rar";
+  const std::string wrap_cmd = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" a -r -ep1 -idq -y -ma5 \"" + wrap_rar.string() +
+                               "\" \"" + wrap_dir.string() + "\"\"";
+  if (std::system(wrap_cmd.c_str()) != 0) return fail("WinRAR 没能生成带外层目录的测试 RAR");
+  std::vector<std::uint8_t> wrap_bytes;
+  {
+    std::ifstream wrap_in(wrap_rar, std::ios::binary);
+    wrap_bytes.assign(std::istreambuf_iterator<char>(wrap_in), {});
+  }
+  std::filesystem::remove_all(rar_dir, rar_remove);
+  drive.add("/apps/panplay/Wrapped PPSA88888/game.rar", std::move(wrap_bytes));
+
   std::string error;
   const auto games = scan_library(drive, "/apps/panplay", &error);
   if (!error.empty()) return fail(error);
@@ -1026,7 +1098,27 @@ int run_install_pipeline_self_test() {
     if (again.status != "already") return fail("RAR 安装后没有显示已安装");
   }
 
+  {
+    const auto local_root = root / "rar-wrap";
+    auto local = make_local_sink(local_root.u8string());
+    InstallRequest request;
+    request.source_dir = "/apps/panplay/Wrapped PPSA88888";
+    request.dest_prefix = "/mnt/usb0/homebrew";
+    const InstallResult installed = install_game(drive, *local, request);
+    if (installed.status != "installed" || installed.files_total != 2) return fail("带外层目录的 RAR 没装好: " + installed.message);
+    std::vector<std::uint8_t> got;
+    error = local->read_file("/mnt/usb0/homebrew/PPSA88888/eboot.bin", &got, 100);
+    if (!error.empty() || std::string(got.begin(), got.end()) != "eboot-ok") return fail("RAR 的游戏根目录没有上移到第一层");
+    const auto game_dir = local_root / "mnt" / "usb0" / "homebrew" / "PPSA88888";
+    if (!std::filesystem::exists(game_dir / "sce_sys" / "param.json")) return fail("RAR 的 sce_sys 不在第一层");
+    if (std::filesystem::exists(game_dir / "Wrap") || std::filesystem::exists(game_dir / "PPSA88888-app0") ||
+        std::filesystem::exists(game_dir / "readme.txt")) {
+      return fail("RAR 外层目录被装进去了");
+    }
+  }
+
   if (const int code = prefetch_tests()) return code;
+  if (const int code = game_root_test()) return code;
   if (const int code = many_files_test()) return code;
   if (const int code = zip64_split_test()) return code;
   if (const int code = cancel_install_test()) return code;
