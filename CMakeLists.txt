@@ -83,7 +83,7 @@ else()
   find_package(Threads REQUIRED)
 
   set_source_files_properties(${UNRAR_SOURCES} PROPERTIES
-    COMPILE_OPTIONS "-Wno-logical-op-parentheses;-Wno-switch;-Wno-dangling-else;-Wno-unknown-warning-option")
+    COMPILE_OPTIONS "-Wno-switch;$<$<CXX_COMPILER_ID:Clang>:-Wno-logical-op-parentheses>;$<$<CXX_COMPILER_ID:Clang>:-Wno-dangling-else>")
   target_compile_definitions(panplay PRIVATE RAR_SMP)
 
   # zlib 只取源码直接编进来，不走它自己的 CMake（它固定要编动态库）。

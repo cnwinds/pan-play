@@ -57,7 +57,12 @@ bool File::Open(const std::wstring &Name,uint Mode)
   if (panplay_unrar_claim(Name.c_str()))
   {
     PanplayStream=true;
-    hFile=(FileHandle)(INT_PTR)1;
+#ifdef FILE_USE_OPEN
+    // Unix 上句柄是文件描述符：用一个必然无效的值，误用时只会报错，不会碰到 stdout。
+    hFile=-2;
+#else
+    hFile=(FileHandle)(size_t)1;
+#endif
     SkipClose=true;
     HandleType=FILE_HANDLENORMAL;
     FileName=Name;
