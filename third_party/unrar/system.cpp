@@ -229,6 +229,9 @@ SSE_VERSION GetSSEVersion()
     if ((CPUInfo[3] & 0x2000000)!=0)
       return SSE_SSE;
   }
+#elif defined(PANPLAY_PS5)
+  // PS5 是固定的 Zen 2 CPU；SDK 不带 __builtin_cpu_supports 需要的 compiler-rt。
+  return SSE_AVX2;
 #elif defined(__GNUC__)
   if (__builtin_cpu_supports("avx2"))
     return SSE_AVX2;
