@@ -1,10 +1,12 @@
 #include "settings.hpp"
 
+#include "panplay/app_paths.hpp"
 #include "panplay/json.hpp"
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 
 namespace {
@@ -14,12 +16,7 @@ std::string env_or_empty(const char* name) {
   return value ? value : "";
 }
 
-std::filesystem::path app_dir() {
-  const std::string root = env_or_empty("APPDATA");
-  std::filesystem::path path = root.empty() ? std::filesystem::path("session") : std::filesystem::path(root) / "panplay";
-  std::filesystem::create_directories(path);
-  return path;
-}
+std::filesystem::path app_dir() { return panplay::app_data_dir(); }
 
 void read_keys(const std::filesystem::path& path, AppSettings* settings) {
   std::ifstream in(path);
@@ -38,7 +35,59 @@ void read_keys(const std::filesystem::path& path, AppSettings* settings) {
 
 }  // namespace
 
-std::string settings_file_path() { return (app_dir() / "settings.json").string(); }
+std::filesystem::path settings_file_path() { return app_dir() / "settings.json"; }
+
+namespace {
+
+std::mutex overrides_mu;
+
+std::map<std::string, std::string> read_overrides_unlocked() {
+  std::map<std::string, std::string> names;
+  std::ifstream in(app_dir() / "name-overrides.json", std::ios::binary);
+  if (!in) return names;
+  std::stringstream buffer;
+  buffer << in.rdbuf();
+  const panplay::Json json = panplay::Json::parse(buffer.str(), nullptr);
+  const panplay::Json* items = json.get("names");
+  if (items == nullptr) return names;
+  for (const auto& [key, value] : items->object) {
+    if (!value.text.empty()) names[key] = value.text;
+  }
+  return names;
+}
+
+}  // namespace
+
+std::map<std::string, std::string> load_name_overrides() {
+  std::lock_guard<std::mutex> lock(overrides_mu);
+  return read_overrides_unlocked();
+}
+
+std::string save_name_override(const std::string& key, const std::string& name) {
+  std::lock_guard<std::mutex> lock(overrides_mu);
+  auto names = read_overrides_unlocked();
+  if (name.empty()) names.erase(key);
+  else names[key] = name;
+  std::string json = "{\"names\":{";
+  bool first = true;
+  for (const auto& [k, v] : names) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + panplay::json_escape(k) + "\":\"" + panplay::json_escape(v) + "\"";
+  }
+  json += "}}";
+  const std::filesystem::path path = app_dir() / "name-overrides.json";
+  std::filesystem::path tmp = path;
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    out << json;
+    if (!out) return "无法保存名称";
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  return ec ? "无法保存名称" : "";
+}
 
 AppSettings load_settings() {
   AppSettings settings;

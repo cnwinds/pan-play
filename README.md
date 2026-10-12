@@ -15,9 +15,26 @@
 
 ## 游戏资料库
 
-名称与 Title ID 来自 [PlayStation-Titles](https://github.com/andshrew/PlayStation-Titles)（MIT，可离线携带）。只有目录名里能抽出 `CUSA` / `PPSA` 时才对照资料库；没有 Title ID 时保持网盘文件夹原名，不按目录名猜测。
+游戏资料分两层，都以 `conceptId` 串起来：
 
-**同步方式（全自动，无需 API 密钥）**：`panplay serve` 启动后会在后台自动从 PlayStation-Titles 拉取最新 Title ID 数据，写入 `data/panplay-catalog.json` 并热重载，**不会阻塞** `/api/games` 等 HTTP 请求。
+1. **Title ID → conceptId、英文名**：来自 [PlayStation-Titles](https://github.com/andshrew/PlayStation-Titles)（MIT，作者每天自动刷新）。程序自带一份 `data/panplay-catalog.json`，自动同步的新版写在数据目录，两份取较新的。
+2. **中文名、封面、类型、发行商、发售日、简介**：按 `conceptId` 读取 PlayStation 商店概念页，依次试港服简体 `zh-hans-hk`、港服繁体 `zh-hant-hk`、美服 `en-us`，结果缓存在数据目录的 `store-meta.json`，封面存到数据目录的 `covers/`。
+
+只有目录名里能抽出 `CUSA` / `PPSA` 时才对照资料；没有 Title ID 时保持网盘文件夹原名，不按目录名猜测。展示名优先级是：手动改名 > 商店名称 > 英文名 > 目录名。手动改名保存在数据目录的 `name-overrides.json`。
+
+**数据目录**（设置、网盘会话、资料库同步副本、商店资料缓存、封面都放这里）：
+
+| 平台 | 默认位置 |
+| --- | --- |
+| Windows | `%APPDATA%\panplay` |
+| PS5 载荷（编译时定义 `__PROSPERO__` 或 `-DPANPLAY_PS5`） | `/data/panplay` |
+| Linux / 其他 | `$XDG_DATA_HOME/panplay`，否则 `~/.local/share/panplay` |
+
+任何平台都可以用环境变量 `PANPLAY_DATA_DIR` 指定别的目录。
+
+商店资料只在后台按需获取：封面墙先显示英文名，补齐后自动换成中文名和封面。每秒最多一次请求；取到的资料 30 天后刷新，未收录的 7 天后再试，网络失败不写缓存。命令行可以用 `panplay store-meta <conceptId>` 直接看某个概念页的解析结果。
+
+**PlayStation-Titles 同步方式（全自动，无需 API 密钥）**：`panplay serve` 启动后会在后台自动拉取最新 Title ID 数据，写入数据目录的 `panplay-catalog.json` 并热重载，**不会阻塞** `/api/games` 等 HTTP 请求。上游停更或访问不了时，可以用环境变量 `PANPLAY_CATALOG_URL` 换成镜像地址，格式与 `All_Titles.json` 相同。
 
 | 时机 | 行为 |
 |------|------|
@@ -28,21 +45,14 @@
 
 设置页 **游戏资料库** 可查看「已同步 / 正在更新 / 上次更新时间」。`GET /api/catalog` 返回 `sync` 字段（phase、last_success 等）。
 
-**手动脚本（可选）**：仍可用 `scripts/update-catalog.ps1` 或 `scripts/build-catalog.py` 离线生成或附带封面；生成后可在设置页点「重新加载资料库」或等下次自动周期。
+**手动脚本（可选）**：仍可用 `scripts/update-catalog.ps1` 或 `scripts/build-catalog.py` 离线生成资料库；生成后可在设置页点「重新加载资料库」或等下次自动周期。脚本的 `--fetch-covers` 写入的包装图标只在商店没有封面时兜底。
 
 **数据来源与许可**：
 
-| 数据 | 来源 | 许可 / 说明 |
-|------|------|-------------|
-| Title ID、名称、conceptId、区域 | [PlayStation-Titles](https://github.com/andshrew/PlayStation-Titles) | MIT，随软件离线携带 |
-| 封面 URL（可选） | [PROSPEROPatches](https://prosperopatches.com) / [ORBISPatches](https://orbispatches.com) | 公开页面抓取，非官方 API |
-
-封面 URL 可选：加 `--fetch-covers` 时会从上述站点抓取 `icon0.webp` 地址写入 catalog（耗时较长）。未命中或未抓封面时，界面回退到纯色块占位。
-
-```powershell
-# 附带封面（可用 --cover-limit 限制条数）
-.\scripts\update-catalog.ps1 --fetch-covers --platform ps5 --cover-limit 500
-```
+| 数据 | 来源 | 说明 |
+|------|------|------|
+| Title ID、英文名、conceptId、区域 | [PlayStation-Titles](https://github.com/andshrew/PlayStation-Titles) | MIT，本地携带并定期同步 |
+| 中文名、封面、简介、类型、发行商 | PlayStation 商店概念页 | 按用户库里的 `conceptId` 逐个读取，结果只存本机 |
 
 `POST /api/catalog/reload` 可在不重启服务的情况下从磁盘重读 JSON（不联网）。
 
@@ -80,4 +90,4 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
-界面里保存密钥。开发时环境变量 `PANPLAY_BAIDU_APP_KEY` 和 `PANPLAY_BAIDU_SECRET_KEY` 可以覆盖本机设置。会话在 `%APPDATA%\panplay\baidu-session.json`。
+界面里保存密钥。开发时环境变量 `PANPLAY_BAIDU_APP_KEY` 和 `PANPLAY_BAIDU_SECRET_KEY` 可以覆盖本机设置。会话在数据目录的 `baidu-session.json`。

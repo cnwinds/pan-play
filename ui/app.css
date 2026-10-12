@@ -580,6 +580,64 @@ body.detail-open { overflow: hidden; }
   color: var(--clay);
 }
 
+.detail-facts {
+  color: var(--paper) !important;
+}
+
+.detail-desc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  overflow: hidden;
+  white-space: pre-line;
+  line-height: 1.55;
+}
+
+.rename-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid rgba(235, 224, 204, 0.1);
+}
+
+.rename-form input {
+  flex: 1 1 10rem;
+  min-width: 0;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid rgba(235, 224, 204, 0.14);
+  border-radius: 4px;
+  background: rgba(12, 10, 8, 0.55);
+  color: var(--paper);
+}
+
+.rename-form input::placeholder { color: rgba(138, 125, 108, 0.65); }
+
+.rename-btn {
+  padding: 0.45rem 0.9rem;
+  border: 0;
+  border-radius: 4px;
+  background: var(--clay);
+  color: var(--paper);
+  font-size: 0.85rem;
+}
+
+.rename-btn.quiet {
+  background: transparent;
+  border: 1px solid rgba(235, 224, 204, 0.16);
+  color: var(--muted);
+}
+
+.rename-btn[hidden] { display: none; }
+
+.rename-note {
+  flex-basis: 100%;
+  min-height: 1rem;
+  font-size: 0.82rem;
+  color: var(--crt-glow) !important;
+}
+
 .detail .action {
   align-self: flex-start;
   margin-top: 0.25rem;

@@ -35,7 +35,9 @@ struct CatalogMeta {
 class GameCatalog {
  public:
   static GameCatalog& instance();
+  // 路径都是 UTF-8。自动同步写在数据目录（随程序发布的目录在 PS5 上可能只读），读取时取较新的那份。
   static std::string default_path();
+  static std::string synced_path();
 
   bool load_default(std::string* error = nullptr);
   bool load_file(const std::string& path, std::string* error = nullptr);

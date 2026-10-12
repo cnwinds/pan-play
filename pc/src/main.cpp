@@ -1,8 +1,10 @@
+#include "panplay/app_paths.hpp"
 #include "panplay/drive.hpp"
 #include "panplay/dummy_ftp.hpp"
 #include "panplay/install.hpp"
 #include "panplay/json.hpp"
 #include "panplay/sink.hpp"
+#include "panplay/store_meta.hpp"
 
 #include "server.hpp"
 #include "settings.hpp"
@@ -16,17 +18,7 @@
 
 namespace {
 
-std::string env_or_empty(const char* name) {
-  const char* value = std::getenv(name);
-  return value ? value : "";
-}
-
-std::string session_path() {
-  const std::string root = env_or_empty("APPDATA");
-  std::filesystem::path path = root.empty() ? std::filesystem::path("session") : std::filesystem::path(root) / "panplay";
-  std::filesystem::create_directories(path);
-  return (path / "baidu-session.json").string();
-}
+std::string session_path() { return (panplay::app_data_dir() / "baidu-session.json").u8string(); }
 
 void print_usage() {
   std::cout << "盘游 Panplay\n"
@@ -38,6 +30,7 @@ void print_usage() {
             << "  panplay scan <游戏库目录>\n"
             << "  panplay install <游戏目录> --to <本机目录或 ftp://主机:端口>\n"
             << "  panplay read <fsid> <offset> <length>\n"
+            << "  panplay store-meta <conceptId>\n"
             << "\n密钥在界面的设置页保存。开发时环境变量 PANPLAY_BAIDU_APP_KEY 和 PANPLAY_BAIDU_SECRET_KEY 仍可覆盖。\n";
 }
 
@@ -137,6 +130,7 @@ int main(int argc, char** argv) {
   if (command == "serve") return run_server(argc >= 3 ? std::stoi(argv[2]) : 8734);
   if (command == "self-test") {
     if (const int json = self_test()) return json;
+    if (const int store = panplay::run_store_meta_self_test()) return store;
     if (const int sink = panplay::run_install_sink_self_test()) return sink;
     return panplay::run_install_pipeline_self_test();
   }
@@ -154,6 +148,7 @@ int main(int argc, char** argv) {
     return panplay::run_install_cli(*drive, argc, argv);
   }
   if (command == "read" && argc >= 5) return read_range(argv[2], argv[3], argv[4]);
+  if (command == "store-meta" && argc >= 3) return panplay::run_store_meta_cli(argv[2]);
   print_usage();
   return 1;
 }

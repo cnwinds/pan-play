@@ -11,11 +11,9 @@
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "panplay/app_paths.hpp"
 
 namespace panplay {
 namespace {
@@ -67,28 +65,17 @@ CatalogEntry parse_entry(const Json& node, const std::string& title_id) {
   return entry;
 }
 
-std::filesystem::path catalog_candidates[] = {
-    std::filesystem::path("data") / "panplay-catalog.json",
-    std::filesystem::path("..") / "data" / "panplay-catalog.json",
-    std::filesystem::path("..") / ".." / "data" / "panplay-catalog.json",
-};
-
-std::filesystem::path resolve_catalog_path() {
-  wchar_t buffer[MAX_PATH];
-  const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-  const std::filesystem::path exe = length > 0 ? std::filesystem::path(buffer).parent_path() : std::filesystem::path(".");
-  const std::filesystem::path from_exe[] = {
-      exe / "data" / "panplay-catalog.json",
-      exe / ".." / "data" / "panplay-catalog.json",
-      exe / ".." / ".." / "data" / "panplay-catalog.json",
-  };
-  for (const auto& candidate : from_exe) {
-    if (std::filesystem::exists(candidate)) return candidate;
+std::filesystem::path bundled_catalog_path() {
+  const std::filesystem::path relative = std::filesystem::path("data") / "panplay-catalog.json";
+  std::vector<std::filesystem::path> roots;
+  const std::filesystem::path exe = executable_dir();
+  if (!exe.empty()) roots.insert(roots.end(), {exe, exe / "..", exe / ".." / ".."});
+  roots.insert(roots.end(), {".", "..", std::filesystem::path("..") / ".."});
+  for (const auto& root : roots) {
+    std::error_code ec;
+    if (std::filesystem::exists(root / relative, ec)) return root / relative;
   }
-  for (const auto& candidate : catalog_candidates) {
-    if (std::filesystem::exists(candidate)) return candidate;
-  }
-  return from_exe[0];
+  return {};
 }
 
 }  // namespace
@@ -98,7 +85,19 @@ GameCatalog& GameCatalog::instance() {
   return catalog;
 }
 
-std::string GameCatalog::default_path() { return resolve_catalog_path().string(); }
+std::string GameCatalog::synced_path() { return (app_data_dir() / "panplay-catalog.json").u8string(); }
+
+std::string GameCatalog::default_path() {
+  const std::string synced = synced_path();
+  const std::filesystem::path bundled = bundled_catalog_path();
+  if (bundled.empty()) return synced;
+  std::error_code synced_ec;
+  std::error_code bundled_ec;
+  const auto synced_time = std::filesystem::last_write_time(std::filesystem::u8path(synced), synced_ec);
+  const auto bundled_time = std::filesystem::last_write_time(bundled, bundled_ec);
+  if (!synced_ec && (bundled_ec || synced_time >= bundled_time)) return synced;
+  return bundled.u8string();
+}
 
 bool GameCatalog::load_default(std::string* error) {
   return load_file(default_path(), error);
@@ -121,7 +120,7 @@ bool GameCatalog::load_file_unlocked(const std::string& path, std::string* error
   loaded_ = false;
   meta_ = {};
 
-  const std::string text = read_text_file(path);
+  const std::string text = read_text_file(std::filesystem::u8path(path));
   if (text.empty()) {
     if (error) *error = "找不到 catalog 文件: " + path;
     return false;
@@ -140,7 +139,7 @@ bool GameCatalog::load_file_unlocked(const std::string& path, std::string* error
   meta_.generated_from = root.str("generated_from");
   meta_.version = static_cast<int>(root.num("version"));
   try {
-    const auto mtime = std::filesystem::last_write_time(path);
+    const auto mtime = std::filesystem::last_write_time(std::filesystem::u8path(path));
     meta_.file_mtime_unix =
         std::chrono::duration_cast<std::chrono::seconds>(mtime.time_since_epoch()).count();
   } catch (...) {

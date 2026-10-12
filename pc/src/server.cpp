@@ -2,12 +2,14 @@
 
 #include "settings.hpp"
 
+#include "panplay/app_paths.hpp"
 #include "panplay/catalog.hpp"
 #include "panplay/catalog_sync.hpp"
 #include "panplay/drive.hpp"
 #include "panplay/install.hpp"
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
+#include "panplay/store_meta.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -24,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -31,12 +34,7 @@
 
 namespace {
 
-std::string session_path() {
-  const char* root = std::getenv("APPDATA");
-  std::filesystem::path path = root == nullptr ? std::filesystem::path("session") : std::filesystem::path(root) / "panplay";
-  std::filesystem::create_directories(path);
-  return (path / "baidu-session.json").string();
-}
+std::string session_path() { return (panplay::app_data_dir() / "baidu-session.json").u8string(); }
 
 std::unique_ptr<panplay::DrivePlugin> open_drive() {
   const AppSettings settings = load_settings();
@@ -48,9 +46,8 @@ std::unique_ptr<panplay::DrivePlugin> open_drive() {
 }
 
 std::filesystem::path ui_root() {
-  wchar_t buffer[MAX_PATH];
-  const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-  std::filesystem::path exe = length > 0 ? std::filesystem::path(buffer).parent_path() : std::filesystem::path(".");
+  const std::filesystem::path found = panplay::executable_dir();
+  const std::filesystem::path exe = found.empty() ? std::filesystem::path(".") : found;
   const std::filesystem::path candidates[] = {exe / "ui", exe / ".." / "ui", exe / ".." / ".." / "ui", std::filesystem::path("ui")};
   for (const auto& candidate : candidates) {
     if (std::filesystem::exists(candidate / "index.html")) return candidate;
@@ -85,10 +82,10 @@ void send_all(SOCKET socket, const std::string& data) {
   }
 }
 
-void reply(SOCKET socket, int status, const std::string& type, const std::string& body) {
+void reply(SOCKET socket, int status, const std::string& type, const std::string& body, const std::string& extra = "") {
   const std::string text = "HTTP/1.1 " + std::to_string(status) + (status == 200 ? " OK" : " Error") +
-                           "\r\nContent-Type: " + type + "\r\nContent-Length: " + std::to_string(body.size()) +
-                           "\r\nConnection: close\r\n\r\n" + body;
+                           "\r\nContent-Type: " + type + "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n" +
+                           extra + "Connection: close\r\n\r\n" + body;
   send_all(socket, text);
 }
 
@@ -175,26 +172,81 @@ std::string catalog_status_json() {
          "}}";
 }
 
-std::string catalog_json_fields(const std::string& name, const std::string& title_id) {
-  if (title_id.empty()) {
-    return ",\"display_name\":\"\",\"cover_url\":\"\",\"concept_id\":0,\"region\":\"\",\"publisher_id\":\"\",\"platform\":\"\",\"catalog_matched\":false,\"catalog_match_by\":\"\"";
+panplay::StoreMetaCache* store_meta = nullptr;
+
+using NameOverrides = std::map<std::string, std::string>;
+
+std::string name_key(const std::string& name, const std::string& title_id) { return title_id.empty() ? name : title_id; }
+
+// 展示名：手动改名 > 商店名称 > PlayStation-Titles 英文名 > 目录名（由页面兜底）。
+std::string game_meta_fields(const std::string& name, const std::string& title_id, const NameOverrides& overrides,
+                             bool detail) {
+  panplay::CatalogMatch match;
+  if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
+  const std::int64_t concept_id = match.found ? match.entry.concept_id : 0;
+
+  panplay::StoreMeta meta;
+  std::string meta_state = "none";
+  if (concept_id > 0 && store_meta != nullptr) meta_state = panplay::store_meta_state_name(store_meta->lookup(concept_id, &meta));
+
+  std::string display_name;
+  std::string name_source;
+  const auto custom = overrides.find(name_key(name, title_id));
+  if (custom != overrides.end()) {
+    display_name = custom->second;
+    name_source = "user";
+  } else if (meta.found) {
+    display_name = meta.name;
+    name_source = "store";
+  } else if (match.found) {
+    display_name = match.entry.name;
+    name_source = "catalog";
   }
-  const panplay::CatalogMatch match = panplay::GameCatalog::instance().lookup(title_id, name);
-  if (!match.found) {
-    return ",\"display_name\":\"\",\"cover_url\":\"\",\"concept_id\":0,\"region\":\"\",\"publisher_id\":\"\",\"platform\":\"\",\"catalog_matched\":false,\"catalog_match_by\":\"\"";
+
+  std::string cover_url;
+  if (meta.has_cover) cover_url = "/api/cover/" + std::to_string(concept_id) + "?v=" + std::to_string(meta.fetched_at);
+  else if (match.found) cover_url = match.entry.cover_url;
+
+  std::string json = ",\"display_name\":\"" + panplay::json_escape(display_name) + "\",\"name_source\":\"" + name_source +
+                     "\",\"store_locale\":\"" + panplay::json_escape(meta.found ? meta.locale : "") +
+                     "\",\"catalog_name\":\"" + panplay::json_escape(match.found ? match.entry.name : "") +
+                     "\",\"cover_url\":\"" + panplay::json_escape(cover_url) + "\",\"meta_state\":\"" + meta_state +
+                     "\",\"concept_id\":" + std::to_string(concept_id) + ",\"region\":\"" +
+                     panplay::json_escape(match.entry.region) + "\",\"publisher_id\":\"" +
+                     panplay::json_escape(match.entry.publisher_id) + "\",\"platform\":\"" +
+                     panplay::json_escape(match.entry.platform) + "\",\"catalog_matched\":" +
+                     (match.found ? "true" : "false") + ",\"catalog_match_by\":\"" + panplay::json_escape(match.match_by) + "\"";
+  if (detail) {
+    json += ",\"publisher\":\"" + panplay::json_escape(meta.publisher) + "\",\"genres\":\"" +
+            panplay::json_escape(meta.genres) + "\",\"release_date\":\"" + panplay::json_escape(meta.release_date) +
+            "\",\"description\":\"" + panplay::json_escape(meta.description) + "\"";
   }
-  return ",\"display_name\":\"" + panplay::json_escape(match.entry.name) + "\",\"cover_url\":\"" +
-         panplay::json_escape(match.entry.cover_url) + "\",\"concept_id\":" + std::to_string(match.entry.concept_id) +
-         ",\"region\":\"" + panplay::json_escape(match.entry.region) + "\",\"publisher_id\":\"" +
-         panplay::json_escape(match.entry.publisher_id) + "\",\"platform\":\"" + panplay::json_escape(match.entry.platform) +
-         "\",\"catalog_matched\":true,\"catalog_match_by\":\"" + panplay::json_escape(match.match_by) + "\"";
+  return json;
 }
 
-std::string folder_json(const std::string& name, const std::string& path, const std::string& state) {
+std::string meta_json(const std::string& name, const NameOverrides& overrides, bool detail) {
+  const std::string title_id = panplay::find_title_id(name);
+  return "{\"name\":\"" + panplay::json_escape(name) + "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\"" +
+         game_meta_fields(name, title_id, overrides, detail) + "}";
+}
+
+std::string folder_json(const std::string& name, const std::string& path, const std::string& state,
+                        const NameOverrides& overrides) {
   const std::string title_id = panplay::find_title_id(name);
   return "{\"name\":\"" + panplay::json_escape(name) + "\",\"path\":\"" + panplay::json_escape(path) + "\",\"title_id\":\"" +
          panplay::json_escape(title_id) + "\",\"archive_bytes\":0,\"formats\":\"\",\"state\":\"" + state + "\"" +
-         catalog_json_fields(name, title_id) + "}";
+         game_meta_fields(name, title_id, overrides, false) + "}";
+}
+
+std::string folder_name_of(const std::string& path) {
+  const auto slash = path.find_last_of('/');
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+std::string image_type(const std::string& bytes) {
+  if (bytes.size() >= 4 && bytes.compare(1, 3, "PNG") == 0) return "image/png";
+  if (bytes.size() >= 12 && bytes.compare(8, 4, "WEBP") == 0) return "image/webp";
+  return "image/jpeg";
 }
 
 std::string games_json(panplay::DrivePlugin& drive) {
@@ -210,6 +262,7 @@ std::string games_json(panplay::DrivePlugin& drive) {
     sink = panplay::open_destination(destination, &error);
     if (sink) placement = read_shelf_placement(*sink, settings.prefix);
   }
+  const NameOverrides overrides = load_name_overrides();
   std::string json = "{\"games\":[";
   bool first = true;
   for (const auto& child : children) {
@@ -221,7 +274,7 @@ std::string games_json(panplay::DrivePlugin& drive) {
     std::string state = "need-settings";
     if (sink) state = shelf_state(placement, child.name, title_id, path);
     else if (dest_ready) state = "install";
-    json += folder_json(child.name, path, state);
+    json += folder_json(child.name, path, state, overrides);
   }
   json += "]}";
   return json;
@@ -233,8 +286,7 @@ std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) 
   const auto files = panplay::collect_archives(drive, path, &error);
   if (!error.empty()) return json_error(error);
   panplay::GameFolder game;
-  const auto slash = path.find_last_of('/');
-  game.name = slash == std::string::npos ? path : path.substr(slash + 1);
+  game.name = folder_name_of(path);
   game.path = path;
   game.title_id = panplay::find_title_id(game.name);
   game.sets = panplay::group_archives(files);
@@ -256,7 +308,7 @@ std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) 
   return "{\"name\":\"" + panplay::json_escape(game.name) + "\",\"path\":\"" + panplay::json_escape(game.path) +
          "\",\"title_id\":\"" + panplay::json_escape(game.title_id) + "\",\"archive_bytes\":" +
          std::to_string(game.archive_bytes) + ",\"formats\":\"" + panplay::json_escape(formats_of(game)) +
-         "\",\"state\":\"" + state + "\"" + catalog_json_fields(game.name, game.title_id) + "}";
+         "\",\"state\":\"" + state + "\"" + game_meta_fields(game.name, game.title_id, load_name_overrides(), true) + "}";
 }
 
 void publish_progress(const panplay::InstallResult& snapshot) {
@@ -408,6 +460,66 @@ void handle_client(SOCKET client) {
   }
   if (method == "GET" && target == "/app.js") {
     reply(client, 200, "text/javascript; charset=utf-8", read_file(ui / "app.js"));
+    return;
+  }
+  if (method == "GET" && target.rfind("/api/cover/", 0) == 0) {
+    const std::string id = target.substr(11, target.find('?') == std::string::npos ? std::string::npos : target.find('?') - 11);
+    const bool digits = !id.empty() && id.size() < 19 && std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isdigit(c); });
+    const std::string bytes = digits && store_meta != nullptr ? read_file(store_meta->cover_file(std::stoll(id))) : "";
+    if (bytes.empty()) {
+      reply_json(client, 404, json_error("没有这张封面"));
+      return;
+    }
+    reply(client, 200, image_type(bytes), bytes, "Cache-Control: max-age=86400\r\n");
+    return;
+  }
+  if (method == "POST" && (target == "/api/meta" || target == "/api/name" || target == "/api/meta/refresh")) {
+    std::string parse_error;
+    const panplay::Json json = panplay::Json::parse(body, &parse_error);
+    if (!parse_error.empty()) {
+      reply_json(client, 400, json_error(parse_error));
+      return;
+    }
+    if (target == "/api/meta") {
+      const NameOverrides overrides = load_name_overrides();
+      std::string out = "{\"items\":[";
+      const panplay::Json* names = json.get("names");
+      if (names != nullptr) {
+        for (std::size_t i = 0; i < names->array.size() && i < 500; ++i) {
+          if (i > 0) out += ",";
+          out += meta_json(names->array[i].text, overrides, false);
+        }
+      }
+      reply_json(client, 200, out + "]}");
+      return;
+    }
+    const std::string name = json.str("name");
+    if (name.empty()) {
+      reply_json(client, 400, json_error("缺少游戏目录名"));
+      return;
+    }
+    if (target == "/api/name") {
+      std::string display = json.str("display_name");
+      const auto begin = display.find_first_not_of(" \t\r\n");
+      display = begin == std::string::npos ? "" : display.substr(begin, display.find_last_not_of(" \t\r\n") - begin + 1);
+      if (display.size() > 400) {
+        reply_json(client, 400, json_error("名称太长"));
+        return;
+      }
+      const std::string error = save_name_override(name_key(name, panplay::find_title_id(name)), display);
+      if (!error.empty()) {
+        reply_json(client, 500, json_error(error));
+        return;
+      }
+    } else {
+      const panplay::CatalogMatch match = panplay::GameCatalog::instance().lookup(panplay::find_title_id(name), name);
+      if (!match.found || match.entry.concept_id <= 0 || store_meta == nullptr) {
+        reply_json(client, 400, json_error("这款游戏没有 conceptId，无法从商店获取"));
+        return;
+      }
+      store_meta->refresh(match.entry.concept_id);
+    }
+    reply_json(client, 200, meta_json(name, load_name_overrides(), true));
     return;
   }
   if (method == "GET" && target == "/api/catalog") {
@@ -585,6 +697,8 @@ int run_server(int port) {
       std::cerr << "游戏资料库未加载（将使用目录名占位，后台自动同步中）: " << catalog_error << "\n";
     }
     panplay::CatalogSync::instance().start(7, 24);
+    store_meta = new panplay::StoreMetaCache(panplay::app_data_dir());
+    store_meta->start();
   }
 
   WSADATA data;

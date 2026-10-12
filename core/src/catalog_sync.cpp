@@ -6,6 +6,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,11 @@ namespace {
 
 constexpr const char* kDefaultUpstream =
     "https://raw.githubusercontent.com/andshrew/PlayStation-Titles/main/Json/All_Titles.json";
+
+std::string upstream_url() {
+  const char* custom = std::getenv("PANPLAY_CATALOG_URL");
+  return custom != nullptr && *custom != '\0' ? custom : kDefaultUpstream;
+}
 
 std::int64_t unix_now() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -80,10 +86,11 @@ bool fetch_and_write_catalog(const std::string& output_path, const std::string& 
     return false;
   }
 
-  const std::filesystem::path out_path(output_path);
+  const std::filesystem::path out_path = std::filesystem::u8path(output_path);
   std::error_code ec;
   std::filesystem::create_directories(out_path.parent_path(), ec);
-  const std::filesystem::path tmp_path = out_path.string() + ".tmp";
+  std::filesystem::path tmp_path = out_path;
+  tmp_path += ".tmp";
 
   std::ofstream out(tmp_path, std::ios::binary);
   if (!out) {
@@ -167,8 +174,6 @@ CatalogSyncInfo CatalogSync::info() const {
 }
 
 bool CatalogSync::needs_update() const {
-  const std::string path = GameCatalog::default_path();
-  if (!std::filesystem::exists(path)) return true;
   const GameCatalog& catalog = GameCatalog::instance();
   if (!catalog.loaded()) return true;
   return catalog.is_stale(stale_days_);
@@ -183,13 +188,13 @@ void CatalogSync::sync_once() {
     info_.last_attempt_unix = unix_now();
   }
 
-  const std::string path = GameCatalog::default_path();
+  const std::string path = GameCatalog::synced_path();
   std::string sync_error;
-  const bool ok = fetch_and_write_catalog(path, kDefaultUpstream, &sync_error);
+  const bool ok = fetch_and_write_catalog(path, upstream_url(), &sync_error);
 
   if (ok) {
     std::string reload_error;
-    if (GameCatalog::instance().reload(&reload_error)) {
+    if (GameCatalog::instance().load_file(path, &reload_error)) {
       std::lock_guard<std::mutex> lock(mu_);
       info_.phase = CatalogSyncPhase::idle;
       info_.last_success_unix = unix_now();

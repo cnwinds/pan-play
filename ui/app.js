@@ -41,6 +41,10 @@ let currentPage = 1;
 let pollTimer = 0;
 let jobTimer = 0;
 let detailEscapeHandler = null;
+let detailGame = null;
+let detailReload = null;
+let metaTimer = 0;
+let metaRounds = 0;
 
 function totalPages() {
   if (games.length === 0) return 0;
@@ -106,13 +110,23 @@ function coverMonogram(game) {
 }
 
 function displayName(game) {
-  const name = (game.name || "").trim();
-  const id = (game.title_id || "").trim();
-  if (!id) return name || "未知目录";
-  const catalog = (game.display_name || "").trim();
-  if (catalog) return catalog;
-  if (!name) return id;
-  return name;
+  const chosen = (game.display_name || "").trim();
+  if (chosen) return chosen;
+  return (game.name || "").trim() || (game.title_id || "").trim() || "未知目录";
+}
+
+const storeLocaleText = { "zh-hans-hk": "港服商店（简体）", "zh-hant-hk": "港服商店（繁体）", "en-us": "美服商店" };
+const metaStateNote = {
+  pending: "正在从商店补全中文名和封面…",
+  missing: "商店里没有找到这款游戏，可以手动改名。",
+  offline: "商店暂时连不上，稍后会自动重试。",
+};
+
+function nameSourceText(game) {
+  if (game.name_source === "user") return "手动修改";
+  if (game.name_source === "store") return storeLocaleText[game.store_locale] || "商店";
+  if (game.name_source === "catalog") return "PlayStation-Titles 英文名";
+  return "网盘目录名";
 }
 
 function shelfTitle(game) {
@@ -149,7 +163,7 @@ function buildFallbackCover(game, art) {
 function buildCaseCover(game) {
   const art = document.createElement("div");
   art.className = "case-art";
-  const coverUrl = (game.title_id || "").trim() ? (game.cover_url || "").trim() : "";
+  const coverUrl = (game.cover_url || "").trim();
   if (coverUrl) {
     const img = document.createElement("img");
     img.className = "case-cover";
@@ -227,10 +241,24 @@ function detailInfoLines(game) {
   return parts.join(" · ");
 }
 
+function detailLine(className, text) {
+  const line = document.createElement("p");
+  line.className = className;
+  line.textContent = text;
+  return line;
+}
+
 function fillDetail(game, lines, action, meta) {
   lines.textContent = detailInfoLines(game);
   if (meta) {
     meta.replaceChildren();
+    const facts = [game.publisher, game.genres, game.release_date].filter((value) => value);
+    if (facts.length) meta.append(detailLine("detail-facts", facts.join(" · ")));
+    if (game.description) meta.append(detailLine("detail-desc", game.description));
+    meta.append(detailLine("detail-source", "名称来源：" + nameSourceText(game)));
+    const english = (game.catalog_name || "").trim();
+    if (english && english !== displayName(game)) meta.append(detailLine("detail-folder", "英文名：" + english));
+    if (metaStateNote[game.meta_state]) meta.append(detailLine("detail-note", metaStateNote[game.meta_state]));
     const folder = (game.name || "").trim();
     if (folder && folder !== displayName(game)) {
       const folderLine = document.createElement("p");
@@ -259,6 +287,8 @@ function fillDetail(game, lines, action, meta) {
 function closeDetail() {
   if (detailOverlay.hidden) return;
   detailOverlay.hidden = true;
+  detailGame = null;
+  detailReload = null;
   document.body.classList.remove("detail-open");
   if (detailEscapeHandler) {
     document.removeEventListener("keydown", detailEscapeHandler);
@@ -297,15 +327,32 @@ function renderDetail(game) {
   const progress = document.createElement("p");
   progress.id = "job-progress";
   const refresh = () => fillDetail(game, lines, action, meta);
+  const showMeta = () => {
+    title.textContent = displayName(game);
+    const oldArt = cover.querySelector(".case-art");
+    if (oldArt) oldArt.replaceWith(buildCaseCover(game));
+    refresh();
+  };
+  const rename = buildRenameForm(game, () => {
+    showMeta();
+    shareMeta(game);
+    renderShelf();
+    scheduleMetaPoll(true);
+  });
   action.addEventListener("click", () => startInstall(game, progress, refresh));
-  copy.append(lines, meta, action, progress);
+  copy.append(lines, meta, action, progress, rename.form);
   detailBody.append(cover, copy);
+  detailGame = game;
+  detailReload = () => api("/api/game", { path: game.path }).then((data) => {
+    if (detailGame !== game) return;
+    Object.assign(game, data);
+    showMeta();
+    rename.sync();
+  }).catch(() => {});
   api("/api/game", { path: game.path }).then(async (data) => {
     Object.assign(game, data);
-    title.textContent = displayName(game);
-    const newCover = buildCaseCover(game);
-    const oldArt = cover.querySelector(".case-art");
-    if (oldArt) oldArt.replaceWith(newCover);
+    showMeta();
+    rename.sync();
     let job = null;
     try {
       job = await api("/api/job");
@@ -321,6 +368,101 @@ function renderDetail(game) {
   }).catch((error) => {
     lines.textContent = error.message;
   });
+}
+
+function buildRenameForm(game, onSaved) {
+  const form = document.createElement("form");
+  form.className = "rename-form";
+  const input = document.createElement("input");
+  input.maxLength = 80;
+  input.spellcheck = false;
+  input.placeholder = "自定义名称";
+  input.setAttribute("aria-label", "自定义名称");
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "rename-btn";
+  save.textContent = "改名";
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "rename-btn quiet";
+  reset.textContent = "恢复自动名称";
+  const refetch = document.createElement("button");
+  refetch.type = "button";
+  refetch.className = "rename-btn quiet";
+  refetch.textContent = "重新获取商店资料";
+  const note = document.createElement("p");
+  note.className = "rename-note";
+  form.append(input, save, reset, refetch, note);
+
+  const sync = () => {
+    input.value = game.name_source === "user" ? game.display_name : "";
+    reset.hidden = game.name_source !== "user";
+    refetch.hidden = !game.concept_id;
+  };
+  const send = async (path, body, done) => {
+    note.textContent = "";
+    try {
+      Object.assign(game, await api(path, body));
+      sync();
+      onSaved();
+      note.textContent = done;
+    } catch (error) {
+      note.textContent = error.message;
+    }
+  };
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = input.value.trim();
+    if (!value) return;
+    send("/api/name", { name: game.name, display_name: value }, "已改名。");
+  });
+  reset.addEventListener("click", () => send("/api/name", { name: game.name, display_name: "" }, "已恢复自动名称。"));
+  refetch.addEventListener("click", () => send("/api/meta/refresh", { name: game.name }, "已排队，稍后自动更新。"));
+  sync();
+  return { form, sync };
+}
+
+const sharedMetaFields = ["display_name", "name_source", "store_locale", "catalog_name", "cover_url", "meta_state"];
+
+function shareMeta(source) {
+  const sameGame = (game) => (source.title_id ? game.title_id === source.title_id : game.name === source.name);
+  for (const game of games) {
+    if (game === source || !sameGame(game)) continue;
+    for (const field of sharedMetaFields) game[field] = source[field];
+  }
+}
+
+function scheduleMetaPoll(reset) {
+  if (reset) metaRounds = 0;
+  window.clearTimeout(metaTimer);
+  metaTimer = 0;
+  const waiting = games.some((game) => game.meta_state === "pending") || (detailGame && detailGame.meta_state === "pending");
+  if (!waiting || metaRounds >= 200) return;
+  metaTimer = window.setTimeout(pollMeta, 3000);
+}
+
+async function pollMeta() {
+  metaTimer = 0;
+  metaRounds += 1;
+  const pending = games.filter((game) => game.meta_state === "pending");
+  if (detailGame && detailGame.meta_state === "pending" && !pending.includes(detailGame)) pending.push(detailGame);
+  try {
+    const data = await api("/api/meta", { names: pending.map((game) => game.name) });
+    let changed = false;
+    (data.items || []).forEach((item, index) => {
+      const game = pending[index];
+      if (!game || game.name !== item.name) return;
+      if (item.meta_state !== game.meta_state || item.display_name !== game.display_name || item.cover_url !== game.cover_url) {
+        changed = true;
+        if (game === detailGame && detailReload) detailReload();
+      }
+      Object.assign(game, item);
+    });
+    if (changed) renderShelf();
+  } catch (error) {
+    // 下一轮再试
+  }
+  scheduleMetaPoll(false);
 }
 
 function jobProgressText(job) {
@@ -414,6 +556,7 @@ async function loadGames() {
     if (!loginFlowActive()) loginText.textContent = shelfStatus();
     updateLede();
     renderShelf();
+    scheduleMetaPoll(true);
   } catch (error) {
     if (loginFlowActive()) return;
     if (error.message === "百度未登录") {
