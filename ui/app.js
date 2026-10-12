@@ -502,6 +502,21 @@ async function queueAction(path, body) {
   }
 }
 
+// 删掉没装完的游戏已经写进存放位置的文件。成功返回空，取消或失败返回原因。
+async function discardInstall(game) {
+  if (!window.confirm(`删除「${displayName(game)}」已经装了一部分的文件？\n删除后再装要从头开始。`)) return "cancelled";
+  const error = await queueAction("/api/discard", { path: game.path });
+  if (error) return error;
+  for (const item of games) {
+    if (item.path !== game.path) continue;
+    item.state = "install";
+    paintTile(item);
+  }
+  game.state = "install";
+  loadGames();
+  return "";
+}
+
 async function startInstall(game) {
   const error = await queueAction("/api/install", { path: game.path });
   if (error && detail && detail.game === game) detail.fail(error);
@@ -586,6 +601,15 @@ function queueRowActions(task) {
   const buttons = [];
   if (settledState(task) !== "installed" && task.retryable !== false) {
     buttons.push(queueButton(task.status === "interrupted" ? "继续" : "重试", () => queueAction("/api/install", { path: task.path })));
+  }
+  if (task.status === "interrupted") {
+    const discard = queueButton("删除", async () => {
+      discard.disabled = true;
+      const error = await discardInstall(task);
+      discard.disabled = false;
+      if (error && error !== "cancelled") window.alert(error);
+    }, "danger");
+    buttons.push(discard);
   }
   buttons.push(queueButton("移出", remove));
   return buttons;
@@ -729,7 +753,9 @@ function openDetail(game, opener) {
   queueRow.append(queueText, queueLinks);
   const status = el("p", "status-text");
   status.setAttribute("role", "status");
-  install.append(action, progress, queueRow, status);
+  const discard = el("button", "discard", "删除已装了一部分的文件");
+  discard.type = "button";
+  install.append(action, discard, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -779,6 +805,7 @@ function openDetail(game, opener) {
     action.classList.toggle("done", game.state === "installed");
     action.disabled = running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
       (game.state !== "need-settings" && archivesRead && !game.formats);
+    discard.hidden = game.state !== "continue" || running || queued;
     progress.hidden = !running;
     if (running) {
       progressText.textContent = jobText(task);
@@ -823,6 +850,16 @@ function openDetail(game, opener) {
     startInstall(game);
   });
   cancel.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
+  discard.addEventListener("click", async () => {
+    discard.disabled = true;
+    status.hidden = true;
+    const error = await discardInstall(game);
+    discard.disabled = false;
+    if (detail && detail.game === game) {
+      if (error && error !== "cancelled") detail.fail(error);
+      else paint();
+    }
+  });
   first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));
   leave.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
 

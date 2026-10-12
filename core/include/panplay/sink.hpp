@@ -34,6 +34,8 @@ class InstallSink {
   virtual std::string remove_file(const std::string& path) = 0;
   // 只删除空目录。
   virtual std::string remove_dir(const std::string& path) = 0;
+  // 连同里面的文件和子目录一起删。目录不存在也算删掉了。
+  virtual std::string remove_tree(const std::string& path) = 0;
 };
 
 struct FtpEndpoint {

@@ -580,14 +580,31 @@ void clean_staging(InstallSink& sink, const std::string& staging_root, const std
   sink.remove_dir(parent_path(staging_root));
 }
 
+// 游戏在主机上的目录名：有 Title ID 用它，没有用网盘目录名。不能用时返回空。
+std::string install_folder(const std::string& source_dir) {
+  const std::string folder_name = base_name(source_dir);
+  const std::string title_id = find_title_id(folder_name);
+  const std::string folder = title_id.empty() ? folder_name : title_id;
+  if (folder.empty() || folder == "." || folder == ".." || folder.find(':') != std::string::npos) return "";
+  return folder;
+}
+
 }  // namespace
+
+std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
+  const std::string folder = install_folder(source_dir);
+  if (folder.empty()) return "游戏目录名不能作为存放目录";
+  const std::string staging_parent = join_storage_path(dest_prefix, ".panplay-staging");
+  if (auto error = sink.remove_tree(join_storage_path(staging_parent, folder)); !error.empty()) return error;
+  sink.remove_dir(staging_parent);
+  return "";
+}
 
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request) {
   InstallResult result;
-  const std::string folder_name = base_name(request.source_dir);
-  const std::string title_id = find_title_id(folder_name);
-  const std::string folder = title_id.empty() ? folder_name : title_id;
-  if (folder.empty() || folder == "." || folder == ".." || folder.find(':') != std::string::npos) {
+  const std::string folder = install_folder(request.source_dir);
+  const std::string title_id = find_title_id(base_name(request.source_dir));
+  if (folder.empty()) {
     result.status = "error";
     result.message = "游戏目录名不能作为存放目录";
     return result;

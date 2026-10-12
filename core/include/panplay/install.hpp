@@ -84,6 +84,8 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
                                 std::vector<ListedRarEntry>* listed);
 
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request);
+// 删掉没装完的游戏留在暂存区的全部文件，之后只能从头装。已经装好的游戏不受影响。
+std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 bool parse_destination(const std::string& text, Destination* destination, std::string* error);
 std::unique_ptr<InstallSink> open_destination(const Destination& destination, std::string* error);
 

@@ -152,6 +152,17 @@ class LocalSink : public InstallSink {
     return "";
   }
 
+  std::string remove_tree(const std::string& path) override {
+    std::filesystem::path local;
+    std::string error;
+    if (!storage_path(root_, path, &local, &error)) return error;
+    const std::filesystem::path inside = local.lexically_normal().lexically_relative(root_.lexically_normal());
+    if (inside.empty() || inside == "." || *inside.begin() == "..") return "不能删除存放位置以外或整个存放位置";
+    std::error_code ec;
+    std::filesystem::remove_all(local, ec);
+    return ec ? "无法删除目录" : "";
+  }
+
  private:
   std::string write_bytes(const std::string& path, const std::uint8_t* data, std::size_t size, bool append) {
     std::filesystem::path local;
@@ -342,6 +353,17 @@ class FtpSink : public InstallSink {
 
   std::string remove_dir(const std::string& path) override { return simple_command("RMD " + path); }
 
+  // FTP 列目录分不出文件和子目录：先当文件删，删不掉再当目录往里删。
+  std::string remove_tree(const std::string& path) override {
+    std::string error;
+    const auto slash = path.find_last_of('/');
+    const std::string parent = slash == std::string::npos || slash == 0 ? "/" : path.substr(0, slash);
+    const auto siblings = list_children(parent, &error);
+    if (!error.empty()) return error;
+    if (std::find(siblings.begin(), siblings.end(), basename_of(path)) == siblings.end()) return "";
+    return remove_tree_at(path, 0);
+  }
+
   std::string read_file(const std::string& path, std::vector<std::uint8_t>* out, std::size_t max_bytes) override {
     std::lock_guard<std::mutex> lock(io_);
     out->clear();
@@ -385,6 +407,20 @@ class FtpSink : public InstallSink {
   }
 
  private:
+  std::string remove_tree_at(const std::string& path, int depth) {
+    if (depth > 64) return "目录层级太深";
+    std::string error;
+    const auto names = list_children(path, &error);
+    if (!error.empty()) return error;
+    for (const auto& name : names) {
+      if (name.empty() || name == "." || name == "..") continue;
+      const std::string child = (!path.empty() && path.back() == '/' ? path : path + "/") + name;
+      if (remove_file(child).empty()) continue;
+      if (auto child_error = remove_tree_at(child, depth + 1); !child_error.empty()) return child_error;
+    }
+    return remove_dir(path);
+  }
+
   std::string simple_command(const std::string& line) {
     std::lock_guard<std::mutex> lock(io_);
     std::string reply;

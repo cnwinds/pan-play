@@ -243,6 +243,7 @@ class CountingSink final : public InstallSink {
   }
   std::string remove_file(const std::string& path) override { return inner_.remove_file(path); }
   std::string remove_dir(const std::string& path) override { return inner_.remove_dir(path); }
+  std::string remove_tree(const std::string& path) override { return inner_.remove_tree(path); }
 
  private:
   InstallSink& inner_;
@@ -299,6 +300,13 @@ class MemorySink final : public InstallSink {
     return "";
   }
   std::string remove_dir(const std::string&) override { return ""; }
+  std::string remove_tree(const std::string& path) override {
+    const std::string inside = path + "/";
+    for (auto it = files.begin(); it != files.end();) {
+      it = it->first.rfind(inside, 0) == 0 ? files.erase(it) : std::next(it);
+    }
+    return "";
+  }
 
  private:
   class Writer final : public FileWriter {
@@ -529,6 +537,17 @@ int resume_on(InstallSink& raw, FakeDrive& drive, const std::vector<std::uint8_t
   if (journal_text.find("param.sfo") == std::string::npos || journal_text.find("eboot.bin") != std::string::npos) {
     return fail("进度记录没有只留下已校验文件");
   }
+
+  for (int round = 0; round < 2; ++round) {
+    if (auto discard_error = discard_install(sink, request.dest_prefix, request.source_dir); !discard_error.empty()) {
+      return fail("删除没装完的文件失败: " + discard_error);
+    }
+  }
+  error.clear();
+  const auto left = sink.list_children(request.dest_prefix, &error);
+  if (!error.empty() || !left.empty() || sink.file_size(partial, &error) >= 0) return fail("删除后暂存区还有东西");
+  first = install_game(drive, sink, request);
+  if (first.status != "interrupted" || first.files_done != 1) return fail("删除后重新安装没有从头开始: " + first.message);
 
   sink.reset();
   request.stop_after_output_bytes = -1;
@@ -1218,6 +1237,17 @@ int run_install_pipeline_self_test() {
     ftp.reset();
     server.stop();
     if (code != 0) return code;
+  }
+
+  {
+    const auto resume_root = root / "resume-local";
+    auto local = make_local_sink(resume_root.u8string());
+    if (const int code = resume_on(*local, drive, param, eboot, resume_root); code != 0) return code;
+    for (const char* whole : {"/", "", "/mnt/.."}) {
+      if (local->remove_tree(whole).empty() || !std::filesystem::is_directory(resume_root)) {
+        return fail(std::string("删除整个存放位置没有被拦住: ") + whole);
+      }
+    }
   }
 
   {

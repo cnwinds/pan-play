@@ -610,6 +610,20 @@ body.drawer-open { overflow: hidden; }
 
 .progress-row .link:hover { color: var(--danger); }
 
+.install .discard {
+  justify-self: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 0.88rem;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.install .discard:hover { color: var(--danger); }
+.install .discard:disabled { opacity: 0.6; text-decoration: none; }
+
 .meter {
   display: block;
   height: 6px;

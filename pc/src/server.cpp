@@ -220,6 +220,8 @@ struct InstallQueue {
   std::unique_ptr<InstallTask> current;
   std::deque<InstallTask> waiting;
   std::deque<InstallTask> finished;
+  // 正在删除没装完的文件的游戏，删完之前不能再加入队列。
+  std::set<std::string> discarding;
   bool worker_running = false;
   std::thread worker;
 };
@@ -612,6 +614,17 @@ void save_queue_locked() {
   out << json;
 }
 
+std::unique_ptr<panplay::InstallSink> open_sink(const AppSettings& settings, std::string* error) {
+  panplay::Destination destination;
+  if (settings.dest().empty() || !panplay::parse_destination(settings.dest(), &destination, error)) {
+    if (error->empty()) *error = "先在设置里填写存放位置";
+    return nullptr;
+  }
+  auto sink = panplay::open_destination(destination, error);
+  if (!sink && error->empty()) *error = "无法连接存放位置";
+  return sink;
+}
+
 panplay::InstallResult run_install(const std::string& path, panplay::CancelToken* cancel) {
   panplay::InstallResult result;
   try {
@@ -621,23 +634,17 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
     auto drive = open_drive();
     const AppSettings settings = load_settings();
     std::string error;
-    panplay::Destination destination;
-    if (settings.dest().empty() || !panplay::parse_destination(settings.dest(), &destination, &error)) {
+    auto sink = open_sink(settings, &error);
+    if (!sink) {
       result.status = "error";
-      result.message = error.empty() ? "先在设置里填写存放位置" : error;
+      result.message = error;
     } else {
-      auto sink = panplay::open_destination(destination, &error);
-      if (!sink) {
-        result.status = "error";
-        result.message = error.empty() ? "无法连接存放位置" : error;
-      } else {
-        panplay::InstallRequest request;
-        request.source_dir = path;
-        request.dest_prefix = settings.prefix();
-        request.on_progress = publish_progress;
-        request.cancel = cancel;
-        result = panplay::install_game(*drive, *sink, request);
-      }
+      panplay::InstallRequest request;
+      request.source_dir = path;
+      request.dest_prefix = settings.prefix();
+      request.on_progress = publish_progress;
+      request.cancel = cancel;
+      result = panplay::install_game(*drive, *sink, request);
     }
   } catch (const std::exception& ex) {
     result.status = "error";
@@ -1114,6 +1121,10 @@ void handle_client(SOCKET client) {
           reply_json(client, 409, json_error("这个游戏已经在安装队列里"));
           return;
         }
+        if (installs.discarding.count(path) != 0) {
+          reply_json(client, 409, json_error("正在删除这个游戏没装完的文件，删完再装"));
+          return;
+        }
         erase_path(installs.finished, path);
         InstallTask task;
         task.path = path;
@@ -1137,6 +1148,52 @@ void handle_client(SOCKET client) {
         return;
       }
       save_queue_locked();
+    }
+    reply_json(client, 200, queue_json());
+    return;
+  }
+  // 删掉没装完的游戏已经写到存放位置的文件，并把它移出队列。正在装或排队的要先取消。
+  if (method == "POST" && target == "/api/discard") {
+    std::string parse_error;
+    const panplay::Json json = panplay::Json::parse(body, &parse_error);
+    const std::string path = json.str("path");
+    if (!parse_error.empty() || path.empty()) {
+      reply_json(client, 400, json_error(parse_error.empty() ? "缺少游戏目录" : parse_error));
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      const bool queued = (installs.current && installs.current->path == path) ||
+                          std::any_of(installs.waiting.begin(), installs.waiting.end(),
+                                      [&](const InstallTask& task) { return task.path == path; });
+      if (queued) {
+        reply_json(client, 409, json_error("这个游戏还在安装队列里，先取消再删除"));
+        return;
+      }
+      if (!installs.discarding.insert(path).second) {
+        reply_json(client, 409, json_error("正在删除"));
+        return;
+      }
+    }
+    std::string error;
+    try {
+      const AppSettings settings = load_settings();
+      if (auto sink = open_sink(settings, &error)) error = panplay::discard_install(*sink, settings.prefix(), path);
+    } catch (const std::exception& ex) {
+      error = std::string("删除失败: ") + ex.what();
+    }
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      installs.discarding.erase(path);
+      if (error.empty()) erase_path(installs.finished, path);
+    }
+    if (!error.empty()) {
+      reply_json(client, 500, json_error(error));
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(shelf_mu);
+      shelf_cache.reset();
     }
     reply_json(client, 200, queue_json());
     return;
