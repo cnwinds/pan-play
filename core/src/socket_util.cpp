@@ -7,6 +7,9 @@
 namespace panplay {
 namespace {
 
+// Windows 10 起的 SO_REUSE_UNICASTPORT，MinGW 头文件里没有。
+constexpr int kReuseUnicastPort = 0x3007;
+
 bool trace_enabled() {
   const char* value = std::getenv("PANPLAY_FTP_TRACE");
   return value && value[0] == '1';
@@ -105,6 +108,15 @@ SOCKET connect_tcp(const std::string& host, std::uint16_t port, std::string* err
     closesocket(socket);
     *error = "地址无效";
     return INVALID_SOCKET;
+  }
+  // FTP 每传一个文件开一条数据连接，且由本机先关，关掉的连接在 TIME_WAIT 里占着本机端口约两分钟；
+  // 小文件多时一两分钟就能把临时端口用光。打开这个选项并绑端口 0，系统改在 connect 时按完整的
+  // 四元组选端口，还在 TIME_WAIT 的端口也能连别的地址。系统不支持这个选项时照旧。
+  const DWORD reuse = 1;
+  if (setsockopt(socket, SOL_SOCKET, kReuseUnicastPort, reinterpret_cast<const char*>(&reuse), sizeof(reuse)) == 0) {
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    bind(socket, reinterpret_cast<sockaddr*>(&local), sizeof(local));
   }
   if (connect(socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
     closesocket(socket);
