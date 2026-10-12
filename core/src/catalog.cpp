@@ -139,9 +139,13 @@ bool GameCatalog::load_file_unlocked(const std::string& path, std::string* error
   meta_.generated_from = root.str("generated_from");
   meta_.version = static_cast<int>(root.num("version"));
   try {
+    // 文件时钟的起点不是 1970 年，按两个时钟的当前时间差换算成 Unix 时间。
     const auto mtime = std::filesystem::last_write_time(std::filesystem::u8path(path));
+    const auto system_mtime = std::chrono::system_clock::now() +
+                              std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                                  mtime - std::filesystem::file_time_type::clock::now());
     meta_.file_mtime_unix =
-        std::chrono::duration_cast<std::chrono::seconds>(mtime.time_since_epoch()).count();
+        std::chrono::duration_cast<std::chrono::seconds>(system_mtime.time_since_epoch()).count();
   } catch (...) {
     meta_.file_mtime_unix = 0;
   }
