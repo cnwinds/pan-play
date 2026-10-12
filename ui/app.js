@@ -1,195 +1,56 @@
-const GAMES_PER_PAGE = 24;
+const $ = (selector) => document.querySelector(selector);
 
-const shelfView = document.querySelector("#shelf-view");
-const settingsView = document.querySelector("#settings-view");
-const shelf = document.querySelector("#shelf");
-const shelfPager = document.querySelector("#shelf-pager");
-const shelfPagerInfo = document.querySelector("#shelf-pager-info");
-const shelfPrev = document.querySelector("#shelf-prev");
-const shelfNext = document.querySelector("#shelf-next");
-const detailOverlay = document.querySelector("#detail-overlay");
-const detailBackdrop = document.querySelector("#detail-backdrop");
-const detailClose = document.querySelector("#detail-close");
-const detail = document.querySelector("#detail");
-const detailBody = document.querySelector("#detail-body");
-const loginText = document.querySelector("#login-text");
-const qr = document.querySelector("#qr");
-const userCode = document.querySelector("#user-code");
-const form = document.querySelector("#settings-form");
-const settingsNote = document.querySelector("#settings-note");
-const catalogStatus = document.querySelector("#catalog-status");
-const catalogNote = document.querySelector("#catalog-note");
-const catalogReload = document.querySelector("#catalog-reload");
-const lede = document.querySelector("#lede");
-const loginBox = document.querySelector("#login-box");
+const shelfView = $("#shelf-view");
+const settingsView = $("#settings-view");
+const library = $("#library");
+const shelf = $("#shelf");
+const shelfEmpty = $("#shelf-empty");
+const gameCount = $("#game-count");
+const lede = $("#lede");
+const search = $("#search");
+const filterButtons = document.querySelectorAll(".filter");
+const loginBox = $("#login-box");
+const loginText = $("#login-text");
+const loginButton = $("#start-login");
+const qr = $("#qr");
+const qrWrap = $("#qr-wrap");
+const userCode = $("#user-code");
+const detailOverlay = $("#detail-overlay");
+const detailBody = $("#detail-body");
+const dock = $("#dock");
+const dockArt = $("#dock-art");
+const dockTitle = $("#dock-title");
+const dockStatus = $("#dock-status");
+const dockMeter = $("#dock-meter");
+const dockAction = $("#dock-action");
+const form = $("#settings-form");
+const settingsNote = $("#settings-note");
+const catalogStatus = $("#catalog-status");
+const catalogNote = $("#catalog-note");
+const catalogReload = $("#catalog-reload");
 
-const signedOutHint = "登录百度网盘后才能看到游戏目录。";
-const missingKeyHint = "请先打开设置，填写 AppKey 和 SecretKey 并保存。";
-const covers = ["#d7c4a3", "#c9d3c4", "#d4c3b8", "#c5d0d6", "#e4d2b8", "#cfc6b4"];
-const stateText = {
-  installed: "已安装",
-  continue: "继续",
-  install: "安装",
-  installing: "正在安装",
-  unsupported: "还不能安装",
-  empty: "没有压缩包",
-  "need-settings": "先设置存放位置",
-};
-
-let games = [];
-let currentPage = 1;
-let pollTimer = 0;
-let jobTimer = 0;
-let detailEscapeHandler = null;
-let detailGame = null;
-let detailReload = null;
-let metaTimer = 0;
-let metaRounds = 0;
-
-function totalPages() {
-  if (games.length === 0) return 0;
-  return Math.ceil(games.length / GAMES_PER_PAGE);
-}
-
-function clampPage(page) {
-  const pages = totalPages();
-  if (pages === 0) return 1;
-  return Math.min(Math.max(1, page), pages);
-}
-
-function pageGames() {
-  if (games.length === 0) return [];
-  const page = clampPage(currentPage);
-  const start = (page - 1) * GAMES_PER_PAGE;
-  return games.slice(start, start + GAMES_PER_PAGE);
-}
-
-function renderPagination() {
-  const pages = totalPages();
-  const total = games.length;
-  shelfPager.hidden = total === 0;
-  if (total === 0) return;
-  const page = clampPage(currentPage);
-  currentPage = page;
-  shelfPagerInfo.textContent = "第 " + page + " / " + pages + " 页，共 " + total + " 个";
-  shelfPrev.disabled = page <= 1;
-  shelfNext.disabled = page >= pages;
-}
-
-function goToPage(page) {
-  if (games.length === 0) return;
-  closeDetail();
-  currentPage = clampPage(page);
-  renderShelf();
-}
-
-function loginFlowActive() {
-  return !qr.hidden || pollTimer !== 0;
-}
-
-function loginErrorText(message) {
-  if (message === "缺少 PANPLAY_BAIDU_APP_KEY" || message === "缺少 PANPLAY_BAIDU_SECRET_KEY") return missingKeyHint;
-  return message;
-}
-
-function stopLoginPoll() {
-  window.clearInterval(pollTimer);
-  pollTimer = 0;
-}
-
-function coverColor(name) {
-  let hash = 0;
-  for (const ch of name) hash = (hash * 33 + ch.codePointAt(0)) >>> 0;
-  return covers[hash % covers.length];
-}
-
-function coverMonogram(game) {
-  if (game.title_id) return game.title_id.slice(0, 4);
-  const name = (game.name || "?").trim();
-  return name.slice(0, 2).toUpperCase();
-}
-
-function displayName(game) {
-  const chosen = (game.display_name || "").trim();
-  if (chosen) return chosen;
-  return (game.name || "").trim() || (game.title_id || "").trim() || "未知目录";
-}
-
+const signedOutHint = "登录后才能看到网盘里的游戏。";
+const missingKeyHint = "先到设置里填写 AppKey 和 SecretKey 并保存。";
+const regionText = { UP: "美服", EP: "欧服", JP: "日服", HP: "港服", KP: "韩服", IP: "国际服" };
 const storeLocaleText = { "zh-hans-hk": "港服商店（简体）", "zh-hant-hk": "港服商店（繁体）", "en-us": "美服商店" };
 const metaStateNote = {
   pending: "正在从商店补全中文名和封面…",
-  missing: "商店里没有找到这款游戏，可以手动改名。",
+  missing: "商店里没有找到这款游戏，可以在下面手动改名。",
   offline: "商店暂时连不上，稍后会自动重试。",
 };
 
-function nameSourceText(game) {
-  if (game.name_source === "user") return "手动修改";
-  if (game.name_source === "store") return storeLocaleText[game.store_locale] || "商店";
-  if (game.name_source === "catalog") return "PlayStation-Titles 英文名";
-  return "网盘目录名";
-}
-
-function shelfTitle(game) {
-  return displayName(game);
-}
-
-function shelfSubtitle(game) {
-  const name = (game.name || "").trim();
-  const id = (game.title_id || "").trim();
-  const parts = [];
-  if (id) {
-    parts.push(name && name.toUpperCase() !== id ? id : "Title ID");
-  }
-  const state = stateText[game.state] || game.state;
-  if (state) parts.push(state);
-  return parts.join(" · ");
-}
-
-function buildFallbackCover(game, art) {
-  art.style.background = coverColor(game.name || game.title_id || "?");
-  const mono = document.createElement("span");
-  mono.className = "case-monogram";
-  mono.textContent = coverMonogram(game);
-  if (game.title_id && game.title_id.length > 4) {
-    const code = document.createElement("span");
-    code.className = "case-id";
-    code.textContent = game.title_id.slice(4);
-    art.append(mono, code);
-  } else {
-    art.append(mono);
-  }
-}
-
-function buildCaseCover(game) {
-  const art = document.createElement("div");
-  art.className = "case-art";
-  const coverUrl = (game.cover_url || "").trim();
-  if (coverUrl) {
-    const img = document.createElement("img");
-    img.className = "case-cover";
-    img.alt = displayName(game);
-    img.loading = "lazy";
-    img.decoding = "async";
-    img.src = coverUrl;
-    img.addEventListener("error", () => {
-      img.remove();
-      art.classList.remove("has-cover");
-      buildFallbackCover(game, art);
-    }, { once: true });
-    art.classList.add("has-cover");
-    art.append(img);
-  } else {
-    buildFallbackCover(game, art);
-  }
-  return art;
-}
-
-function formatBytes(bytes) {
-  if (bytes < 1024) return bytes + " B";
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MB";
-  return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GB";
-}
+let games = [];
+let filter = "all";
+let query = "";
+let loggedIn = false;
+let loginTimer = 0;
+let metaTimer = 0;
+let metaRounds = 0;
+let job = null;
+let jobTimer = 0;
+let dockVisible = false;
+let detail = null;
+const tiles = new Map();
 
 async function api(path, body) {
   const response = await fetch(path, body === undefined ? undefined : {
@@ -202,243 +63,175 @@ async function api(path, body) {
   return data;
 }
 
-function show(view) {
-  if (view !== "shelf") closeDetail();
-  shelfView.hidden = view !== "shelf";
-  settingsView.hidden = view !== "settings";
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function displayName(game) {
+  return (game.display_name || "").trim() || (game.name || "").trim() || (game.title_id || "").trim() || "未知目录";
+}
+
+function platformText(game) {
+  if (game.platform) return game.platform.toUpperCase();
+  const id = (game.title_id || "").toUpperCase();
+  if (id.startsWith("PPSA")) return "PS5";
+  if (id.startsWith("CUSA")) return "PS4";
+  return "";
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return "";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MB";
+  return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GB";
+}
+
+function hashHue(text) {
+  let hash = 0;
+  for (const ch of text) hash = (hash * 33 + ch.codePointAt(0)) >>> 0;
+  return hash % 360;
+}
+
+// 封面：有商店图用商店图，没有就用 Title ID 生成一张。
+function buildArt(game, className) {
+  const art = el("span", "art " + (className || ""));
+  const fallback = () => {
+    const hue = hashHue(game.title_id || game.name || "?");
+    art.style.background = `linear-gradient(160deg, hsl(${hue} 42% 34%), hsl(${(hue + 40) % 360} 46% 18%))`;
+    const box = el("span", "fallback");
+    const id = (game.title_id || "").trim();
+    if (id) {
+      box.append(el("span", "fallback-kind", id.slice(0, 4)), el("span", "fallback-code", id.slice(4)));
+    } else {
+      box.append(el("span", "fallback-code", (game.name || "?").trim().slice(0, 2)));
+    }
+    art.append(box);
+  };
+  const url = (game.cover_url || "").trim();
+  if (url) {
+    const img = document.createElement("img");
+    img.alt = "";
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.src = url;
+    img.addEventListener("error", () => {
+      img.remove();
+      fallback();
+    }, { once: true });
+    art.append(img);
+  } else {
+    fallback();
+  }
+  const fill = el("span", "fill");
+  fill.append(el("span"));
+  art.append(fill);
+  return art;
+}
+
+function jobFraction() {
+  if (!job || !job.files_total) return 0;
+  return Math.min(1, job.files_done / job.files_total);
+}
+
+function jobFor(game) {
+  return job && job.running && job.path === game.path;
+}
+
+function paintArt(art, game) {
+  art.dataset.state = game.state;
+  const installing = jobFor(game);
+  art.style.setProperty("--p", installing ? jobFraction() : 0);
+  const label = art.querySelector(".fill span");
+  if (label) label.textContent = installing && job.files_total ? Math.round(jobFraction() * 100) + "%" : "…";
+  art.querySelector(".badge")?.remove();
+  if (game.state === "installed") art.append(el("span", "badge installed", "已安装"));
+  if (game.state === "continue") art.append(el("span", "badge continue", "未装完"));
+}
+
+/* 游戏库 */
+
+function matches(game) {
+  if (filter === "installed" && game.state !== "installed") return false;
+  if (filter === "todo" && game.state === "installed") return false;
+  if (!query) return true;
+  const haystack = [displayName(game), game.name, game.title_id, game.catalog_name].join("\n").toLowerCase();
+  return haystack.includes(query);
 }
 
 function renderShelf() {
+  tiles.clear();
   shelf.replaceChildren();
-  for (const game of pageGames()) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "case";
-    const title = document.createElement("strong");
-    title.className = "case-title";
-    title.textContent = shelfTitle(game);
-    const meta = document.createElement("span");
-    meta.className = "case-meta";
-    meta.textContent = shelfSubtitle(game);
-    button.append(buildCaseCover(game), title, meta);
-    button.addEventListener("click", () => renderDetail(game));
-    shelf.append(button);
+  const list = games.filter(matches);
+  for (const game of list) shelf.append(buildTile(game));
+  gameCount.textContent = games.length ? String(games.length) : "";
+  shelfEmpty.hidden = list.length > 0;
+  if (games.length === 0) shelfEmpty.textContent = "游戏库目录里还没有游戏文件夹。";
+  else if (query) shelfEmpty.textContent = `没有找到“${search.value.trim()}”。`;
+  else if (filter === "installed") shelfEmpty.textContent = "还没有装到主机上的游戏。";
+  else shelfEmpty.textContent = "这里没有游戏了。";
+}
+
+function buildTile(game) {
+  const tile = el("button", "tile");
+  tile.type = "button";
+  const art = buildArt(game);
+  const sub = el("span", "tile-sub");
+  const platform = platformText(game);
+  if (platform) sub.append(el("span", "plat", platform));
+  if (game.title_id) sub.append(el("span", "num", game.title_id));
+  tile.append(art, el("span", "tile-name", displayName(game)), sub);
+  tile.addEventListener("click", () => openDetail(game, tile));
+  tiles.set(game.path, { tile, art });
+  paintTile(game);
+  return tile;
+}
+
+function paintTile(game) {
+  const entry = tiles.get(game.path);
+  if (!entry) return;
+  entry.tile.dataset.state = game.state;
+  paintArt(entry.art, game);
+}
+
+function updateLede() {
+  lede.replaceChildren();
+  if (games.length && games.every((game) => game.state === "need-settings")) {
+    const go = el("button", "", "到设置里填写存放位置");
+    go.type = "button";
+    go.addEventListener("click", () => show("settings"));
+    lede.append(go, "后才能安装。");
+    return;
   }
-  renderPagination();
+  const installed = games.filter((game) => game.state === "installed").length;
+  if (games.length) lede.textContent = installed ? `已装到主机 ${installed} 个。` : "点开游戏就能装到主机。";
 }
 
-function detailInfoLines(game) {
-  const parts = [];
-  const identified = Boolean((game.title_id || "").trim());
-  if (identified) parts.push(game.title_id);
-  else parts.push("目录名里没有 Title ID");
-  if (identified && game.platform) parts.push(game.platform.toUpperCase());
-  if (identified && game.region) parts.push("区域 " + game.region);
-  if (identified && game.publisher_id) parts.push(game.publisher_id);
-  if (game.formats) parts.push(game.formats);
-  parts.push(formatBytes(game.archive_bytes || 0));
-  if (!identified || game.catalog_matched === false) parts.push("资料库未收录");
-  return parts.join(" · ");
-}
-
-function detailLine(className, text) {
-  const line = document.createElement("p");
-  line.className = className;
-  line.textContent = text;
-  return line;
-}
-
-function fillDetail(game, lines, action, meta) {
-  lines.textContent = detailInfoLines(game);
-  if (meta) {
-    meta.replaceChildren();
-    const facts = [game.publisher, game.genres, game.release_date].filter((value) => value);
-    if (facts.length) meta.append(detailLine("detail-facts", facts.join(" · ")));
-    if (game.description) meta.append(detailLine("detail-desc", game.description));
-    meta.append(detailLine("detail-source", "名称来源：" + nameSourceText(game)));
-    const english = (game.catalog_name || "").trim();
-    if (english && english !== displayName(game)) meta.append(detailLine("detail-folder", "英文名：" + english));
-    if (metaStateNote[game.meta_state]) meta.append(detailLine("detail-note", metaStateNote[game.meta_state]));
-    const folder = (game.name || "").trim();
-    if (folder && folder !== displayName(game)) {
-      const folderLine = document.createElement("p");
-      folderLine.className = "detail-folder";
-      folderLine.textContent = "网盘目录：" + folder;
-      meta.append(folderLine);
+async function loadGames() {
+  try {
+    const data = await api("/api/games");
+    games = data.games || [];
+    if (job && job.running) {
+      const game = games.find((item) => item.path === job.path);
+      if (game) game.state = "installing";
     }
-    if ((game.title_id || "").trim() && game.concept_id) {
-      const conceptLine = document.createElement("p");
-      conceptLine.className = "detail-concept";
-      conceptLine.textContent = "Concept ID " + game.concept_id;
-      meta.append(conceptLine);
-    }
-    if (game.catalog_matched === false) {
-      const note = document.createElement("p");
-      note.className = "detail-note";
-      note.textContent = "本地资料库没有收录这款游戏，仍可按目录名安装。";
-      meta.append(note);
-    }
-  }
-  action.className = "action" + (game.state === "installed" ? " done" : "");
-  action.textContent = stateText[game.state] || "安装";
-  action.disabled = game.state === "installed" || game.state === "installing" || game.state === "unsupported" || game.state === "empty" || game.state === "need-settings" || !game.formats;
-}
-
-function closeDetail() {
-  if (detailOverlay.hidden) return;
-  detailOverlay.hidden = true;
-  detailGame = null;
-  detailReload = null;
-  document.body.classList.remove("detail-open");
-  if (detailEscapeHandler) {
-    document.removeEventListener("keydown", detailEscapeHandler);
-    detailEscapeHandler = null;
-  }
-}
-
-function openDetail() {
-  detailOverlay.hidden = false;
-  document.body.classList.add("detail-open");
-  if (!detailEscapeHandler) {
-    detailEscapeHandler = (event) => {
-      if (event.key === "Escape") closeDetail();
-    };
-    document.addEventListener("keydown", detailEscapeHandler);
-  }
-  detailClose.focus();
-}
-
-function renderDetail(game) {
-  openDetail();
-  detailBody.replaceChildren();
-  const cover = document.createElement("div");
-  cover.className = "case";
-  const title = document.createElement("strong");
-  title.className = "case-title";
-  title.textContent = shelfTitle(game);
-  cover.append(buildCaseCover(game), title);
-  const copy = document.createElement("div");
-  const lines = document.createElement("p");
-  const meta = document.createElement("div");
-  meta.className = "detail-meta";
-  const action = document.createElement("button");
-  action.type = "button";
-  fillDetail(game, lines, action, meta);
-  const progress = document.createElement("p");
-  progress.id = "job-progress";
-  const cancel = document.createElement("button");
-  cancel.type = "button";
-  cancel.className = "rename-btn quiet job-cancel";
-  cancel.textContent = "取消安装";
-  cancel.hidden = true;
-  const refresh = () => {
-    fillDetail(game, lines, action, meta);
-    cancel.hidden = game.state !== "installing";
-    cancel.disabled = false;
-  };
-  cancel.addEventListener("click", async () => {
-    cancel.disabled = true;
-    try {
-      await api("/api/cancel", {});
-      progress.textContent = "正在取消…";
-    } catch (error) {
-      progress.textContent = error.message;
-      cancel.disabled = false;
-    }
-  });
-  const showMeta = () => {
-    title.textContent = displayName(game);
-    const oldArt = cover.querySelector(".case-art");
-    if (oldArt) oldArt.replaceWith(buildCaseCover(game));
-    refresh();
-  };
-  const rename = buildRenameForm(game, () => {
-    showMeta();
-    shareMeta(game);
+    setLoggedIn(true);
+    updateLede();
     renderShelf();
     scheduleMetaPoll(true);
-  });
-  action.addEventListener("click", () => startInstall(game, progress, refresh));
-  copy.append(lines, meta, action, progress, cancel, rename.form);
-  detailBody.append(cover, copy);
-  detailGame = game;
-  detailReload = () => api("/api/game", { path: game.path }).then((data) => {
-    if (detailGame !== game) return;
-    Object.assign(game, data);
-    showMeta();
-    rename.sync();
-  }).catch(() => {});
-  api("/api/game", { path: game.path }).then(async (data) => {
-    Object.assign(game, data);
-    showMeta();
-    rename.sync();
-    let job = null;
-    try {
-      job = await api("/api/job");
-    } catch (error) {
-      job = null;
+  } catch (error) {
+    if (loginFlowActive()) return;
+    if (error.message === "百度未登录") {
+      games = [];
+      setLoggedIn(false);
+      loginText.textContent = signedOutHint;
+      return;
     }
-    if (job && job.path === game.path && (job.running || job.status)) {
-      game.state = job.running ? "installing" : settledState(job);
-      progress.textContent = jobProgressText(job);
-    }
-    refresh();
-    if (job && job.running && job.path === game.path) watchJob(progress, game, refresh);
-  }).catch((error) => {
-    lines.textContent = error.message;
-  });
-}
-
-function buildRenameForm(game, onSaved) {
-  const form = document.createElement("form");
-  form.className = "rename-form";
-  const input = document.createElement("input");
-  input.maxLength = 80;
-  input.spellcheck = false;
-  input.placeholder = "自定义名称";
-  input.setAttribute("aria-label", "自定义名称");
-  const save = document.createElement("button");
-  save.type = "submit";
-  save.className = "rename-btn";
-  save.textContent = "改名";
-  const reset = document.createElement("button");
-  reset.type = "button";
-  reset.className = "rename-btn quiet";
-  reset.textContent = "恢复自动名称";
-  const refetch = document.createElement("button");
-  refetch.type = "button";
-  refetch.className = "rename-btn quiet";
-  refetch.textContent = "重新获取商店资料";
-  const note = document.createElement("p");
-  note.className = "rename-note";
-  form.append(input, save, reset, refetch, note);
-
-  const sync = () => {
-    input.value = game.name_source === "user" ? game.display_name : "";
-    reset.hidden = game.name_source !== "user";
-    refetch.hidden = !game.concept_id;
-  };
-  const send = async (path, body, done) => {
-    note.textContent = "";
-    try {
-      Object.assign(game, await api(path, body));
-      sync();
-      onSaved();
-      note.textContent = done;
-    } catch (error) {
-      note.textContent = error.message;
-    }
-  };
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const value = input.value.trim();
-    if (!value) return;
-    send("/api/name", { name: game.name, display_name: value }, "已改名。");
-  });
-  reset.addEventListener("click", () => send("/api/name", { name: game.name, display_name: "" }, "已恢复自动名称。"));
-  refetch.addEventListener("click", () => send("/api/meta/refresh", { name: game.name }, "已排队，稍后自动更新。"));
-  sync();
-  return { form, sync };
+    if (loggedIn) lede.textContent = loginErrorText(error.message);
+    else loginText.textContent = loginErrorText(error.message);
+  }
 }
 
 const sharedMetaFields = ["display_name", "name_source", "store_locale", "catalog_name", "cover_url", "meta_state"];
@@ -455,7 +248,7 @@ function scheduleMetaPoll(reset) {
   if (reset) metaRounds = 0;
   window.clearTimeout(metaTimer);
   metaTimer = 0;
-  const waiting = games.some((game) => game.meta_state === "pending") || (detailGame && detailGame.meta_state === "pending");
+  const waiting = games.some((game) => game.meta_state === "pending") || (detail && detail.game.meta_state === "pending");
   if (!waiting || metaRounds >= 200) return;
   metaTimer = window.setTimeout(pollMeta, 3000);
 }
@@ -464,7 +257,7 @@ async function pollMeta() {
   metaTimer = 0;
   metaRounds += 1;
   const pending = games.filter((game) => game.meta_state === "pending");
-  if (detailGame && detailGame.meta_state === "pending" && !pending.includes(detailGame)) pending.push(detailGame);
+  if (detail && detail.game.meta_state === "pending" && !pending.includes(detail.game)) pending.push(detail.game);
   try {
     const data = await api("/api/meta", { names: pending.map((game) => game.name) });
     let changed = false;
@@ -473,7 +266,7 @@ async function pollMeta() {
       if (!game || game.name !== item.name) return;
       if (item.meta_state !== game.meta_state || item.display_name !== game.display_name || item.cover_url !== game.cover_url) {
         changed = true;
-        if (game === detailGame && detailReload) detailReload();
+        if (detail && detail.game === game) detail.reload();
       }
       Object.assign(game, item);
     });
@@ -484,123 +277,387 @@ async function pollMeta() {
   scheduleMetaPoll(false);
 }
 
-function jobProgressText(job) {
-  if (job.running) {
-    if (job.files_total > 0) return "正在安装 " + job.files_done + " / " + job.files_total;
-    return job.message || "正在读取压缩包…";
+/* 安装任务：一次只有一个，在整个页面里共享 */
+
+function jobText(current) {
+  if (current.running) {
+    if (current.message === "正在取消…") return current.message;
+    if (current.files_total > 0) return `已装 ${current.files_done} / ${current.files_total} 个文件`;
+    return current.message || "正在读取压缩包…";
   }
-  if (job.message) return job.message;
-  if (job.status === "installed" || job.status === "already") return "安装完成";
-  return job.status || "";
+  if (current.message) return current.message;
+  if (current.status === "installed" || current.status === "already") return "安装完成";
+  return current.status || "";
 }
 
-function settledState(job) {
-  if (job.status === "installed" || job.status === "already") return "installed";
-  if (job.status === "interrupted") return "continue";
+function settledState(current) {
+  if (current.status === "installed" || current.status === "already") return "installed";
+  if (current.status === "interrupted") return "continue";
   return "install";
 }
 
-function watchJob(progress, game, refresh) {
-  const tick = async () => {
-    let job;
-    try {
-      job = await api("/api/job");
-    } catch (error) {
-      return;
-    }
-    if (!job.path || job.path !== game.path) return;
-    progress.textContent = jobProgressText(job);
-    if (job.running) {
-      if (game.state !== "installing") {
-        game.state = "installing";
-        refresh();
-      }
-      return;
-    }
-    window.clearInterval(jobTimer);
-    jobTimer = 0;
-    game.state = settledState(job);
-    refresh();
-    loadGames();
-  };
-  window.clearInterval(jobTimer);
-  jobTimer = window.setInterval(tick, 1000);
-  tick();
+// 列表刷新后详情里拿的可能是旧对象，所以按路径找出所有要更新的游戏。
+function applyJob() {
+  if (!job) return;
+  const targets = games.filter((item) => item.path === job.path);
+  const inDetail = detail && detail.game.path === job.path;
+  if (inDetail && !targets.includes(detail.game)) targets.push(detail.game);
+  for (const game of targets) {
+    if (job.running) game.state = "installing";
+    else if (job.status && game.state === "installing") game.state = settledState(job);
+    paintTile(game);
+  }
+  if (inDetail) detail.paint();
+  paintDock(targets[0] || null);
 }
 
-async function startInstall(game, progress, refresh) {
-  progress.textContent = "正在读取压缩包…";
+let dockArtPath = null;
+
+function paintDock(game) {
+  dock.hidden = !dockVisible || !job;
+  if (dock.hidden) return;
+  const state = job.running ? "installing" : job.status === "installed" || job.status === "already" ? "installed" : "error";
+  dock.dataset.state = state;
+  dockTitle.textContent = game ? displayName(game) : job.path.split("/").pop();
+  dockStatus.textContent = jobText(job);
+  if (dockArtPath !== job.path) {
+    dockArtPath = job.path;
+    dockArt.replaceChildren(buildArt(game || { name: dockTitle.textContent }));
+  }
+  dockMeter.style.setProperty("--p", state === "installed" ? 1 : jobFraction());
+  dockAction.textContent = job.running ? "取消" : "关闭";
+  dockAction.disabled = job.running && job.message === "正在取消…";
+}
+
+async function refreshJob() {
+  try {
+    const next = await api("/api/job");
+    const finished = job && job.running && !next.running;
+    job = next;
+    applyJob();
+    if (finished) {
+      stopJobWatch();
+      loadGames();
+    }
+  } catch (error) {
+    // 下一秒再试
+  }
+}
+
+function watchJob() {
+  stopJobWatch();
+  jobTimer = window.setInterval(refreshJob, 1000);
+}
+
+function stopJobWatch() {
+  window.clearInterval(jobTimer);
+  jobTimer = 0;
+}
+
+async function startInstall(game) {
   try {
     await api("/api/install", { path: game.path });
   } catch (error) {
-    progress.textContent = error.message;
+    if (detail && detail.game === game) detail.fail(error.message);
     return;
   }
-  game.state = "installing";
-  refresh();
-  watchJob(progress, game, refresh);
+  job = { running: true, path: game.path, files_done: 0, files_total: 0, message: "正在读取压缩包…" };
+  dockVisible = true;
+  applyJob();
+  watchJob();
 }
 
-const loginButton = document.querySelector("#start-login");
-let loggedIn = false;
+async function cancelInstall() {
+  try {
+    await api("/api/cancel", {});
+    if (job) job.message = "正在取消…";
+    applyJob();
+  } catch (error) {
+    dockStatus.textContent = error.message;
+  }
+}
+
+dockAction.addEventListener("click", () => {
+  if (job && job.running) {
+    cancelInstall();
+    return;
+  }
+  dockVisible = false;
+  paintDock(null);
+});
+
+$("#dock-open").addEventListener("click", () => {
+  const game = job && games.find((item) => item.path === job.path);
+  if (game) openDetail(game);
+});
+
+/* 详情抽屉 */
+
+const actionText = {
+  install: "安装到主机",
+  continue: "继续安装",
+  installed: "已安装到主机",
+  installing: "正在安装…",
+  unsupported: "这种压缩包还不能安装",
+  empty: "目录里没有压缩包",
+  "need-settings": "先到设置里填写存放位置",
+};
+
+function detailFacts(game) {
+  const facts = [];
+  const platform = platformText(game);
+  if (game.title_id) facts.push(game.title_id);
+  if (platform) facts.push(platform);
+  if (regionText[game.region]) facts.push(regionText[game.region]);
+  if (game.formats) facts.push(game.formats.toUpperCase());
+  if (game.archive_bytes) facts.push(formatBytes(game.archive_bytes));
+  return facts;
+}
+
+function nameSourceText(game) {
+  if (game.name_source === "user") return "手动修改";
+  if (game.name_source === "store") return storeLocaleText[game.store_locale] || "商店";
+  if (game.name_source === "catalog") return "PlayStation-Titles 英文名";
+  return "网盘目录名";
+}
+
+function openDetail(game, opener) {
+  closeDetail();
+  detailOverlay.hidden = false;
+  document.body.classList.add("drawer-open");
+  detailBody.replaceChildren();
+
+  const hero = el("div", "hero");
+  const backdrop = el("div", "hero-backdrop");
+  const row = el("div", "hero-row");
+  const artSlot = el("div");
+  const heading = el("div");
+  const title = el("h2");
+  title.id = "detail-title";
+  const facts = el("div", "facts num");
+  heading.append(title, facts);
+  row.append(artSlot, heading);
+  hero.append(backdrop, row);
+
+  const install = el("div", "drawer-section install");
+  const action = el("button", "btn primary");
+  action.type = "button";
+  const progress = el("div", "progress");
+  const progressRow = el("div", "progress-row");
+  const progressText = el("span");
+  progressText.setAttribute("role", "status");
+  const cancel = el("button", "link", "取消安装");
+  cancel.type = "button";
+  progressRow.append(progressText, cancel);
+  const meter = el("span", "meter");
+  meter.append(el("span"));
+  progress.append(meter, progressRow);
+  const status = el("p", "status-text");
+  status.setAttribute("role", "status");
+  install.append(action, progress, status);
+
+  const about = el("div", "drawer-section");
+  const desc = el("p", "desc");
+  const specs = el("dl", "specs");
+  const metaNote = el("p", "meta-note");
+  about.append(desc, specs, metaNote);
+
+  const naming = el("details", "naming");
+  const summary = el("summary", "", "名称与资料");
+  const namingBody = el("div", "naming-body");
+  const origin = el("dl", "specs");
+  const rename = buildRenameForm(game, () => {
+    detail?.paint();
+    shareMeta(game);
+    renderShelf();
+    scheduleMetaPoll(true);
+  });
+  namingBody.append(origin, rename.form);
+  naming.append(summary, namingBody);
+
+  detailBody.append(hero, install, about, naming);
+
+  let coverKey = null;
+  const paint = () => {
+    if (jobFor(game)) game.state = "installing";
+    title.textContent = displayName(game);
+    facts.replaceChildren(...detailFacts(game).map((text) => el("span", "", text)));
+    if (coverKey !== (game.cover_url || "")) {
+      coverKey = game.cover_url || "";
+      artSlot.replaceChildren(buildArt(game, "hero-art"));
+      backdrop.style.backgroundImage = coverKey ? `url("${coverKey}")` : "none";
+    }
+    paintArt(artSlot.firstChild, game);
+
+    const running = jobFor(game);
+    action.textContent = actionText[game.state] || "安装到主机";
+    action.classList.toggle("done", game.state === "installed");
+    action.disabled = running || ["installed", "unsupported", "empty"].includes(game.state) ||
+      (game.state !== "need-settings" && !game.formats);
+    progress.hidden = !running;
+    if (running) {
+      progressText.textContent = jobText(job);
+      meter.style.setProperty("--p", jobFraction());
+      cancel.disabled = job.message === "正在取消…";
+    }
+    const finished = job && !job.running && job.path === game.path && job.status;
+    status.hidden = running || !finished;
+    status.className = "status-text" + (finished && settledState(job) !== "installed" ? " warn" : "");
+    if (finished) status.textContent = jobText(job);
+
+    desc.textContent = game.description || "";
+    desc.hidden = !game.description;
+    const rows = [["发行商", game.publisher], ["类型", game.genres], ["发售日期", game.release_date]];
+    specs.replaceChildren(...rows.filter(([, value]) => value).flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]));
+    specs.hidden = specs.childElementCount === 0;
+    metaNote.textContent = game.catalog_matched === false && !metaStateNote[game.meta_state]
+      ? "资料库里没有这款游戏，仍然可以按目录名安装。"
+      : metaStateNote[game.meta_state] || "";
+    metaNote.hidden = !metaNote.textContent;
+    about.hidden = desc.hidden && specs.hidden && metaNote.hidden;
+
+    const originRows = [["名称来源", nameSourceText(game)]];
+    const english = (game.catalog_name || "").trim();
+    if (english && english !== displayName(game)) originRows.push(["英文名", english]);
+    if ((game.name || "").trim()) originRows.push(["网盘目录", game.name]);
+    if (game.concept_id) originRows.push(["Concept ID", String(game.concept_id)]);
+    origin.replaceChildren(...originRows.flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]));
+  };
+
+  action.addEventListener("click", () => {
+    if (game.state === "need-settings") {
+      show("settings");
+      return;
+    }
+    status.hidden = true;
+    startInstall(game);
+  });
+  cancel.addEventListener("click", cancelInstall);
+
+  const reload = () => api("/api/game", { path: game.path }).then((data) => {
+    if (!detail || detail.game !== game) return;
+    Object.assign(game, data);
+    paint();
+    rename.sync();
+  }).catch((error) => {
+    if (detail && detail.game === game) detail.fail(error.message);
+  });
+
+  detail = {
+    game,
+    opener,
+    paint,
+    reload,
+    fail(message) {
+      status.hidden = false;
+      status.className = "status-text warn";
+      status.textContent = message;
+    },
+  };
+  paint();
+  reload();
+  $("#detail-close").focus();
+}
+
+function closeDetail() {
+  if (detailOverlay.hidden) return;
+  detailOverlay.hidden = true;
+  document.body.classList.remove("drawer-open");
+  const opener = detail && detail.opener;
+  detail = null;
+  if (opener && opener.isConnected) opener.focus();
+}
+
+function buildRenameForm(game, onSaved) {
+  const formEl = el("form", "rename");
+  const input = el("input");
+  input.maxLength = 80;
+  input.spellcheck = false;
+  input.placeholder = "自己起个名字";
+  input.setAttribute("aria-label", "自定义名称");
+  const save = el("button", "btn primary small", "改名");
+  save.type = "submit";
+  const actions = el("div", "rename-actions");
+  const reset = el("button", "btn quiet small", "恢复自动名称");
+  reset.type = "button";
+  const refetch = el("button", "btn quiet small", "重新获取商店资料");
+  refetch.type = "button";
+  actions.append(reset, refetch);
+  const note = el("p", "note");
+  note.setAttribute("role", "status");
+  const line = el("div", "rename-line");
+  line.append(input, save);
+  formEl.append(line, actions, note);
+
+  const sync = () => {
+    input.value = game.name_source === "user" ? game.display_name : "";
+    reset.hidden = game.name_source !== "user";
+    refetch.hidden = !game.concept_id;
+    actions.hidden = reset.hidden && refetch.hidden;
+  };
+  const send = async (path, body, done) => {
+    note.textContent = "";
+    note.classList.remove("error");
+    try {
+      Object.assign(game, await api(path, body));
+      sync();
+      onSaved();
+      note.textContent = done;
+    } catch (error) {
+      note.classList.add("error");
+      note.textContent = error.message;
+    }
+  };
+  formEl.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = input.value.trim();
+    if (value) send("/api/name", { name: game.name, display_name: value }, "已改名。");
+  });
+  reset.addEventListener("click", () => send("/api/name", { name: game.name, display_name: "" }, "已恢复自动名称。"));
+  refetch.addEventListener("click", () => send("/api/meta/refresh", { name: game.name }, "已排队，稍后自动更新。"));
+  sync();
+  return { form: formEl, sync };
+}
+
+$("#detail-backdrop").addEventListener("click", closeDetail);
+$("#detail-close").addEventListener("click", closeDetail);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !detailOverlay.hidden) closeDetail();
+});
+
+/* 登录 */
+
+function loginFlowActive() {
+  return !qrWrap.hidden || loginTimer !== 0;
+}
+
+function loginErrorText(message) {
+  if (message === "缺少 PANPLAY_BAIDU_APP_KEY" || message === "缺少 PANPLAY_BAIDU_SECRET_KEY") return missingKeyHint;
+  return message;
+}
 
 function setLoggedIn(on) {
   loggedIn = on;
-  loginButton.hidden = on;
   loginBox.hidden = on && !loginFlowActive();
+  library.hidden = !loginBox.hidden;
+  loginButton.hidden = on;
 }
 
-function updateLede() {
-  if (!loggedIn || loginFlowActive()) return;
-  if (games.length === 0) {
-    lede.textContent = shelfStatus();
-    return;
-  }
-  const hint = shelfStatus().replace(/^已经登录。/, "").trim();
-  lede.textContent = games.length + " 个目录" + (hint ? " · " + hint : "");
-}
-
-function shelfStatus() {
-  if (games.length === 0) return "这个目录里还没有游戏文件夹。";
-  if (games.every((game) => game.state === "need-settings")) return "已经登录。到设置里填写存放位置后才能安装。";
-  return "已经登录。点开封面查看详情和安装状态。";
-}
-
-async function loadGames() {
-  try {
-    const data = await api("/api/games");
-    games = data.games || [];
-    currentPage = 1;
-    setLoggedIn(true);
-    if (!loginFlowActive()) loginText.textContent = shelfStatus();
-    updateLede();
-    renderShelf();
-    scheduleMetaPoll(true);
-  } catch (error) {
-    if (loginFlowActive()) return;
-    if (error.message === "百度未登录") {
-      setLoggedIn(false);
-      games = [];
-      currentPage = 1;
-      renderShelf();
-      loginText.textContent = signedOutHint;
-      return;
-    }
-    if (loggedIn) lede.textContent = loginErrorText(error.message);
-    else loginText.textContent = loginErrorText(error.message);
-  }
+function stopLoginPoll() {
+  window.clearTimeout(loginTimer);
+  loginTimer = 0;
 }
 
 function finishLogin() {
   stopLoginPoll();
-  loginText.textContent = "已经登录。";
-  qr.hidden = true;
+  qrWrap.hidden = true;
   userCode.textContent = "";
+  loginText.textContent = "已经登录，正在读取游戏…";
   loadGames();
 }
 
 async function pollLogin() {
-  pollTimer = 0;
+  loginTimer = 0;
   try {
     const poll = await api("/api/login/poll", {});
     if (poll.done) {
@@ -609,12 +666,12 @@ async function pollLogin() {
     }
     if (poll.expired || poll.error) {
       stopLoginPoll();
+      qrWrap.hidden = true;
       loginText.textContent = loginErrorText(poll.error || "二维码过期了，再显示一次。");
       return;
     }
-    const wait = Math.max(5, poll.retry_after || 5);
-    loginText.textContent = "手机上确认之后，页面会自动进入游戏目录。";
-    pollTimer = window.setTimeout(() => { pollLogin(); }, wait * 1000);
+    loginText.textContent = "在手机上确认后，这里会自动进入游戏库。";
+    loginTimer = window.setTimeout(pollLogin, Math.max(5, poll.retry_after || 5) * 1000);
   } catch (error) {
     stopLoginPoll();
     loginText.textContent = loginErrorText(error.message);
@@ -623,7 +680,6 @@ async function pollLogin() {
 
 async function startLogin() {
   stopLoginPoll();
-  loginBox.hidden = false;
   loginButton.disabled = true;
   loginText.textContent = "正在向百度获取二维码…";
   let challenge;
@@ -633,65 +689,62 @@ async function startLogin() {
     loginButton.disabled = false;
   }
   if (challenge.already) {
-    setLoggedIn(true);
-    qr.hidden = true;
-    loginText.textContent = "已经登录，正在读取游戏目录…";
+    qrWrap.hidden = true;
+    loginText.textContent = "已经登录，正在读取游戏…";
     await loadGames();
     return;
   }
   if (challenge.qrcode_url) {
-    qr.hidden = false;
     qr.src = challenge.qrcode_url;
     qr.alt = "百度登录二维码";
+    qrWrap.hidden = false;
   }
   userCode.textContent = challenge.user_code ? "用户码 " + challenge.user_code : "";
-  loginText.textContent = "用百度 App、百度网盘或微信扫描。确认后会自动进入。";
-  pollTimer = window.setTimeout(() => { pollLogin(); }, Math.max(5, challenge.interval || 5) * 1000);
+  loginText.textContent = "用百度 App、百度网盘或微信扫码。";
+  loginButton.textContent = "换一张二维码";
+  loginTimer = window.setTimeout(pollLogin, Math.max(5, challenge.interval || 5) * 1000);
 }
 
-function formatCatalogTime(unixSeconds) {
-  if (!unixSeconds) return "未知";
+loginButton.addEventListener("click", () => {
+  startLogin().catch((error) => { loginText.textContent = loginErrorText(error.message); });
+});
+
+/* 设置 */
+
+function formatTime(unixSeconds) {
+  if (!unixSeconds || unixSeconds < 0) return "";
   const date = new Date(unixSeconds * 1000);
-  if (Number.isNaN(date.getTime())) return "未知";
-  return date.toLocaleString();
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { hour12: false });
 }
 
 function renderCatalogStatus(info) {
   const sync = info && info.sync ? info.sync : {};
   if (sync.phase === "updating") {
-    catalogStatus.textContent = "游戏库数据：正在后台同步…";
+    catalogStatus.textContent = "正在后台同步…";
     return;
   }
   if (!info || !info.loaded) {
-    catalogStatus.textContent = "游戏库数据：尚未就绪，后台正在首次同步（界面仍可用目录名）。";
+    catalogStatus.textContent = "还没有资料库，后台正在第一次同步。在这之前游戏按目录名显示。";
     return;
   }
-  const parts = [`游戏库数据：已同步 ${info.count.toLocaleString()} 款`];
-  if (info.generated_at) parts.push("上次更新 " + info.generated_at.replace("T", " ").replace("Z", " UTC"));
-  else if (info.file_mtime) parts.push("上次更新 " + formatCatalogTime(info.file_mtime));
-  else if (sync.last_success) parts.push("上次更新 " + formatCatalogTime(sync.last_success));
-  if (info.stale) parts.push("已超过 " + (sync.stale_days || 7) + " 天，将自动重新同步");
-  if (sync.last_error) parts.push("最近同步失败：" + sync.last_error);
-  catalogStatus.textContent = parts.join(" · ");
+  const lines = [`已收录 ${info.count.toLocaleString("zh-CN")} 款游戏。`];
+  const updated = info.generated_at ? info.generated_at.replace("T", " ").replace("Z", " UTC")
+    : formatTime(info.file_mtime) || formatTime(sync.last_success);
+  if (updated) lines.push(`上次更新 ${updated}。`);
+  if (info.stale) lines.push(`已超过 ${sync.stale_days || 7} 天，会自动重新同步。`);
+  if (sync.last_error) lines.push(`最近一次同步失败：${sync.last_error}`);
+  catalogStatus.textContent = lines.join("");
 }
 
-let catalogPollTimer = null;
-
-function stopCatalogPoll() {
-  if (catalogPollTimer) {
-    clearInterval(catalogPollTimer);
-    catalogPollTimer = null;
-  }
-}
+let catalogTimer = 0;
 
 async function loadCatalogStatus() {
   const info = await api("/api/catalog");
   renderCatalogStatus(info);
-  stopCatalogPoll();
+  window.clearInterval(catalogTimer);
+  catalogTimer = 0;
   if (info && info.sync && info.sync.phase === "updating") {
-    catalogPollTimer = setInterval(() => {
-      loadCatalogStatus().catch(() => {});
-    }, 5000);
+    catalogTimer = window.setInterval(() => { loadCatalogStatus().catch(() => {}); }, 5000);
   }
 }
 
@@ -703,68 +756,102 @@ async function loadSettings() {
   await loadCatalogStatus();
 }
 
-detailBackdrop.addEventListener("click", closeDetail);
-detailClose.addEventListener("click", closeDetail);
-detail.addEventListener("click", (event) => event.stopPropagation());
-
-document.querySelector("#show-shelf").addEventListener("click", () => show("shelf"));
-shelfPrev.addEventListener("click", () => goToPage(currentPage - 1));
-shelfNext.addEventListener("click", () => goToPage(currentPage + 1));
-document.querySelector("#show-settings").addEventListener("click", () => {
-  show("settings");
-  loadSettings().catch((error) => { settingsNote.textContent = error.message; });
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const body = {};
+  for (const name of ["app_key", "secret_key", "library_path", "dest", "prefix"]) body[name] = form.elements[name].value;
+  settingsNote.classList.remove("error");
+  try {
+    await api("/api/settings", body);
+    settingsNote.textContent = "已保存。";
+    if (loggedIn) loadGames();
+  } catch (error) {
+    settingsNote.classList.add("error");
+    settingsNote.textContent = error.message;
+  }
 });
+
 catalogReload.addEventListener("click", async () => {
   catalogReload.disabled = true;
-  catalogNote.textContent = "正在重读资料库…";
+  catalogNote.classList.remove("error");
+  catalogNote.textContent = "正在重新加载…";
   try {
-    const info = await api("/api/catalog/reload", {});
-    renderCatalogStatus(info);
-    catalogNote.textContent = "已从磁盘重新加载。";
+    renderCatalogStatus(await api("/api/catalog/reload", {}));
+    catalogNote.textContent = "已重新加载。";
     if (loggedIn) await loadGames();
   } catch (error) {
+    catalogNote.classList.add("error");
     catalogNote.textContent = error.message;
   } finally {
     catalogReload.disabled = false;
   }
 });
-document.querySelector("#start-login").addEventListener("click", () => {
-  startLogin().catch((error) => { loginText.textContent = loginErrorText(error.message); });
-});
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const body = {};
-  for (const name of ["app_key", "secret_key", "library_path", "dest", "prefix"]) body[name] = form.elements[name].value;
-  try {
-    await api("/api/settings", body);
-    settingsNote.textContent = "已保存在这台电脑上。";
-  } catch (error) {
-    settingsNote.textContent = error.message;
+
+/* 导航与筛选 */
+
+function show(view) {
+  closeDetail();
+  shelfView.hidden = view !== "shelf";
+  settingsView.hidden = view !== "settings";
+  for (const [selector, name] of [["#show-shelf", "shelf"], ["#show-settings", "settings"]]) {
+    if (name === view) $(selector).setAttribute("aria-current", "page");
+    else $(selector).removeAttribute("aria-current");
   }
+  if (view === "settings") {
+    settingsNote.textContent = "";
+    loadSettings().catch((error) => {
+      settingsNote.classList.add("error");
+      settingsNote.textContent = error.message;
+    });
+  }
+  window.scrollTo(0, 0);
+}
+
+$("#show-shelf").addEventListener("click", () => show("shelf"));
+$("#show-settings").addEventListener("click", () => show("settings"));
+
+search.addEventListener("input", () => {
+  query = search.value.trim().toLowerCase();
+  if (shelfView.hidden) show("shelf");
+  renderShelf();
 });
 
+for (const button of filterButtons) {
+  button.addEventListener("click", () => {
+    filter = button.dataset.filter;
+    for (const other of filterButtons) other.setAttribute("aria-pressed", String(other === button));
+    renderShelf();
+  });
+}
+
+/* 启动 */
+
 async function boot() {
-  loginText.textContent = "正在确认登录…";
   loginButton.disabled = true;
   try {
     const session = await api("/api/session");
-    setLoggedIn(!!session.logged_in);
     if (!session.logged_in) {
-      loginBox.hidden = false;
+      setLoggedIn(false);
       loginText.textContent = signedOutHint;
-      loginButton.disabled = false;
       return;
     }
-    setLoggedIn(true);
-    lede.textContent = "正在读取游戏目录…";
-    loginText.textContent = "已经登录，正在读取游戏目录…";
+    try {
+      job = await api("/api/job");
+    } catch (error) {
+      job = null;
+    }
     await loadGames();
+    if (job && job.running) {
+      dockVisible = true;
+      applyJob();
+      watchJob();
+    }
   } catch (error) {
+    setLoggedIn(false);
+    loginText.textContent = loginErrorText(error.message);
+  } finally {
     loginButton.disabled = false;
-    if (loggedIn) lede.textContent = loginErrorText(error.message);
-    else loginText.textContent = loginErrorText(error.message);
   }
 }
 
-loadSettings().catch(() => {});
 boot();
