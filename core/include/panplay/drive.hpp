@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -88,5 +89,27 @@ struct BaiduConfig {
 };
 
 std::unique_ptr<DrivePlugin> make_baidu_drive(BaiduConfig config);
+
+// 插件在设置页要用户填的一项参数。
+struct DriveField {
+  std::string key;
+  std::string label;
+  bool secret = false;
+  std::string hint;
+};
+
+struct DriveKind {
+  std::string id;
+  std::string name;
+  std::string intro;
+  std::vector<DriveField> fields;
+};
+
+// 随版本发布的全部网盘插件，第一个是默认插件。
+const std::vector<DriveKind>& drive_kinds();
+const DriveKind* find_drive_kind(const std::string& id);
+// values 按 DriveField::key 取值。id 不认识时返回空指针。
+std::unique_ptr<DrivePlugin> make_drive(const std::string& id, const std::map<std::string, std::string>& values,
+                                        const std::string& session_path);
 
 }  // namespace panplay

@@ -35,25 +35,99 @@
 
 namespace {
 
-std::string session_path() { return (panplay::app_data_dir() / "baidu-session.json").u8string(); }
+std::filesystem::path login_challenge_file() { return panplay::app_data_dir() / "login-challenge.json"; }
 
-// 进程内只留一个百度插件实例，下载地址缓存和令牌刷新都在它里面；密钥改了才换新实例。
+// 进程内只留一个网盘插件实例，下载地址缓存和令牌刷新都在它里面；换插件或改了参数才换新实例。
 std::shared_ptr<panplay::DrivePlugin> open_drive() {
   static std::mutex mu;
   static std::shared_ptr<panplay::DrivePlugin> drive;
   static std::string key;
   const AppSettings settings = load_settings();
-  const std::string wanted = settings.app_key + "\n" + settings.secret_key;
+  const DriveSettings current = settings.current_drive();
+  std::string wanted = settings.drive;
+  for (const auto& [name, value] : current.values) wanted += "\n" + name + "=" + value;
   std::lock_guard<std::mutex> lock(mu);
   if (!drive || key != wanted) {
-    panplay::BaiduConfig config;
-    config.app_key = settings.app_key;
-    config.secret_key = settings.secret_key;
-    config.session_path = session_path();
-    drive = panplay::make_baidu_drive(std::move(config));
+    drive = panplay::make_drive(settings.drive, current.values, drive_session_path(settings.drive));
     key = wanted;
   }
   return drive;
+}
+
+// 设置页要的全部内容：可选的插件和它们各自的参数，以及保存方式。
+std::string settings_json(const AppSettings& settings) {
+  using panplay::json_escape;
+  std::string json = "{\"drive\":\"" + json_escape(settings.drive) + "\",\"drives\":[";
+  bool first_kind = true;
+  for (const auto& kind : panplay::drive_kinds()) {
+    if (!first_kind) json += ",";
+    first_kind = false;
+    const auto saved = settings.drives.find(kind.id);
+    const DriveSettings drive = saved == settings.drives.end() ? DriveSettings{} : saved->second;
+    json += "{\"id\":\"" + json_escape(kind.id) + "\",\"name\":\"" + json_escape(kind.name) + "\",\"intro\":\"" +
+            json_escape(kind.intro) + "\",\"library_path\":\"" + json_escape(drive.library_path) + "\",\"fields\":[";
+    for (std::size_t i = 0; i < kind.fields.size(); ++i) {
+      const auto& field = kind.fields[i];
+      const auto value = drive.values.find(field.key);
+      if (i > 0) json += ",";
+      json += "{\"key\":\"" + json_escape(field.key) + "\",\"label\":\"" + json_escape(field.label) +
+              "\",\"secret\":" + (field.secret ? "true" : "false") + ",\"hint\":\"" + json_escape(field.hint) +
+              "\",\"value\":\"" + json_escape(value == drive.values.end() ? "" : value->second) + "\"}";
+    }
+    json += "]}";
+  }
+  json += "],\"target\":\"" + json_escape(settings.target) + "\",\"targets\":[";
+  const auto modes = target_modes();
+  for (std::size_t i = 0; i < modes.size(); ++i) json += (i > 0 ? ",\"" : "\"") + modes[i] + "\"";
+  json += "],\"local_dir\":\"" + json_escape(settings.local_dir) + "\",\"ftp_host\":\"" + json_escape(settings.ftp_host) +
+          "\",\"ftp_port\":\"" + json_escape(settings.ftp_port) + "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) + "\"}";
+  return json;
+}
+
+std::string trimmed(std::string value) {
+  const auto begin = value.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos) return "";
+  return value.substr(begin, value.find_last_not_of(" \t\r\n") - begin + 1);
+}
+
+// 只改当前插件那一份参数，其他插件的保持不动。返回不合格的原因。
+std::string apply_settings(const panplay::Json& json, AppSettings* settings) {
+  const panplay::DriveKind* kind = panplay::find_drive_kind(json.str("drive"));
+  if (kind == nullptr) return "不认识这个网盘插件";
+  const auto modes = target_modes();
+  const std::string mode = json.str("target");
+  if (std::find(modes.begin(), modes.end(), mode) == modes.end()) return "这台设备不支持这种保存方式";
+
+  DriveSettings& drive = settings->drives[kind->id];
+  const std::string library_path = trimmed(json.str("library_path"));
+  if (!library_path.empty() && library_path.front() != '/') return "游戏库目录要以 / 开头";
+  if (!library_path.empty()) drive.library_path = library_path;
+  if (const panplay::Json* values = json.get("values")) {
+    for (const auto& field : kind->fields) {
+      if (values->get(field.key) != nullptr) drive.values[field.key] = trimmed(values->str(field.key));
+    }
+  }
+
+  std::string host = trimmed(json.str("ftp_host"));
+  if (host.rfind("ftp://", 0) == 0) host = host.substr(6);
+  while (!host.empty() && host.back() == '/') host.pop_back();
+  const std::string port = trimmed(json.str("ftp_port"));
+  const std::string ftp_dir = trimmed(json.str("ftp_dir"));
+  if (mode == "ftp" && !host.empty()) {
+    const bool digits = !port.empty() && port.size() <= 5 &&
+                        std::all_of(port.begin(), port.end(), [](unsigned char c) { return std::isdigit(c); });
+    if (!digits || std::stoi(port) < 1 || std::stoi(port) > 65535) return "端口要是 1 到 65535 之间的数字";
+    if (host.find_first_of(":/ ") != std::string::npos) return "主机地址只填 IP 或主机名，端口单独填";
+  }
+  if (!ftp_dir.empty() && ftp_dir.front() != '/') return "主机目录要以 / 开头";
+
+  settings->drive = kind->id;
+  settings->target = mode;
+  settings->local_dir = trimmed(json.str("local_dir"));
+  settings->ftp_host = host;
+  if (!port.empty()) settings->ftp_port = port;
+  if (!ftp_dir.empty()) settings->ftp_dir = ftp_dir;
+  return "";
 }
 
 std::filesystem::path ui_root() {
@@ -353,7 +427,7 @@ std::mutex shelf_mu;
 std::shared_ptr<const ShelfListing> shelf_cache;
 
 std::string shelf_key(const AppSettings& settings) {
-  return settings.library_path + "\n" + settings.dest + "\n" + settings.prefix;
+  return settings.drive + "\n" + settings.library_path() + "\n" + settings.dest() + "\n" + settings.prefix();
 }
 
 // 游戏库列表读到的主机安装情况，还没读过或设置变了时为空。
@@ -367,22 +441,24 @@ std::shared_ptr<const ShelfListing> shelf_listing(panplay::DrivePlugin& drive, b
   const std::string key = shelf_key(settings);
   std::lock_guard<std::mutex> lock(shelf_mu);
   if (!fresh && shelf_cache && shelf_cache->key == key) return shelf_cache;
-  const auto children = drive.list(settings.library_path, error);
+  const std::string library_path = settings.library_path();
+  const auto children = drive.list(library_path, error);
   if (!error->empty()) return nullptr;
   auto listing = std::make_shared<ShelfListing>();
   listing->key = key;
   for (const auto& child : children) {
     if (!child.is_dir) continue;
-    const std::string path = child.path.empty() ? panplay::join_storage_path(settings.library_path, child.name) : child.path;
+    const std::string path = child.path.empty() ? panplay::join_storage_path(library_path, child.name) : child.path;
     listing->folders.push_back({child.name, path, panplay::find_title_id(child.name)});
   }
   panplay::Destination destination;
   std::string dest_error;
-  listing->dest_ready = !settings.dest.empty() && panplay::parse_destination(settings.dest, &destination, &dest_error);
+  const std::string dest = settings.dest();
+  listing->dest_ready = !dest.empty() && panplay::parse_destination(dest, &destination, &dest_error);
   if (listing->dest_ready) {
     if (auto sink = panplay::open_destination(destination, &dest_error)) {
       listing->sink_ready = true;
-      listing->placement = read_shelf_placement(*sink, settings.prefix);
+      listing->placement = read_shelf_placement(*sink, settings.prefix());
     }
   }
   shelf_cache = listing;
@@ -488,12 +564,13 @@ std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) 
   } else {
     std::unique_ptr<panplay::InstallSink> sink;
     panplay::Destination destination;
-    if (!settings.dest.empty() && panplay::parse_destination(settings.dest, &destination, &error)) {
+    const std::string dest = settings.dest();
+    if (!dest.empty() && panplay::parse_destination(dest, &destination, &error)) {
       sink = panplay::open_destination(destination, &error);
     }
     if (sink) state = archive_problem(game);
-    if (sink && state.empty()) state = game_state(*sink, settings.prefix, game);
-    else if (!sink && !settings.dest.empty()) state = "install";
+    if (sink && state.empty()) state = game_state(*sink, settings.prefix(), game);
+    else if (!sink && !dest.empty()) state = "install";
   }
   const auto queued = queue_states();
   if (queued.count(path) != 0) state = queued.at(path);
@@ -545,7 +622,7 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
     const AppSettings settings = load_settings();
     std::string error;
     panplay::Destination destination;
-    if (!panplay::parse_destination(settings.dest, &destination, &error)) {
+    if (settings.dest().empty() || !panplay::parse_destination(settings.dest(), &destination, &error)) {
       result.status = "error";
       result.message = error.empty() ? "先在设置里填写存放位置" : error;
     } else {
@@ -556,7 +633,7 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
       } else {
         panplay::InstallRequest request;
         request.source_dir = path;
-        request.dest_prefix = settings.prefix;
+        request.dest_prefix = settings.prefix();
         request.on_progress = publish_progress;
         request.cancel = cancel;
         result = panplay::install_game(*drive, *sink, request);
@@ -899,12 +976,7 @@ void handle_client(SOCKET client) {
     return;
   }
   if (method == "GET" && target == "/api/settings") {
-    const AppSettings settings = load_settings();
-    reply_json(client, 200,
-               "{\"app_key\":\"" + panplay::json_escape(settings.app_key) + "\",\"secret_key\":\"" +
-                   panplay::json_escape(settings.secret_key) + "\",\"library_path\":\"" +
-                   panplay::json_escape(settings.library_path) + "\",\"dest\":\"" + panplay::json_escape(settings.dest) +
-                   "\",\"prefix\":\"" + panplay::json_escape(settings.prefix) + "\"}");
+    reply_json(client, 200, settings_json(load_settings()));
     return;
   }
   if (method == "POST" && target == "/api/settings") {
@@ -915,13 +987,11 @@ void handle_client(SOCKET client) {
       return;
     }
     AppSettings settings = load_settings();
-    if (!json.str("app_key").empty() || body.find("app_key") != std::string::npos) settings.app_key = json.str("app_key");
-    if (!json.str("secret_key").empty() || body.find("secret_key") != std::string::npos) {
-      settings.secret_key = json.str("secret_key");
+    std::string invalid = apply_settings(json, &settings);
+    if (!invalid.empty()) {
+      reply_json(client, 400, json_error(invalid));
+      return;
     }
-    if (!json.str("library_path").empty()) settings.library_path = json.str("library_path");
-    if (body.find("dest") != std::string::npos) settings.dest = json.str("dest");
-    if (!json.str("prefix").empty()) settings.prefix = json.str("prefix");
     const std::string error = save_settings(settings);
     reply_json(client, error.empty() ? 200 : 500, error.empty() ? "{\"ok\":true}" : json_error(error));
     return;
@@ -942,7 +1012,7 @@ void handle_client(SOCKET client) {
       reply_json(client, 400, json_error(challenge.error));
       return;
     }
-    std::ofstream out(std::filesystem::path(session_path()).parent_path() / "login-challenge.json", std::ios::trunc);
+    std::ofstream out(login_challenge_file(), std::ios::trunc);
     out << "{\"device_code\":\"" << panplay::json_escape(challenge.device_code) << "\",\"interval\":"
         << challenge.interval_seconds << ",\"expires_in\":" << challenge.expires_in << ",\"qrcode_url\":\""
         << panplay::json_escape(challenge.qrcode_url) << "\",\"user_code\":\"" << panplay::json_escape(challenge.user_code)
@@ -959,7 +1029,7 @@ void handle_client(SOCKET client) {
       reply_json(client, 200, "{\"done\":true,\"expired\":false,\"error\":\"\",\"retry_after\":0}");
       return;
     }
-    std::ifstream in(std::filesystem::path(session_path()).parent_path() / "login-challenge.json");
+    std::ifstream in(login_challenge_file());
     std::stringstream buffer;
     buffer << in.rdbuf();
     const panplay::Json saved = panplay::Json::parse(buffer.str(), nullptr);

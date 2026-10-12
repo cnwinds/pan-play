@@ -36,7 +36,7 @@ const catalogNote = $("#catalog-note");
 const catalogReload = $("#catalog-reload");
 
 const signedOutHint = "登录后才能看到网盘里的游戏。";
-const missingKeyHint = "先到设置里填写 AppKey 和 SecretKey 并保存。";
+const missingKeyHint = "先到设置里填好网盘插件的参数并保存。";
 const regionText = { UP: "美服", EP: "欧服", JP: "日服", HP: "港服", KP: "韩服", IP: "国际服" };
 const storeLocaleText = { "zh-hans-hk": "港服商店（简体）", "zh-hant-hk": "港服商店（繁体）", "en-us": "美服商店" };
 const metaStateNote = {
@@ -1053,18 +1053,96 @@ async function loadCatalogStatus() {
   }
 }
 
+// 每个插件的参数先记在这里，切换插件再切回来时还在。
+let driveDrafts = new Map();
+let currentDrive = "";
+
+function rememberDrive() {
+  const draft = driveDrafts.get(currentDrive);
+  if (!draft) return;
+  draft.library_path = form.elements.library_path.value;
+  for (const field of draft.fields) field.value = form.elements["drive:" + field.key].value;
+}
+
+function renderDrive(id) {
+  rememberDrive();
+  currentDrive = id;
+  const draft = driveDrafts.get(id);
+  const box = $("#drive-fields");
+  box.replaceChildren();
+  for (const field of draft.fields) {
+    const label = el("label", "field", field.label);
+    const input = el("input");
+    input.name = "drive:" + field.key;
+    input.type = field.secret ? "password" : "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.value = field.value || "";
+    label.append(input);
+    if (field.hint) label.append(el("span", "hint", field.hint));
+    box.append(label);
+  }
+  form.elements.library_path.value = draft.library_path || "";
+  for (const radio of form.querySelectorAll('input[name="drive"]')) radio.checked = radio.value === id;
+}
+
+function renderDriveChoices(drives) {
+  const box = $("#drive-choices");
+  box.replaceChildren();
+  for (const drive of drives) {
+    const card = el("label", "choice-card");
+    const radio = el("input");
+    radio.type = "radio";
+    radio.name = "drive";
+    radio.value = drive.id;
+    radio.addEventListener("change", () => renderDrive(drive.id));
+    card.append(radio, el("strong", "", drive.name));
+    if (drive.intro) card.append(el("span", "", drive.intro));
+    box.append(card);
+  }
+}
+
+function renderTarget(mode) {
+  for (const radio of form.querySelectorAll('input[name="target"]')) radio.checked = radio.value === mode;
+  for (const group of form.querySelectorAll("[data-target]")) group.hidden = group.dataset.target !== mode;
+}
+
 async function loadSettings() {
   const settings = await api("/api/settings");
-  for (const name of ["app_key", "secret_key", "library_path", "dest", "prefix"]) {
-    form.elements[name].value = settings[name] || "";
+  driveDrafts = new Map(settings.drives.map((drive) => [drive.id, {
+    library_path: drive.library_path,
+    fields: drive.fields.map((field) => ({ ...field })),
+  }]));
+  currentDrive = "";
+  renderDriveChoices(settings.drives);
+  renderDrive(settings.drive);
+
+  const targets = settings.targets || [];
+  $("#target-choice").hidden = targets.length < 2;
+  for (const radio of form.querySelectorAll('input[name="target"]')) {
+    radio.closest(".choice-card").hidden = !targets.includes(radio.value);
   }
+  form.elements.local_dir.placeholder = targets.includes("ftp") ? "D:\\PS5 游戏" : "/mnt/usb0/homebrew";
+  for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) form.elements[name].value = settings[name] || "";
+  renderTarget(settings.target);
   await loadCatalogStatus();
+}
+
+for (const radio of form.querySelectorAll('input[name="target"]')) {
+  radio.addEventListener("change", () => renderTarget(radio.value));
 }
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const body = {};
-  for (const name of ["app_key", "secret_key", "library_path", "dest", "prefix"]) body[name] = form.elements[name].value;
+  rememberDrive();
+  const draft = driveDrafts.get(currentDrive);
+  const body = {
+    drive: currentDrive,
+    library_path: draft.library_path,
+    values: Object.fromEntries(draft.fields.map((field) => [field.key, field.value])),
+    target: form.querySelector('input[name="target"]:checked')?.value || "",
+  };
+  for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) body[name] = form.elements[name].value;
   settingsNote.classList.remove("error");
   try {
     await api("/api/settings", body);

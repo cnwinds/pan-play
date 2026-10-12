@@ -90,8 +90,6 @@ int serve(int argc, char** argv) {
   return run_server(options);
 }
 
-std::string session_path() { return (panplay::app_data_dir() / "baidu-session.json").u8string(); }
-
 void print_usage() {
   std::cout << "盘游 Panplay\n"
             << "  panplay serve [端口] [--lan]   --lan 让局域网里的手机也能打开，要访问口令\n"
@@ -128,17 +126,13 @@ int self_test() {
   return 0;
 }
 
-std::unique_ptr<panplay::DrivePlugin> open_baidu() {
+std::unique_ptr<panplay::DrivePlugin> open_drive() {
   const AppSettings settings = load_settings();
-  panplay::BaiduConfig config;
-  config.app_key = settings.app_key;
-  config.secret_key = settings.secret_key;
-  config.session_path = session_path();
-  return panplay::make_baidu_drive(std::move(config));
+  return panplay::make_drive(settings.drive, settings.current_drive().values, drive_session_path(settings.drive));
 }
 
 int login() {
-  auto drive = open_baidu();
+  auto drive = open_drive();
   panplay::LoginChallenge challenge = drive->start_login();
   if (!challenge.error.empty()) {
     std::cerr << challenge.error << "\n";
@@ -168,7 +162,7 @@ int login() {
 }
 
 int list_dir(const std::string& path) {
-  auto drive = open_baidu();
+  auto drive = open_drive();
   std::string error;
   std::vector<panplay::DriveEntry> entries = drive->list(path, &error);
   if (!error.empty()) {
@@ -182,7 +176,7 @@ int list_dir(const std::string& path) {
 }
 
 int read_range(const std::string& file_id, const std::string& offset_text, const std::string& length_text) {
-  auto drive = open_baidu();
+  auto drive = open_drive();
   const auto offset = std::stoll(offset_text);
   const auto length = static_cast<std::size_t>(std::stoll(length_text));
   panplay::ReadResult result = drive->read_at(file_id, offset, length);
@@ -228,7 +222,7 @@ int bench_prefetch_download(panplay::DrivePlugin& drive, const panplay::DriveEnt
 }
 
 int bench_download(const std::string& dir, int seconds, int connections, int block_mb) {
-  auto drive = open_baidu();
+  auto drive = open_drive();
   std::string error;
   const auto entries = drive->list(dir, &error);
   if (!error.empty()) {
@@ -334,11 +328,11 @@ int main(int argc, char** argv) {
   if (command == "login") return login();
   if (command == "ls") return list_dir(argc >= 3 ? argv[2] : "/");
   if (command == "scan") {
-    auto drive = open_baidu();
+    auto drive = open_drive();
     return panplay::run_scan_cli(*drive, argc >= 3 ? argv[2] : "/");
   }
   if (command == "install") {
-    auto drive = open_baidu();
+    auto drive = open_drive();
     return panplay::run_install_cli(*drive, argc, argv);
   }
   if (command == "read" && argc >= 5) return read_range(argv[2], argv[3], argv[4]);

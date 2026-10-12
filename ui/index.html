@@ -58,34 +58,64 @@
   <main id="settings-view" class="view settings" hidden>
     <h1>设置</h1>
     <form id="settings-form" class="settings-form">
-      <section class="settings-section" aria-labelledby="set-baidu">
+      <section class="settings-section" aria-labelledby="set-drive">
         <div class="settings-intro">
-          <h2 id="set-baidu">百度网盘</h2>
-          <p>AppKey 和 SecretKey 在百度网盘开放平台创建应用后得到，只保存在这台电脑上。</p>
+          <h2 id="set-drive">网盘</h2>
+          <p>游戏从哪个网盘读取。每个网盘的参数和登录分开保存，换来换去不会丢。</p>
         </div>
         <div class="fields">
-          <label class="field">AppKey<input name="app_key" autocomplete="off" spellcheck="false"></label>
-          <label class="field">SecretKey<input name="secret_key" type="password" autocomplete="off" spellcheck="false"></label>
+          <fieldset class="choice">
+            <legend>网盘插件</legend>
+            <div class="choices" id="drive-choices"></div>
+          </fieldset>
+          <div class="fields" id="drive-fields"></div>
           <label class="field">游戏库目录
             <input name="library_path" placeholder="/游戏资源/PS5" spellcheck="false">
             <span class="hint">网盘里放游戏文件夹的目录，每个子文件夹算一个游戏。</span>
           </label>
         </div>
       </section>
-      <section class="settings-section" aria-labelledby="set-console">
+      <section class="settings-section" aria-labelledby="set-target">
         <div class="settings-intro">
-          <h2 id="set-console">主机</h2>
-          <p>游戏会边下载边解压，直接写到这里。</p>
+          <h2 id="set-target">存放位置</h2>
+          <p>游戏边下载边解压，直接写到这里，中间不留压缩包。</p>
         </div>
         <div class="fields">
-          <label class="field">存放位置
-            <input name="dest" placeholder="ftp://192.168.1.20:2121" spellcheck="false">
-            <span class="hint">PS5 的 FTP 地址，也可以填这台电脑上的目录。</span>
-          </label>
-          <label class="field">主机目录
-            <input name="prefix" placeholder="/mnt/usb0/homebrew" spellcheck="false">
-            <span class="hint">每个游戏装到这个目录下以 Title ID 命名的文件夹里。</span>
-          </label>
+          <fieldset class="choice" id="target-choice">
+            <legend>保存方式</legend>
+            <div class="choices">
+              <label class="choice-card">
+                <input type="radio" name="target" value="local">
+                <strong>本机文件夹</strong>
+                <span>装到运行盘游的这台设备上</span>
+              </label>
+              <label class="choice-card">
+                <input type="radio" name="target" value="ftp">
+                <strong>FTP 发送到主机</strong>
+                <span>通过局域网写进 PS5 的 FTP</span>
+              </label>
+            </div>
+          </fieldset>
+          <div class="fields" data-target="local">
+            <label class="field">文件夹
+              <input name="local_dir" placeholder="D:\PS5 游戏" spellcheck="false">
+              <span class="hint">每个游戏装到这个文件夹下以 Title ID 命名的子文件夹里。</span>
+            </label>
+          </div>
+          <div class="fields" data-target="ftp">
+            <div class="field-row">
+              <label class="field">主机地址
+                <input name="ftp_host" placeholder="192.168.1.20" spellcheck="false" autocomplete="off">
+              </label>
+              <label class="field port">端口
+                <input name="ftp_port" placeholder="2121" inputmode="numeric" autocomplete="off">
+              </label>
+            </div>
+            <label class="field">主机目录
+              <input name="ftp_dir" placeholder="/mnt/usb0/homebrew" spellcheck="false">
+              <span class="hint">每个游戏装到主机这个目录下以 Title ID 命名的文件夹里。</span>
+            </label>
+          </div>
         </div>
       </section>
       <div class="settings-actions">
