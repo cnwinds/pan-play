@@ -18,6 +18,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,16 +32,14 @@ struct VolumeState {
   std::int64_t size = 0;
   std::int64_t pos = 0;
   std::unique_ptr<panplay::PrefetchReader> reader;
-  std::vector<std::uint8_t> window;
-  std::int64_t window_start = -1;
 };
 
 struct RarSession {
   panplay::DrivePlugin* drive = nullptr;
   const panplay::CancelToken* cancel = nullptr;
   panplay::PrefetchOptions prefetch;
-  // 列目录时只读文件头，在文件之间跳着读，每次取一小段，不开长连接。
-  bool random_access = false;
+  std::function<void(std::int64_t)> on_bytes;
+  std::chrono::steady_clock::time_point bytes_reported{};
   std::vector<VolumeState> volumes;
   int index = 0;
   std::vector<wchar_t> name_buf;
@@ -231,30 +231,24 @@ std::string open_archive(SessionGuard& guard, unsigned int mode, HANDLE* handle)
   return "";
 }
 
-int read_window(VolumeState& volume, std::uint8_t* out, std::size_t size) {
-  constexpr std::size_t kWindow = 64u << 10;
-  const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), volume.size - volume.pos));
-  const std::int64_t window_end = volume.window_start + static_cast<std::int64_t>(volume.window.size());
-  if (volume.window_start < 0 || volume.pos < volume.window_start || volume.pos + static_cast<std::int64_t>(want) > window_end) {
-    if (session->cancel && session->cancel->cancelled()) {
-      session->read_error = panplay::kInterrupted;
-      return -1;
-    }
-    const auto length = static_cast<std::size_t>(
-        std::min<std::int64_t>(static_cast<std::int64_t>(std::max(want, kWindow)), volume.size - volume.pos));
-    panplay::ReadResult result = session->drive->read_at(volume.file_id, volume.pos, length);
-    if (!result.error.empty()) {
-      session->read_error = result.error;
-      return -1;
-    }
-    volume.window = std::move(result.bytes);
-    volume.window_start = volume.pos;
+// 已读到整组分卷的哪个位置，算进度用。
+std::int64_t archive_position() {
+  std::int64_t position = 0;
+  for (int i = 0; i < session->index && static_cast<std::size_t>(i) < session->volumes.size(); ++i) {
+    position += session->volumes[static_cast<std::size_t>(i)].size;
   }
-  const auto offset = static_cast<std::size_t>(volume.pos - volume.window_start);
-  const std::size_t n = std::min(want, volume.window.size() - offset);
-  std::memcpy(out, volume.window.data() + offset, n);
-  volume.pos += static_cast<std::int64_t>(n);
-  return static_cast<int>(n);
+  if (static_cast<std::size_t>(session->index) < session->volumes.size()) {
+    position += session->volumes[static_cast<std::size_t>(session->index)].pos;
+  }
+  return position;
+}
+
+void report_bytes(bool force) {
+  if (!session->on_bytes) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (!force && now - session->bytes_reported < std::chrono::milliseconds(500)) return;
+  session->bytes_reported = now;
+  session->on_bytes(archive_position());
 }
 
 std::string process_failure(const std::string& fallback) {
@@ -272,7 +266,6 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
   }
   VolumeState& volume = session->volumes[static_cast<std::size_t>(session->index)];
   if (volume.pos >= volume.size || size == 0) return 0;
-  if (session->random_access) return read_window(volume, static_cast<std::uint8_t*>(data), size);
   if (!volume.reader) {
     volume.reader = std::make_unique<panplay::PrefetchReader>(*session->drive, volume.file_id, volume.size, session->cancel,
                                                               session->prefetch);
@@ -303,6 +296,7 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
     filled += got;
   }
   volume.pos += static_cast<std::int64_t>(filled);
+  report_bytes(false);
   return static_cast<int>(filled);
 }
 
@@ -330,63 +324,13 @@ extern "C" long long panplay_unrar_tell(void) {
 
 namespace panplay {
 
-std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& parts, const CancelToken* cancel,
-                             std::vector<ListedRarEntry>* entries) {
-  SessionGuard guard(drive, parts, cancel, PrefetchOptions{});
-  guard.state.random_access = true;
-  const auto listed_at = std::chrono::steady_clock::now();
-  struct Trace {
-    std::chrono::steady_clock::time_point started;
-    ~Trace() {
-      if (std::getenv("PANPLAY_TRACE") == nullptr) return;
-      std::cerr << "rar 列目录 " << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << " 秒\n";
-    }
-  } trace{listed_at};
-  HANDLE handle = nullptr;
-  if (auto error = open_archive(guard, RAR_OM_LIST, &handle); !error.empty()) return error;
-  while (true) {
-    RARHeaderDataEx header{};
-    const int code = RARReadHeaderEx(handle, &header);
-    if (code == ERAR_END_ARCHIVE) break;
-    if (code != ERAR_SUCCESS) {
-      RARCloseArchive(handle);
-      return process_failure("读取 RAR 文件头失败");
-    }
-    if ((header.Flags & RHDF_ENCRYPTED) != 0) {
-      RARCloseArchive(handle);
-      return "RAR 有密码，这一版不能安装";
-    }
-    if (is_stream_entry(raw_header_name(header))) {
-      if (RARProcessFileW(handle, RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
-        RARCloseArchive(handle);
-        return process_failure("读取 RAR 目录失败");
-      }
-      continue;
-    }
-    std::string name_error;
-    ListedRarEntry entry;
-    entry.name = header_name(header, &name_error);
-    if (!name_error.empty()) {
-      RARCloseArchive(handle);
-      return name_error;
-    }
-    entry.directory = (header.Flags & RHDF_DIRECTORY) != 0 || (!entry.name.empty() && entry.name.back() == '/');
-    entry.solid = (header.Flags & RHDF_SOLID) != 0;
-    entry.crc = header.FileCRC;
-    entry.size = unpacked_size(header);
-    entries->push_back(std::move(entry));
-    if (RARProcessFileW(handle, RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
-      RARCloseArchive(handle);
-      return process_failure("读取 RAR 目录失败");
-    }
-  }
-  RARCloseArchive(handle);
-  return "";
-}
-
 std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
-                                const RarExtract& options, std::vector<FinishedFile>* done) {
+                                const RarExtract& options, std::vector<FinishedFile>* done,
+                                std::vector<ListedRarEntry>* listed) {
   SessionGuard guard(drive, parts, options.cancel, options.prefetch);
+  guard.state.on_bytes = options.on_bytes;
+  std::map<std::string, std::pair<std::int64_t, std::uint32_t>> finished_before;
+  for (const auto& file : *done) finished_before[file.name] = {file.size, file.crc};
   const auto started = std::chrono::steady_clock::now();
   struct Trace {
     RarSession& state;
@@ -434,26 +378,15 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       failure = name_error;
       break;
     }
-    const std::string& root = options.game_root;
-    if (!root.empty()) {
-      const bool inside = name.compare(0, root.size(), root) == 0 && name.size() > root.size();
-      if (!inside) {
-        if (RARProcessFileW(handle, solid ? RAR_TEST : RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
-          failure = process_failure("解压 RAR 失败");
-          break;
-        }
-        continue;
-      }
-      name.erase(0, root.size());
-    }
     const bool directory = (header.Flags & RHDF_DIRECTORY) != 0 || (!name.empty() && name.back() == '/');
     const std::uint64_t size = unpacked_size(header);
-    bool already = false;
-    for (const auto& file : *done) {
-      if (file.name == name && file.size == static_cast<std::int64_t>(size) && file.crc == header.FileCRC) already = true;
-    }
+    listed->push_back(ListedRarEntry{name, directory, solid, header.FileCRC, size});
+    const std::string staged = options.staging_prefix + name;
+    const auto before = finished_before.find(staged);
+    const bool already = before != finished_before.end() && before->second.first == static_cast<std::int64_t>(size) &&
+                         before->second.second == header.FileCRC;
     if (!directory && !already) {
-      writer.out = std::make_unique<OutputFile>(sink, join_storage_path(options.staging_root, name),
+      writer.out = std::make_unique<OutputFile>(sink, join_storage_path(options.staging_root, staged),
                                                 options.stop_after_output_bytes, options.written);
     }
     const int operation = directory || (already && !solid) ? RAR_SKIP : RAR_TEST;
@@ -470,18 +403,22 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       failure = process_failure("解压 RAR 失败: " + name);
       break;
     }
+    report_bytes(false);
     if (!writer.out) continue;
     failure = writer.out->finish();
     if (!failure.empty()) break;
-    if (writer.out->size() != static_cast<std::int64_t>(size) || writer.out->crc() != header.FileCRC) {
+    // 跨卷文件的文件头里是本卷那段数据的 CRC，不是整个文件的；整个文件的 CRC 已由 UnRAR 在最后一卷校验过。
+    const bool split = (header.Flags & RHDF_SPLITAFTER) != 0;
+    if (writer.out->size() != static_cast<std::int64_t>(size) || (!split && writer.out->crc() != header.FileCRC)) {
       failure = "校验和不符: " + name;
       break;
     }
-    const FinishedFile finished{name, static_cast<std::int64_t>(size), header.FileCRC};
+    const FinishedFile finished{staged, static_cast<std::int64_t>(size), header.FileCRC};
     done->push_back(finished);
-    failure = append_journal(sink, options.journal_path, finished);
+    failure = options.journal->add(finished);
     if (failure.empty() && options.on_file_done) options.on_file_done(*done);
   }
+  if (failure.empty()) report_bytes(true);
   writer.out.reset();
   active_write = nullptr;
   RARCloseArchive(handle);

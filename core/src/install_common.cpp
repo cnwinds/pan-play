@@ -100,10 +100,29 @@ std::string write_journal(InstallSink& sink, const std::string& path, const std:
   return sink.store(path, reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
 }
 
-std::string append_journal(InstallSink& sink, const std::string& path, const FinishedFile& file) {
-  if (auto error = sink.ensure_dir(parent_path(path)); !error.empty()) return error;
-  const std::string line = journal_line(file);
-  return sink.append(path, reinterpret_cast<const std::uint8_t*>(line.data()), line.size());
+JournalWriter::JournalWriter(InstallSink& sink, std::string path) : sink_(sink), path_(std::move(path)) {}
+
+JournalWriter::~JournalWriter() { flush(); }
+
+std::string JournalWriter::add(const FinishedFile& file) {
+  pending_ += journal_line(file);
+  ++pending_count_;
+  const auto now = std::chrono::steady_clock::now();
+  if (pending_count_ < kBatchFiles && now - last_flush_ < std::chrono::seconds(1)) return "";
+  return flush();
+}
+
+std::string JournalWriter::flush() {
+  last_flush_ = std::chrono::steady_clock::now();
+  if (pending_.empty()) return "";
+  if (!dir_ready_) {
+    if (auto error = sink_.ensure_dir(parent_path(path_)); !error.empty()) return error;
+    dir_ready_ = true;
+  }
+  const std::string text = std::move(pending_);
+  pending_.clear();
+  pending_count_ = 0;
+  return sink_.append(path_, reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
 }
 
 }  // namespace panplay

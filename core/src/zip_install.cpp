@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <set>
 
 namespace panplay {
@@ -28,6 +29,8 @@ struct ZipVolume {
 struct Member {
   int set_index = 0;
   std::string name;
+  // 在暂存区里的路径：压缩包内原路径，多个压缩包时前面加 "<序号>/"。
+  std::string staged;
   bool directory = false;
   std::uint16_t method = 0;
   std::uint32_t crc = 0;
@@ -313,7 +316,9 @@ std::string read_zip_members(DrivePlugin& drive, const std::vector<ZipVolume>& v
   return "";
 }
 
-std::string marker_json(const std::string& title_id, const std::string& plugin, std::vector<Member> members) {
+// 安装标记里的 source 是网盘上各个压缩包文件的名字和大小。再次安装时只比对它，不用为了比对去读压缩包。
+std::string marker_json(const std::string& title_id, const std::string& plugin, const std::string& source,
+                        std::vector<Member> members) {
   std::sort(members.begin(), members.end(), [](const Member& left, const Member& right) { return left.name < right.name; });
   std::string json = "{\"entries\":[";
   bool first = true;
@@ -324,15 +329,31 @@ std::string marker_json(const std::string& title_id, const std::string& plugin, 
     json += "{\"crc32\":" + std::to_string(member.crc) + ",\"name\":\"" + json_escape(member.name) +
             "\",\"size\":" + std::to_string(member.uncomp_size) + "}";
   }
-  json += "],\"plugin\":\"" + json_escape(plugin) + "\",\"title_id\":\"" + json_escape(title_id) + "\"}";
+  json += "],\"plugin\":\"" + json_escape(plugin) + "\",\"source\":\"" + json_escape(source) + "\",\"title_id\":\"" +
+          json_escape(title_id) + "\"}";
   return json;
+}
+
+std::string source_signature(const std::vector<ArchiveSet>& sets) {
+  std::vector<std::string> parts;
+  for (const auto& set : sets) {
+    for (const auto& part : set.parts) parts.push_back(part.name + ":" + std::to_string(part.size));
+  }
+  std::sort(parts.begin(), parts.end());
+  std::string signature;
+  for (const auto& part : parts) {
+    if (!signature.empty()) signature += "|";
+    signature += part;
+  }
+  return signature;
 }
 
 // PS5 只认 homebrew/<游戏>/sce_sys 这一层。压缩包里游戏外面常包着一两层目录（如 PPSA05106-app0/），
 // 找出 sce_sys 所在的那层作为游戏根目录，安装时去掉外层；没有 sce_sys 时去掉所有文件共有的外层目录。
-// 返回的根目录带结尾斜杠，为空表示压缩包本身就是一层。
-std::string find_game_root(const std::vector<Member>& members, std::string* root) {
+// 返回的根目录带结尾斜杠，为空表示压缩包本身就是一层。has_param 表示根目录下有 param.json/param.sfo，即完整游戏而不是补丁。
+std::string find_game_root(const std::vector<Member>& members, std::string* root, bool* has_param) {
   root->clear();
+  *has_param = false;
   std::set<std::string> with_param;
   std::set<std::string> with_sys;
   for (const auto& member : members) {
@@ -361,6 +382,7 @@ std::string find_game_root(const std::vector<Member>& members, std::string* root
       return "压缩包里有多个游戏目录（" + shallowest[0] + "、" + shallowest[1] + "），不知道该装哪个";
     }
     *root = shallowest.front();
+    *has_param = !with_param.empty();
     return "";
   }
   while (true) {
@@ -411,23 +433,22 @@ void remove_stale(InstallSink& sink, const std::string& final_root, const std::v
   for (const auto& dir : ordered) sink.remove_dir(join_storage_path(final_root, dir));
 }
 
-bool already_done(const std::vector<FinishedFile>& done, const Member& member) {
-  for (const auto& file : done) {
-    if (file.name == member.name && file.size == static_cast<std::int64_t>(member.uncomp_size) && file.crc == member.crc) {
-      return true;
-    }
-  }
-  return false;
-}
-
 struct ExtractContext {
   InstallSink& sink;
   std::string staging_root;
-  std::string journal_path;
+  JournalWriter& journal;
   std::int64_t* written;
   std::int64_t stop;
   const CancelToken* cancel;
+  // 上次已校验过的暂存文件：暂存路径 -> 大小、CRC。
+  std::map<std::string, std::pair<std::int64_t, std::uint32_t>> finished_before;
 };
+
+bool already_done(const ExtractContext& context, const Member& member) {
+  const auto found = context.finished_before.find(member.staged);
+  return found != context.finished_before.end() && found->second.first == static_cast<std::int64_t>(member.uncomp_size) &&
+         found->second.second == member.crc;
+}
 
 bool cancelled(const CancelToken* cancel) { return cancel != nullptr && cancel->cancelled(); }
 
@@ -480,8 +501,8 @@ std::string copy_member(ZipStream& stream, const Member& member, OutputFile& out
 }
 
 std::string extract_member(ZipStream& stream, ExtractContext& context, const Member& member, std::vector<FinishedFile>* done) {
-  if (member.directory) return context.sink.ensure_dir(join_storage_path(context.staging_root, member.name));
-  if (already_done(*done, member)) return "";
+  if (member.directory) return "";
+  if (already_done(context, member)) return "";
   if (context.stop >= 0 && *context.written >= context.stop) return kInterrupted;
   if (cancelled(context.cancel)) return kInterrupted;
 
@@ -491,15 +512,15 @@ std::string extract_member(ZipStream& stream, ExtractContext& context, const Mem
   if (read_u32(header) != kLocalHeader) return "ZIP 文件头和目录对不上: " + member.name;
   if (auto error = stream.skip(read_u16(header + 26) + read_u16(header + 28)); !error.empty()) return error;
 
-  OutputFile out(context.sink, join_storage_path(context.staging_root, member.name), context.stop, context.written);
+  OutputFile out(context.sink, join_storage_path(context.staging_root, member.staged), context.stop, context.written);
   if (auto error = copy_member(stream, member, out, context.cancel); !error.empty()) return error;
   if (auto error = out.finish(); !error.empty()) return error;
   if (out.size() != static_cast<std::int64_t>(member.uncomp_size) || out.crc() != member.crc) {
     return "校验和不符: " + member.name;
   }
-  const FinishedFile finished{member.name, static_cast<std::int64_t>(member.uncomp_size), member.crc};
+  const FinishedFile finished{member.staged, static_cast<std::int64_t>(member.uncomp_size), member.crc};
   done->push_back(finished);
-  return append_journal(context.sink, context.journal_path, finished);
+  return context.journal.add(finished);
 }
 
 std::string finish_install(InstallSink& sink, const std::string& staging_root, const std::string& final_root,
@@ -509,7 +530,7 @@ std::string finish_install(InstallSink& sink, const std::string& staging_root, c
       if (auto error = sink.ensure_dir(join_storage_path(final_root, member.name)); !error.empty()) return error;
       continue;
     }
-    const std::string from = join_storage_path(staging_root, member.name);
+    const std::string from = join_storage_path(staging_root, member.staged);
     const std::string to = join_storage_path(final_root, member.name);
     std::string error;
     const std::int64_t staged = sink.file_size(from, &error);
@@ -529,14 +550,16 @@ std::string finish_install(InstallSink& sink, const std::string& staging_root, c
   return sink.store(marker_path, reinterpret_cast<const std::uint8_t*>(marker.data()), marker.size());
 }
 
-// 安装完成后暂存区只剩日志和空目录。清理失败不影响安装结果，下次安装会再清一次。
+// 搬完后暂存区只剩日志、没搬走的文件（游戏目录外的、被补丁覆盖的）和空目录。
+// staged 是解压过的全部暂存路径，leftovers 是其中没搬走的文件。清理失败不影响安装结果，下次安装会再清一次。
 void clean_staging(InstallSink& sink, const std::string& staging_root, const std::string& journal_path,
-                   const std::vector<Member>& members) {
+                   const std::vector<std::string>& staged, const std::vector<std::string>& leftovers) {
+  for (const auto& file : leftovers) sink.remove_file(join_storage_path(staging_root, file));
   std::set<std::string> dirs;
-  for (const auto& member : members) {
-    std::string name = member.name;
+  for (const auto& path : staged) {
+    std::string name = path;
     while (!name.empty() && name.back() == '/') name.pop_back();
-    if (!member.directory) {
+    {
       const auto slash = name.find_last_of('/');
       name = slash == std::string::npos ? "" : name.substr(0, slash);
     }
@@ -570,12 +593,14 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     return result;
   }
 
-  const auto report = [&](const std::string& message, int done, int total) {
+  const auto report = [&](const std::string& message) {
     if (!request.on_progress) return;
     InstallResult snapshot;
     snapshot.message = message;
-    snapshot.files_done = done;
-    snapshot.files_total = total;
+    snapshot.files_done = result.files_done;
+    snapshot.files_total = result.files_total;
+    snapshot.bytes_done = result.bytes_done;
+    snapshot.bytes_total = result.bytes_total;
     request.on_progress(snapshot);
   };
   const auto fail = [&](const std::string& message) {
@@ -583,7 +608,12 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     result.message = message == kInterrupted ? "已中断，再次执行安装会继续" : message;
     return result;
   };
-  report("正在读取压缩包…", 0, 0);
+  const auto interrupted = [&]() {
+    result.status = "interrupted";
+    result.message = "已中断，已完成 " + std::to_string(result.files_done) + " 个文件，再次执行安装会继续";
+    return result;
+  };
+  report("正在读取压缩包…");
 
   std::string error;
   const auto files = collect_archives(drive, request.source_dir, &error);
@@ -599,65 +629,60 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   }
   if (zips.empty() && rars.empty()) return fail(other ? "还不能安装 7z" : "这个目录里没有压缩包");
 
-  std::vector<std::vector<ZipVolume>> zip_sets;
-  std::vector<Member> members;
-  for (std::size_t i = 0; i < zips.size(); ++i) {
-    zip_sets.push_back(zip_volumes(zips[i].parts));
-    if (auto zip_error = read_zip_members(drive, zip_sets.back(), static_cast<int>(i), &members); !zip_error.empty()) {
+  // 每个压缩包（可能分卷）各自原样解压到暂存区，最后按各自的游戏根目录合并。
+  // 多个压缩包时各占暂存区里的 "<序号>/" 子目录，免得同名文件互相覆盖。
+  struct Source {
+    bool rar = false;
+    const ArchiveSet* set = nullptr;
+    std::vector<ZipVolume> volumes;
+    std::vector<Member> members;
+    std::string prefix;
+    std::int64_t start = 0;
+    std::string root;
+    bool has_param = false;
+  };
+  std::vector<Source> sources;
+  for (const auto& set : zips) sources.push_back(Source{false, &set});
+  for (const auto& set : rars) sources.push_back(Source{true, &set});
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    Source& source = sources[i];
+    source.prefix = sources.size() > 1 ? std::to_string(i + 1) + "/" : "";
+    source.start = result.bytes_total;
+    for (const auto& part : source.set->parts) result.bytes_total += part.size;
+    if (source.rar) continue;
+    source.volumes = zip_volumes(source.set->parts);
+    if (auto zip_error = read_zip_members(drive, source.volumes, static_cast<int>(i), &source.members); !zip_error.empty()) {
       return fail(zip_error);
     }
-  }
-  for (std::size_t i = 0; i < rars.size(); ++i) {
-    std::vector<ListedRarEntry> entries;
-    if (auto list_error = list_rar_entries(drive, rars[i].parts, request.cancel, &entries); !list_error.empty()) {
-      return fail(list_error);
-    }
-    for (const auto& entry : entries) {
-      Member member;
-      member.set_index = -1;
-      member.name = entry.name;
-      member.directory = entry.directory;
-      member.crc = entry.crc;
-      member.uncomp_size = entry.size;
-      members.push_back(std::move(member));
+    for (auto& member : source.members) member.staged = source.prefix + member.name;
+    if (auto root_error = find_game_root(source.members, &source.root, &source.has_param); !root_error.empty()) {
+      return fail(root_error);
     }
   }
-  std::string game_root;
-  if (auto root_error = find_game_root(members, &game_root); !root_error.empty()) return fail(root_error);
-  int outside = 0;
-  if (!game_root.empty()) {
-    std::vector<Member> inside;
-    for (auto& member : members) {
-      if (member.name.compare(0, game_root.size(), game_root) != 0) {
-        if (!member.directory) ++outside;
-        continue;
-      }
-      member.name.erase(0, game_root.size());
-      if (!member.name.empty()) inside.push_back(std::move(member));
-    }
-    members = std::move(inside);
-  }
-  std::set<std::string> names;
-  for (const auto& member : members) {
-    if (member.directory) continue;
-    if (!names.insert(member.name).second) return fail("压缩包里有重复文件");
-    ++result.files_total;
-  }
+  std::vector<ArchiveSet> archives = zips;
+  archives.insert(archives.end(), rars.begin(), rars.end());
+  const std::string signature = source_signature(archives);
 
   const std::string staging_root = join_storage_path(request.dest_prefix, ".panplay-staging/" + folder);
   const std::string final_root = join_storage_path(request.dest_prefix, folder);
   const std::string marker_path = join_storage_path(final_root, ".panplay-done.json");
   const std::string journal_path = join_storage_path(staging_root, ".panplay-journal.jsonl");
-  const std::string expected = marker_json(title_id, drive.id(), members);
 
   std::vector<std::uint8_t> existing;
-  error = sink.read_file(marker_path, &existing, 1 << 20);
+  error = sink.read_file(marker_path, &existing, 256u << 20);
   if (error.empty()) {
-    if (std::string(existing.begin(), existing.end()) == expected) {
-      clean_staging(sink, staging_root, journal_path, members);
+    std::string parse_error;
+    const Json old = Json::parse(std::string(existing.begin(), existing.end()), &parse_error);
+    const Json* entries = old.get("entries");
+    if (parse_error.empty() && entries != nullptr && old.str("source") == signature && old.str("plugin") == drive.id()) {
+      sink.remove_file(journal_path);
+      sink.remove_dir(staging_root);
+      sink.remove_dir(parent_path(staging_root));
       result.status = "already";
       result.message = "已安装 " + folder;
+      result.files_total = static_cast<int>(entries->array.size());
       result.files_done = result.files_total;
+      result.bytes_done = result.bytes_total;
       return result;
     }
   } else if (error != "missing") {
@@ -669,69 +694,128 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   if (sink.file_size(journal_path, &error) >= 0) {
     if (auto write_error = write_journal(sink, journal_path, done); !write_error.empty()) return fail(write_error);
   }
-
-  // 日志里可能留着旧版本写入、现在已不属于文件清单的条目，只数当前清单里的文件。
-  const auto count_done = [&](const std::vector<FinishedFile>& list) {
-    int count = 0;
-    for (const auto& file : list) {
-      if (names.count(file.name) != 0) ++count;
-    }
-    return count;
-  };
-  result.files_done = count_done(done);
-  report("正在安装", result.files_done, result.files_total);
+  result.files_done = static_cast<int>(done.size());
+  report("正在安装");
 
   std::int64_t written = 0;
-  ExtractContext context{sink, staging_root, journal_path, &written, request.stop_after_output_bytes, request.cancel};
-  for (std::size_t i = 0; i < zip_sets.size(); ++i) {
+  JournalWriter journal(sink, journal_path);
+  ExtractContext context{sink, staging_root, journal, &written, request.stop_after_output_bytes, request.cancel, {}};
+  for (const auto& file : done) context.finished_before[file.name] = {file.size, file.crc};
+  for (auto& source : sources) {
+    if (source.rar) {
+      RarExtract options;
+      options.staging_root = staging_root;
+      options.journal = &journal;
+      options.written = &written;
+      options.stop_after_output_bytes = request.stop_after_output_bytes;
+      options.cancel = request.cancel;
+      options.prefetch = request.prefetch;
+      options.staging_prefix = source.prefix;
+      options.on_file_done = [&](const std::vector<FinishedFile>& now_done) {
+        result.files_done = static_cast<int>(now_done.size());
+        report("正在安装");
+      };
+      options.on_bytes = [&](std::int64_t bytes) {
+        result.bytes_done = source.start + bytes;
+        report("正在安装");
+      };
+      std::vector<ListedRarEntry> listed;
+      error = extract_rar_entries(drive, sink, source.set->parts, options, &done, &listed);
+      result.files_done = static_cast<int>(done.size());
+      if (error == kInterrupted) return interrupted();
+      if (!error.empty()) return fail(error);
+      for (const auto& entry : listed) {
+        Member member;
+        member.set_index = -1;
+        member.name = entry.name;
+        member.staged = source.prefix + entry.name;
+        member.directory = entry.directory;
+        member.crc = entry.crc;
+        member.uncomp_size = entry.size;
+        source.members.push_back(std::move(member));
+      }
+      if (auto root_error = find_game_root(source.members, &source.root, &source.has_param); !root_error.empty()) {
+        return fail(root_error);
+      }
+      continue;
+    }
     std::vector<const Member*> ordered;
-    for (const auto& member : members) {
-      if (member.set_index == static_cast<int>(i)) ordered.push_back(&member);
+    for (const auto& member : source.members) {
+      if (member.name.compare(0, source.root.size(), source.root) == 0) ordered.push_back(&member);
     }
     std::sort(ordered.begin(), ordered.end(),
               [](const Member* left, const Member* right) { return left->local_offset < right->local_offset; });
-    ZipStream stream(drive, zip_sets[i], request.cancel, request.prefetch);
+    ZipStream stream(drive, source.volumes, request.cancel, request.prefetch);
     for (const Member* member : ordered) {
       error = extract_member(stream, context, *member, &done);
-      result.files_done = count_done(done);
-      if (!error.empty()) {
-        if (error == kInterrupted) {
-          result.status = "interrupted";
-          result.message = "已中断，已完成 " + std::to_string(result.files_done) + " 个文件，再次执行安装会继续";
-          return result;
-        }
-        return fail(error);
-      }
-      report("正在安装", result.files_done, result.files_total);
+      result.files_done = static_cast<int>(done.size());
+      if (error == kInterrupted) return interrupted();
+      if (!error.empty()) return fail(error);
+      result.bytes_done = source.start + member->local_offset + static_cast<std::int64_t>(member->comp_size);
+      report("正在安装");
     }
-  }
-  for (const auto& rar : rars) {
-    RarExtract options;
-    options.staging_root = staging_root;
-    options.journal_path = journal_path;
-    options.written = &written;
-    options.stop_after_output_bytes = request.stop_after_output_bytes;
-    options.cancel = request.cancel;
-    options.prefetch = request.prefetch;
-    options.game_root = game_root;
-    options.on_file_done = [&](const std::vector<FinishedFile>& now_done) {
-      result.files_done = count_done(now_done);
-      report("正在安装", result.files_done, result.files_total);
-    };
-    error = extract_rar_entries(drive, sink, rar.parts, options, &done);
-    result.files_done = count_done(done);
-    if (error == kInterrupted) {
-      result.status = "interrupted";
-      result.message = "已中断，已完成 " + std::to_string(result.files_done) + " 个文件，再次执行安装会继续";
-      return result;
-    }
-    if (!error.empty()) return fail(error);
   }
 
+  // 收尾会删掉日志，所以先把攒着的写完，免得析构时又把日志写回暂存区。
+  if (auto flush_error = journal.flush(); !flush_error.empty()) return fail(flush_error);
+
+  // 带 param 的是游戏本体，其余（如固件补丁）按各自的根目录覆盖上去。
+  std::vector<const Source*> games;
+  for (const auto& source : sources) {
+    if (source.has_param) games.push_back(&source);
+  }
+  if (games.size() > 1) {
+    return fail("压缩包里有多个游戏目录（" + games[0]->set->parts.front().name + "、" + games[1]->set->parts.front().name +
+                "），不知道该装哪个");
+  }
+  std::vector<const Source*> layers = games;
+  for (const auto& source : sources) {
+    if (!source.has_param) layers.push_back(&source);
+  }
+  std::vector<Member> members;
+  std::map<std::string, std::pair<std::size_t, const Source*>> placed;
+  std::vector<std::string> staged;
+  std::vector<std::string> leftovers;
+  int outside = 0;
+  for (const Source* source : layers) {
+    for (const auto& member : source->members) {
+      if (!member.directory) staged.push_back(member.staged);
+      if (member.name.compare(0, source->root.size(), source->root) != 0) {
+        if (member.directory) continue;
+        ++outside;
+        if (source->rar) leftovers.push_back(member.staged);
+        continue;
+      }
+      Member final_member = member;
+      final_member.name.erase(0, source->root.size());
+      if (final_member.name.empty()) continue;
+      const auto found = placed.find(final_member.name);
+      if (found == placed.end()) {
+        placed[final_member.name] = {members.size(), source};
+        members.push_back(std::move(final_member));
+        continue;
+      }
+      Member& earlier = members[found->second.first];
+      if (earlier.directory && final_member.directory) continue;
+      const bool patch_over_game = found->second.second->has_param && !source->has_param;
+      if (earlier.directory != final_member.directory || !patch_over_game) return fail("压缩包里有重复文件");
+      leftovers.push_back(earlier.staged);
+      earlier = std::move(final_member);
+      found->second.second = source;
+    }
+  }
+  result.files_total = 0;
+  for (const auto& member : members) {
+    if (!member.directory) ++result.files_total;
+  }
+  result.bytes_done = result.bytes_total;
+  report("正在收尾");
+
+  const std::string expected = marker_json(title_id, drive.id(), signature, members);
   error = finish_install(sink, staging_root, final_root, members, expected, marker_path);
   if (!error.empty()) return fail(error);
   if (!existing.empty()) remove_stale(sink, final_root, existing, members);
-  clean_staging(sink, staging_root, journal_path, members);
+  clean_staging(sink, staging_root, journal_path, staged, leftovers);
   result.status = "installed";
   result.files_done = result.files_total;
   result.message = "已安装 " + folder + "，" + std::to_string(result.files_done) + " 个文件";

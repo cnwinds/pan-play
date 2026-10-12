@@ -328,6 +328,8 @@ void publish_progress(const panplay::InstallResult& snapshot) {
   job.result.message = snapshot.message;
   job.result.files_done = snapshot.files_done;
   job.result.files_total = snapshot.files_total;
+  job.result.bytes_done = snapshot.bytes_done;
+  job.result.bytes_total = snapshot.bytes_total;
 }
 
 void run_install(std::string path, std::shared_ptr<panplay::CancelToken> cancel) {
@@ -668,7 +670,9 @@ void handle_client(SOCKET client) {
                std::string("{\"running\":") + (job.running ? "true" : "false") + ",\"path\":\"" +
                    panplay::json_escape(job.path) + "\",\"status\":\"" + panplay::json_escape(job.result.status) +
                    "\",\"message\":\"" + panplay::json_escape(job.result.message) + "\",\"files_done\":" +
-                   std::to_string(job.result.files_done) + ",\"files_total\":" + std::to_string(job.result.files_total) + "}");
+                   std::to_string(job.result.files_done) + ",\"files_total\":" + std::to_string(job.result.files_total) +
+                   ",\"bytes_done\":" + std::to_string(job.result.bytes_done) +
+                   ",\"bytes_total\":" + std::to_string(job.result.bytes_total) + "}");
     return;
   }
   if (method == "POST" && target == "/api/install") {

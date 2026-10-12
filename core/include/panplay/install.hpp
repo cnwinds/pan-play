@@ -18,6 +18,9 @@ struct InstallResult {
   std::string message;
   int files_done = 0;
   int files_total = 0;
+  // 按压缩包读到的位置算的进度。RAR 要解压完才知道有多少文件，安装中 files_total 可能一直是 0。
+  std::int64_t bytes_done = 0;
+  std::int64_t bytes_total = 0;
 };
 
 struct InstallRequest {
@@ -51,22 +54,27 @@ struct FinishedFile {
   std::uint32_t crc = 0;
 };
 
+class JournalWriter;
+
 struct RarExtract {
   std::string staging_root;
-  std::string journal_path;
+  JournalWriter* journal = nullptr;
   std::int64_t* written = nullptr;
   std::int64_t stop_after_output_bytes = -1;
   const CancelToken* cancel = nullptr;
   PrefetchOptions prefetch;
-  // 只解压这个目录（带结尾斜杠）里的内容，并去掉这层前缀；为空表示全部原样解压。
-  std::string game_root;
+  // 解压到暂存区时加在压缩包内路径前面（带结尾斜杠）；进度日志里记的也是加了前缀的名字。
+  std::string staging_prefix;
   std::function<void(const std::vector<FinishedFile>& done)> on_file_done;
+  // 已读到整组分卷的第几个字节。
+  std::function<void(std::int64_t archive_bytes)> on_bytes;
 };
 
-std::string list_rar_entries(DrivePlugin& drive, const std::vector<DriveEntry>& parts, const CancelToken* cancel,
-                             std::vector<ListedRarEntry>* entries);
+// 一遍读完整组分卷：全部解压到暂存区，同时把压缩包里的条目按原路径记到 listed。
+// 没有单独列目录这一步，因为没有快速打开记录的 RAR 列目录要逐个文件跳着读，小文件多时比解压还慢。
 std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
-                                const RarExtract& options, std::vector<FinishedFile>* done);
+                                const RarExtract& options, std::vector<FinishedFile>* done,
+                                std::vector<ListedRarEntry>* listed);
 
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request);
 bool parse_destination(const std::string& text, Destination* destination, std::string* error);

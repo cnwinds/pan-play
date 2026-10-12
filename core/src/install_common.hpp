@@ -3,6 +3,7 @@
 #include "panplay/install.hpp"
 #include "panplay/sink.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -42,6 +43,26 @@ class OutputFile {
 std::vector<FinishedFile> load_journal(InstallSink& sink, const std::string& path);
 // 每次开始安装时整份重写一次，去掉上次中断留下的半行，之后只追加。
 std::string write_journal(InstallSink& sink, const std::string& path, const std::vector<FinishedFile>& done);
-std::string append_journal(InstallSink& sink, const std::string& path, const FinishedFile& file);
+
+// 往进度日志追加已校验的文件。在 FTP 上每次追加都要开一条数据连接，所以攒够一批
+// 或隔一秒才写一次；析构时写掉剩下的。中断时最多丢最近一批，那几个文件续装时重新解压。
+class JournalWriter {
+ public:
+  JournalWriter(InstallSink& sink, std::string path);
+  ~JournalWriter();
+  JournalWriter(const JournalWriter&) = delete;
+  JournalWriter& operator=(const JournalWriter&) = delete;
+  std::string add(const FinishedFile& file);
+  std::string flush();
+
+ private:
+  static constexpr int kBatchFiles = 100;
+  InstallSink& sink_;
+  std::string path_;
+  std::string pending_;
+  int pending_count_ = 0;
+  bool dir_ready_ = false;
+  std::chrono::steady_clock::time_point last_flush_ = std::chrono::steady_clock::now();
+};
 
 }  // namespace panplay

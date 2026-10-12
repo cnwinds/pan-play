@@ -132,8 +132,14 @@ function buildArt(game, className) {
 }
 
 function jobFraction() {
-  if (!job || !job.files_total) return 0;
+  if (!job) return 0;
+  if (job.bytes_total) return Math.min(1, job.bytes_done / job.bytes_total);
+  if (!job.files_total) return 0;
   return Math.min(1, job.files_done / job.files_total);
+}
+
+function jobStarted(current) {
+  return Boolean(current && (current.bytes_total || current.files_total));
 }
 
 function jobFor(game) {
@@ -145,7 +151,7 @@ function paintArt(art, game) {
   const installing = jobFor(game);
   art.style.setProperty("--p", installing ? jobFraction() : 0);
   const label = art.querySelector(".fill span");
-  if (label) label.textContent = installing && job.files_total ? Math.round(jobFraction() * 100) + "%" : "…";
+  if (label) label.textContent = installing && jobStarted(job) ? Math.round(jobFraction() * 100) + "%" : "…";
   art.querySelector(".badge")?.remove();
   if (game.state === "installed") art.append(el("span", "badge installed", "已安装"));
   if (game.state === "continue") art.append(el("span", "badge continue", "未装完"));
@@ -282,6 +288,10 @@ async function pollMeta() {
 function jobText(current) {
   if (current.running) {
     if (current.message === "正在取消…") return current.message;
+    if (current.message === "正在收尾") return `正在收尾，共 ${current.files_total} 个文件`;
+    if (current.bytes_total > 0 && current.message === "正在安装") {
+      return `已处理 ${formatBytes(current.bytes_done)} / ${formatBytes(current.bytes_total)} · ${current.files_done} 个文件`;
+    }
     if (current.files_total > 0) return `已装 ${current.files_done} / ${current.files_total} 个文件`;
     return current.message || "正在读取压缩包…";
   }

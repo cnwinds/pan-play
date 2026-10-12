@@ -214,8 +214,10 @@ class CountingSink final : public InstallSink {
     return inner_.store(path, data, size);
   }
   std::string append(const std::string& path, const std::uint8_t* data, std::size_t size) override {
+    ++appends_;
     return inner_.append(path, data, size);
   }
+  int appends() const { return appends_; }
   std::string rename_path(const std::string& from, const std::string& to) override { return inner_.rename_path(from, to); }
   std::string read_file(const std::string& path, std::vector<std::uint8_t>* out, std::size_t max_bytes) override {
     return inner_.read_file(path, out, max_bytes);
@@ -230,6 +232,7 @@ class CountingSink final : public InstallSink {
   InstallSink& inner_;
   std::map<std::string, int> writes_;
   int writers_ = 0;
+  int appends_ = 0;
 };
 
 // 只记大小的存放位置，大文件不落盘。1 MB 以内的文件保留内容，方便读回进度日志和完成标记。
@@ -775,6 +778,7 @@ int many_files_test() {
   if (drive.read_at_calls > 4) return fail("读 ZIP 目录用了 " + std::to_string(drive.read_at_calls.load()) + " 次随机读");
   if (drive.stream_opens > 2) return fail("顺序解压打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
   if (sink.writers_opened() != 3000) return fail("每个文件应该只开一次写入流");
+  if (sink.appends() > 3000 / 100 + 5) return fail("进度日志追加了 " + std::to_string(sink.appends()) + " 次，没有攒批");
   const auto& sample = memory.files["/mnt/usb0/homebrew/CUSA30000/file2999.bin"];
   if (sample.bytes != inputs.back().data) return fail("最后一个文件内容不对");
   return 0;
@@ -1002,8 +1006,30 @@ int run_install_pipeline_self_test() {
     std::ifstream wrap_in(wrap_rar, std::ios::binary);
     wrap_bytes.assign(std::istreambuf_iterator<char>(wrap_in), {});
   }
+  const auto split_dir = rar_dir / "Split";
+  std::filesystem::create_directories(split_dir);
+  const auto split_data = pattern(150000, 5);
+  {
+    std::ofstream big(split_dir / "big.bin", std::ios::binary);
+    big.write(reinterpret_cast<const char*>(split_data.data()), static_cast<std::streamsize>(split_data.size()));
+  }
+  const std::string split_cmd = "\"\"C:\\Program Files\\WinRAR\\Rar.exe\" a -ep -idq -y -ma5 -m0 -v40k \"" +
+                                (split_dir / "split.rar").string() + "\" \"" + (split_dir / "big.bin").string() + "\"\"";
+  if (std::system(split_cmd.c_str()) != 0) return fail("WinRAR 没能生成跨卷测试 RAR");
+  int split_parts = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(split_dir)) {
+    if (entry.path().extension() != ".rar") continue;
+    std::ifstream part_in(entry.path(), std::ios::binary);
+    drive.add("/apps/panplay/Split CUSA66666/" + entry.path().filename().string(),
+              std::vector<std::uint8_t>(std::istreambuf_iterator<char>(part_in), {}));
+    ++split_parts;
+  }
+  if (split_parts < 3) return fail("跨卷测试 RAR 没有切开");
   std::filesystem::remove_all(rar_dir, rar_remove);
   drive.add("/apps/panplay/Wrapped PPSA88888/game.rar", std::move(wrap_bytes));
+  const std::vector<std::uint8_t> fixed_eboot{'e', 'b', 'o', 'o', 't', '-', 'f', 'i', 'x'};
+  drive.add("/apps/panplay/Wrapped PPSA88888/fix.zip",
+            make_zip({{"eboot.bin", fixed_eboot, true}, {"sce_sys/about/right.sprx", pattern(40, 9), false}}, {}).front());
 
   std::string error;
   const auto games = scan_library(drive, "/apps/panplay", &error);
@@ -1099,22 +1125,51 @@ int run_install_pipeline_self_test() {
   }
 
   {
+    auto local = make_local_sink((root / "rar-split").u8string());
+    InstallRequest request;
+    request.source_dir = "/apps/panplay/Split CUSA66666";
+    request.dest_prefix = "/mnt/usb0/homebrew";
+    const InstallResult installed = install_game(drive, *local, request);
+    if (installed.status != "installed") return fail("跨卷文件的 RAR 没装好: " + installed.message);
+    std::vector<std::uint8_t> got;
+    error = local->read_file("/mnt/usb0/homebrew/CUSA66666/big.bin", &got, 1 << 20);
+    if (!error.empty() || got != split_data) return fail("跨卷文件内容不对");
+  }
+
+  {
     const auto local_root = root / "rar-wrap";
     auto local = make_local_sink(local_root.u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Wrapped PPSA88888";
     request.dest_prefix = "/mnt/usb0/homebrew";
+    std::int64_t last_bytes = -1;
+    std::int64_t bytes_total = 0;
+    bool bytes_backwards = false;
+    request.on_progress = [&](const InstallResult& snapshot) {
+      if (snapshot.bytes_done < last_bytes) bytes_backwards = true;
+      last_bytes = snapshot.bytes_done;
+      bytes_total = snapshot.bytes_total;
+    };
     const InstallResult installed = install_game(drive, *local, request);
-    if (installed.status != "installed" || installed.files_total != 2) return fail("带外层目录的 RAR 没装好: " + installed.message);
+    if (installed.status != "installed" || installed.files_total != 3) {
+      return fail("带外层目录的 RAR 加补丁没装好: " + installed.message);
+    }
+    if (bytes_total <= 0 || last_bytes != bytes_total || bytes_backwards) return fail("按字节的安装进度不对");
     std::vector<std::uint8_t> got;
     error = local->read_file("/mnt/usb0/homebrew/PPSA88888/eboot.bin", &got, 100);
-    if (!error.empty() || std::string(got.begin(), got.end()) != "eboot-ok") return fail("RAR 的游戏根目录没有上移到第一层");
+    if (!error.empty() || got != fixed_eboot) return fail("补丁里的 eboot.bin 没有覆盖游戏本体的");
     const auto game_dir = local_root / "mnt" / "usb0" / "homebrew" / "PPSA88888";
     if (!std::filesystem::exists(game_dir / "sce_sys" / "param.json")) return fail("RAR 的 sce_sys 不在第一层");
+    if (!std::filesystem::exists(game_dir / "sce_sys" / "about" / "right.sprx")) return fail("补丁的 sce_sys 没有合进游戏目录");
     if (std::filesystem::exists(game_dir / "Wrap") || std::filesystem::exists(game_dir / "PPSA88888-app0") ||
         std::filesystem::exists(game_dir / "readme.txt")) {
       return fail("RAR 外层目录被装进去了");
     }
+    if (std::filesystem::exists(local_root / "mnt" / "usb0" / "homebrew" / ".panplay-staging")) {
+      return fail("装完后暂存区没有清干净");
+    }
+    const InstallResult again = install_game(drive, *local, request);
+    if (again.status != "already" || again.files_total != 3) return fail("RAR 加补丁装完后没有显示已安装");
   }
 
   if (const int code = prefetch_tests()) return code;
