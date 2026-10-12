@@ -1,4 +1,4 @@
-name: build
+﻿name: build
 
 on:
   push:
@@ -9,7 +9,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 安装依赖
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
@@ -24,16 +24,21 @@ jobs:
 
       - name: 编译
         run: |
-          cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-linux
+          set -o pipefail
+          { cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-linux; } 2>&1 | tee build.log \
+            || { .github/report-errors.sh build.log; exit 1; }
 
       - name: 自测
-        run: ./build-linux/panplay self-test
+        run: |
+          set -o pipefail
+          ./build-linux/panplay self-test 2>&1 | tee test.log || { .github/report-errors.sh test.log; exit 1; }
 
       - name: HTTPS 连通
         run: |
-          ./build-linux/panplay http-get https://pan.baidu.com/
-          ./build-linux/panplay http-get https://raw.githubusercontent.com/andshrew/PlayStation-Titles/main/README.md
+          set -o pipefail
+          { ./build-linux/panplay http-get https://pan.baidu.com/ \
+              && ./build-linux/panplay http-get https://raw.githubusercontent.com/andshrew/PlayStation-Titles/main/README.md; } 2>&1 \
+            | tee http.log || { .github/report-errors.sh http.log; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -45,7 +50,7 @@ jobs:
     env:
       PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 安装依赖
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build clang-18 lld-18 llvm-18 unzip
@@ -57,8 +62,10 @@ jobs:
 
       - name: 编译
         run: |
-          "$PS5_PAYLOAD_SDK/bin/prospero-cmake" -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-ps5
+          set -o pipefail
+          { "$PS5_PAYLOAD_SDK/bin/prospero-cmake" -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              && cmake --build build-ps5; } 2>&1 | tee build.log \
+            || { .github/report-errors.sh build.log; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
