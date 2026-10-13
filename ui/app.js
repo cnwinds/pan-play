@@ -912,6 +912,25 @@ function openDetail(game, opener) {
   const summary = el("summary", "", "名称与资料");
   const namingBody = el("div", "naming-body");
   const origin = el("dl", "specs");
+  // 网盘路径单独建一次：paint 会频繁重画，复制后的提示不能被冲掉。
+  const pathText = el("span", "drive-path");
+  const pathCopy = el("button", "path-copy", "复制");
+  pathCopy.type = "button";
+  const pathCell = el("dd", "path-cell");
+  pathCell.append(pathText, pathCopy);
+  let pathCopyTimer = 0;
+  pathCopy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(game.path);
+      pathCopy.textContent = "已复制";
+    } catch (error) {
+      // 非本机的 http 页面拿不到剪贴板权限，退回到选中文字让人手动复制。
+      window.getSelection().selectAllChildren(pathText);
+      pathCopy.textContent = "按 Ctrl+C 复制";
+    }
+    clearTimeout(pathCopyTimer);
+    pathCopyTimer = setTimeout(() => { pathCopy.textContent = "复制"; }, 2000);
+  });
   const rename = buildRenameForm(game, () => {
     detail?.paint();
     shareMeta(game);
@@ -1005,9 +1024,13 @@ function openDetail(game, opener) {
     const originRows = [["名称来源", nameSourceText(game)]];
     const english = (game.catalog_name || "").trim();
     if (english && english !== displayName(game)) originRows.push(["英文名", english]);
-    if ((game.name || "").trim()) originRows.push(["网盘目录", game.name]);
-    if (game.concept_id) originRows.push(["Concept ID", String(game.concept_id)]);
-    origin.replaceChildren(...originRows.flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]));
+    const originNodes = originRows.flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]);
+    if (game.path) {
+      pathText.textContent = game.path;
+      originNodes.push(el("dt", "", "网盘路径"), pathCell);
+    }
+    if (game.concept_id) originNodes.push(el("dt", "", "Concept ID"), el("dd", "", String(game.concept_id)));
+    origin.replaceChildren(...originNodes);
   };
 
   // 有多组压缩包时，新装和装更新前先让用户选要装哪些；继续安装沿用上次的选择。

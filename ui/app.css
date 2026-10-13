@@ -800,6 +800,28 @@ body.drawer-open { overflow: hidden; }
 .specs dt { color: var(--faint); }
 .specs dd { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
 
+.path-cell {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+.drive-path { min-width: 0; color: var(--text); }
+.path-copy {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--faint);
+  font: inherit;
+  font-size: 0.82rem;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.path-copy:hover { color: var(--text); }
+
 .naming {
   border-top: 1px solid var(--line);
 }
