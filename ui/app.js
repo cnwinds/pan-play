@@ -353,7 +353,7 @@ function updateLede() {
   if (counts.all && counts.need_settings) {
     const go = el("button", "", "到设置里填写存放位置");
     go.type = "button";
-    go.addEventListener("click", () => show("settings"));
+    go.addEventListener("click", () => show("settings", "target"));
     lede.append(go, "后才能安装。");
     return;
   }
@@ -1027,7 +1027,7 @@ function openDetail(game, opener) {
   };
   action.addEventListener("click", () => {
     if (game.state === "need-settings") {
-      show("settings");
+      show("settings", "target");
       return;
     }
     if (!archivesRead && ["install", "update"].includes(game.state)) {
@@ -1284,23 +1284,55 @@ function formatTime(unixSeconds) {
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { hour12: false });
 }
 
+function setTabStatus(name, text, state = "") {
+  $(`#status-${name}`).textContent = text;
+  $(`#dot-${name}`).dataset.state = state;
+}
+
 function renderCatalogStatus(info) {
   const sync = info && info.sync ? info.sync : {};
   if (sync.phase === "updating") {
-    catalogStatus.textContent = "正在后台同步…";
+    catalogStatus.replaceChildren(el("p", "catalog-meta", "正在后台同步…"));
+    setTabStatus("catalog", "正在同步…");
     return;
   }
   if (!info || !info.loaded) {
-    catalogStatus.textContent = "还没有资料库，后台正在第一次同步。在这之前游戏按目录名显示。";
+    catalogStatus.replaceChildren(el("p", "catalog-meta", "还没有资料库，后台正在第一次同步。在这之前游戏按目录名显示。"));
+    setTabStatus("catalog", "还没有资料库", "warn");
     return;
   }
-  const lines = [`已收录 ${info.count.toLocaleString("zh-CN")} 款游戏。`];
+  const count = info.count.toLocaleString("zh-CN");
+  const figure = el("p", "catalog-figure");
+  figure.append(el("span", "num", count), "款游戏");
+  const parts = [figure];
   const updated = info.generated_at ? info.generated_at.replace("T", " ").replace("Z", " UTC")
     : formatTime(info.file_mtime) || formatTime(sync.last_success);
-  if (updated) lines.push(`上次更新 ${updated}。`);
-  if (info.stale) lines.push(`已超过 ${sync.stale_days || 7} 天，会自动重新同步。`);
-  if (sync.last_error) lines.push(`最近一次同步失败：${sync.last_error}`);
-  catalogStatus.textContent = lines.join("");
+  const meta = [];
+  if (updated) meta.push(`上次更新 ${updated}。`);
+  if (info.stale) meta.push(`已超过 ${sync.stale_days || 7} 天，会自动重新同步。`);
+  if (meta.length) parts.push(el("p", "catalog-meta", meta.join("")));
+  if (sync.last_error) parts.push(el("p", "catalog-meta error", `最近一次同步失败：${sync.last_error}`));
+  catalogStatus.replaceChildren(...parts);
+  setTabStatus("catalog", `已收录 ${count} 款`, sync.last_error ? "warn" : "ok");
+}
+
+// 摘要只反映已保存的设置，所以只在读取和保存成功后刷新。
+function summarizeSettings() {
+  const library = form.elements.library_path.value.trim();
+  const keysFilled = [...$("#drive-fields").querySelectorAll("input")].every((input) => input.value.trim());
+  setTabStatus("drive", library || "还没填游戏库目录", library && keysFilled ? "ok" : "warn");
+
+  const mode = form.querySelector('input[name="target"]:checked')?.value;
+  const host = form.elements.ftp_host.value.trim();
+  const dir = form.elements.local_dir.value.trim();
+  if (mode === "ftp") {
+    setTabStatus("target", host ? `FTP ${host}:${form.elements.ftp_port.value.trim() || "2121"}` : "还没填主机地址",
+      host ? "ok" : "warn");
+  } else if (mode === "local") {
+    setTabStatus("target", dir || "还没填文件夹", dir ? "ok" : "warn");
+  } else {
+    setTabStatus("target", "还没选保存方式", "warn");
+  }
 }
 
 let catalogTimer = 0;
@@ -1387,6 +1419,7 @@ async function loadSettings() {
   form.elements.local_dir.placeholder = targets.includes("ftp") ? "D:\\PS5 游戏" : "/data/homebrew";
   for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) form.elements[name].value = settings[name] || "";
   renderTarget(settings.target);
+  summarizeSettings();
   await Promise.all([loadAccess(), loadCatalogStatus()]);
 }
 
@@ -1409,11 +1442,25 @@ function renderAccess(access) {
     : lan.disabled ? "只能在运行盘游的电脑上关闭" : "同一网络里的设备可以打开盘游";
   accessForm.elements.require_code.checked = access.require_code;
   accessForm.elements.code.value = access.code || "";
-  const url = $("#access-url");
-  url.hidden = !access.url;
-  url.textContent = access.url ? `其他设备打开 ${access.url}` : "";
+  $("#access-url").hidden = !access.url;
+  $("#access-url-text").textContent = access.url || "";
   renderAccessCode();
+  if (!access.lan) setTabStatus("access", "只在本机使用");
+  else setTabStatus("access", access.require_code ? "已开启，需要口令" : "已开启", "ok");
 }
+
+$("#access-copy").addEventListener("click", async () => {
+  const text = $("#access-url-text").textContent;
+  accessNote.classList.remove("error");
+  try {
+    await navigator.clipboard.writeText(text);
+    accessNote.textContent = "地址已复制。";
+  } catch (error) {
+    // 非本机的 http 页面拿不到剪贴板权限，退回到选中文字让人手动复制。
+    window.getSelection().selectAllChildren($("#access-url-text"));
+    accessNote.textContent = "已选中地址，按 Ctrl+C 复制。";
+  }
+});
 
 async function loadAccess() {
   accessNote.textContent = "";
@@ -1457,6 +1504,7 @@ form.addEventListener("submit", async (event) => {
   try {
     await api("/api/settings", body);
     settingsNote.textContent = "已保存。";
+    summarizeSettings();
     if (loggedIn) loadGames();
   } catch (error) {
     settingsNote.classList.add("error");
@@ -1482,7 +1530,35 @@ catalogReload.addEventListener("click", async () => {
 
 /* 导航与筛选 */
 
-function show(view) {
+const settingsTabs = [...document.querySelectorAll(".settings-tab")];
+
+function showSettingsTab(name) {
+  for (const tab of settingsTabs) {
+    const selected = tab.dataset.panel === name;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    $(`#${tab.getAttribute("aria-controls")}`).hidden = !selected;
+  }
+  // 网盘和存放位置共用一个表单和保存按钮，两个都没选中时整个表单收起来。
+  form.hidden = ![...form.querySelectorAll('[role="tabpanel"]')].some((panel) => !panel.hidden);
+}
+
+settingsTabs.forEach((tab, index) => {
+  tab.addEventListener("click", () => showSettingsTab(tab.dataset.panel));
+  tab.addEventListener("keydown", (event) => {
+    const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[event.key];
+    let next;
+    if (step) next = settingsTabs[(index + step + settingsTabs.length) % settingsTabs.length];
+    else if (event.key === "Home") next = settingsTabs[0];
+    else if (event.key === "End") next = settingsTabs[settingsTabs.length - 1];
+    if (!next) return;
+    event.preventDefault();
+    showSettingsTab(next.dataset.panel);
+    next.focus();
+  });
+});
+
+function show(view, settingsTab) {
   closeDetail();
   shelfView.hidden = view !== "shelf";
   settingsView.hidden = view !== "settings";
@@ -1490,6 +1566,7 @@ function show(view) {
     if (name === view) $(selector).setAttribute("aria-current", "page");
     else $(selector).removeAttribute("aria-current");
   }
+  if (settingsTab) showSettingsTab(settingsTab);
   if (view === "settings") {
     settingsNote.textContent = "";
     loadSettings().catch((error) => {

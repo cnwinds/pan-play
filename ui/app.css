@@ -1089,32 +1089,204 @@ body.drawer-open { overflow: hidden; }
 .dock[data-state="error"] .dock-meter > span { background: var(--danger); }
 
 /* 设置 */
-.settings > * { max-width: 920px; }
-
 .settings > h1 {
-  margin-bottom: 1.5rem;
+  margin-bottom: 1.75rem;
   font-size: 1.9rem;
   font-weight: 800;
 }
 
-.settings-section {
+.settings-layout {
   display: grid;
-  grid-template-columns: 240px 1fr;
-  gap: 2.5rem;
-  padding: 2rem 0;
-  border-top: 1px solid var(--line);
+  grid-template-columns: 252px minmax(0, 880px);
+  gap: 2rem;
+  align-items: start;
 }
 
-.settings-intro h2 {
-  font-size: 1.05rem;
+/* 左侧分类：每项带当前配置摘要，绿点表示已配好，黄点表示还缺东西 */
+.settings-tabs {
+  position: sticky;
+  top: calc(var(--bar-h) + 1.5rem);
+  display: grid;
+  gap: 2px;
+}
+
+.settings-tab {
+  position: relative;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 8px;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.8rem 0.9rem 0.8rem 1rem;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--muted);
+  text-align: left;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.settings-tab:hover { background: rgba(255, 255, 255, 0.03); color: var(--text); }
+
+.settings-tab[aria-selected="true"] {
+  background: var(--deck);
+  color: var(--text);
+}
+
+.settings-tab[aria-selected="true"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.85rem;
+  bottom: 0.85rem;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: var(--signal);
+}
+
+.tab-icon {
+  width: 20px;
+  height: 20px;
+  color: var(--faint);
+  transition: color 0.15s;
+}
+
+.settings-tab:hover .tab-icon { color: var(--muted); }
+.settings-tab[aria-selected="true"] .tab-icon { color: var(--signal-hi); }
+
+.tab-text {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.tab-text strong {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.tab-status {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 0.8rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.settings-tab[aria-selected="true"] .tab-status { color: var(--muted); }
+
+.tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.tab-dot[data-state="ok"] { background: var(--mint); box-shadow: 0 0 0 3px rgba(95, 211, 160, 0.14); }
+.tab-dot[data-state="warn"] { background: var(--amber); box-shadow: 0 0 0 3px rgba(240, 179, 87, 0.16); }
+
+/* 右侧面板 */
+.settings-panel {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--deck);
+}
+
+.panel-head {
+  padding: 1.6rem 1.9rem 1.35rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel-head h2 {
+  font-size: 1.25rem;
   font-weight: 700;
 }
 
-.settings-intro p {
-  margin-top: 0.4rem;
+.panel-head p {
+  max-width: 40em;
+  margin-top: 0.35rem;
   color: var(--muted);
   font-size: 0.88rem;
 }
+
+.panel-body {
+  display: grid;
+  gap: 1.5rem;
+  padding: 1.75rem 1.9rem 2rem;
+}
+
+.panel-body > .field,
+.panel-body > .fields,
+.panel-body .field-row,
+.panel-body .address { max-width: 580px; }
+
+.settings-panel .field input,
+.settings-panel .choice-card { background: var(--night); }
+
+.settings-panel .choice-card:has(input:checked) { background: rgba(77, 139, 255, 0.1); }
+
+.panel-foot {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.9rem 1.9rem;
+  border-top: 1px solid var(--line);
+  background: rgba(10, 14, 22, 0.35);
+}
+
+.panel-foot .note { margin-right: auto; }
+
+/* 局域网地址 */
+.address {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.7rem 0.7rem 0.7rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--night);
+}
+
+.address-label {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.address-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 1rem;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  user-select: all;
+}
+
+.address .btn { flex: none; margin-left: auto; }
+
+/* 资料库 */
+.catalog-status {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.catalog-figure {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  color: var(--muted);
+}
+
+.catalog-figure .num {
+  color: var(--text);
+  font-size: 2.6rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.catalog-meta { color: var(--muted); font-size: 0.88rem; }
+.catalog-meta.error { color: var(--danger); }
 
 .fields {
   display: grid;
@@ -1215,19 +1387,6 @@ body.drawer-open { overflow: hidden; }
 
 .field-row input { min-width: 0; }
 
-.settings-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 1rem;
-}
-
-.settings-form > .settings-actions {
-  padding: 0 0 2rem calc(240px + 2.5rem);
-}
-
-.catalog-status { color: var(--muted); font-size: 0.9rem; }
-
 @media (max-width: 760px) {
   .bar-inner {
     flex-wrap: wrap;
@@ -1254,8 +1413,37 @@ body.drawer-open { overflow: hidden; }
   .naming summary { padding: 1rem 1.25rem; }
   .naming-body { padding: 0 1.25rem 1.5rem; }
 
-  .settings-section { grid-template-columns: 1fr; gap: 1.25rem; }
-  .settings-form > .settings-actions { padding-left: 0; }
+  .settings-layout { grid-template-columns: minmax(0, 1fr); gap: 1.25rem; }
+
+  .settings-tabs {
+    position: static;
+    display: flex;
+    gap: 0.4rem;
+    margin: 0 -1rem;
+    padding: 0 1rem;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .settings-tab {
+    flex: none;
+    grid-template-columns: 18px auto;
+    gap: 0.5rem;
+    padding: 0.55rem 0.85rem;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+  }
+
+  .settings-tab[aria-selected="true"] { border-color: var(--signal); }
+  .settings-tab[aria-selected="true"]::before { display: none; }
+  .tab-icon { width: 18px; height: 18px; }
+  .tab-status, .tab-dot { display: none; }
+
+  .panel-head { padding: 1.25rem 1.25rem 1.1rem; }
+  .panel-body { padding: 1.25rem 1.25rem 1.5rem; }
+  .panel-foot { padding: 0.85rem 1.25rem; }
+  .address { flex-wrap: wrap; }
+  .address-value { flex-basis: 100%; order: 2; }
 }
 
 @media (prefers-reduced-motion: reduce) {
