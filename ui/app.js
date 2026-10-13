@@ -453,6 +453,18 @@ function syncGameState(game) {
   else if (game.state === "installing" || game.state === "queued") game.state = task ? settledState(task) : "install";
 }
 
+// 详情页读到的压缩包和安装情况同步给列表里同一款游戏，格子上的角标跟着变。
+function shareDetail(source) {
+  for (const game of games) {
+    if (game.path !== source.path) continue;
+    if (game !== source) {
+      for (const field of ["state", "archive_bytes", "formats", "layers"]) game[field] = source[field];
+    }
+    syncGameState(game);
+    paintTile(game);
+  }
+}
+
 // 列表刷新后详情里拿的可能是旧对象，所以详情里的游戏单独更新。
 function applyQueue() {
   for (const game of games) {
@@ -469,9 +481,10 @@ function applyQueue() {
 function setQueue(data) {
   const active = new Set(tasks.filter((task) => task.state !== "done").map((task) => task.path));
   tasks = data.tasks || [];
-  const settled = tasks.some((task) => task.state === "done" && active.has(task.path));
+  const settled = tasks.filter((task) => task.state === "done" && active.has(task.path)).map((task) => task.path);
   applyQueue();
-  if (settled) loadGames();
+  if (settled.length) loadGames();
+  if (detail && settled.includes(detail.game.path)) detail.reload();
   if (queueBusy()) watchQueue();
   else stopQueueWatch();
 }
@@ -1042,15 +1055,16 @@ function openDetail(game, opener) {
   first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));
   leave.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
 
-  // 简介等资料在本机缓存里，马上就有；压缩包大小和格式要列网盘目录，慢一些，分开取。
-  const loadMeta = () => api("/api/meta", { names: [game.name], detail: true }).then((data) => {
-    const item = (data.items || [])[0];
-    if (!item || !detail || detail.game !== game || item.name !== game.name) return;
-    Object.assign(game, item);
+  // 简介等资料和上次读到的压缩包、安装情况都在本机缓存里，马上就有，先显示出来；
+  // 实时列网盘目录、连主机要慢一些，读到了再换上。实时的先到了就不用缓存的。
+  const loadCached = () => api("/api/game", { path: game.path, cached: true }).then((data) => {
+    if (!detail || detail.game !== game || archivesRead) return;
+    Object.assign(game, data);
     paint();
     rename.sync();
+    if (data.source === "cache") shareDetail(game);
   }).catch(() => {
-    // 网盘那边的请求也会带回资料
+    // 实时的请求也会带回资料
   });
 
   const reload = () => api("/api/game", { path: game.path }).then((data) => {
@@ -1061,6 +1075,7 @@ function openDetail(game, opener) {
     waitingLayers = false;
     paint();
     rename.sync();
+    shareDetail(game);
     if (pending && !action.disabled) beginInstall();
   }).catch((error) => {
     waitingLayers = false;
@@ -1082,7 +1097,7 @@ function openDetail(game, opener) {
     },
   };
   paint();
-  loadMeta();
+  loadCached();
   reload();
   $("#detail-close").focus();
 }

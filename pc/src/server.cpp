@@ -1,5 +1,6 @@
 #include "server.hpp"
 
+#include "detail_cache.hpp"
 #include "settings.hpp"
 
 #include "panplay/app_paths.hpp"
@@ -27,6 +28,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -260,15 +262,16 @@ std::string archive_problem(const panplay::GameFolder& game) {
   return "unsupported";
 }
 
+// 和游戏库列表的判断一致：暂存区里有这款游戏的目录就算没装完（续装日志可能已经没了，留下的文件要能删掉；
+// 已装好的游戏更新到一半也是这样），其次才看完成标记。
 std::string game_state(panplay::InstallSink& sink, const std::string& prefix, const panplay::GameFolder& game) {
   const std::string folder = game.title_id.empty() ? game.name : game.title_id;
-  const std::string marker = panplay::join_storage_path(panplay::join_storage_path(prefix, folder), ".panplay-done.json");
   std::string error;
-  if (sink.file_size(marker, &error) >= 0 && error.empty()) return "installed";
-  const std::string journal =
-      panplay::join_storage_path(panplay::join_storage_path(prefix, ".panplay-staging/" + folder), ".panplay-journal.jsonl");
+  const auto staging = sink.list_children(panplay::join_storage_path(prefix, ".panplay-staging"), &error);
+  if (std::find(staging.begin(), staging.end(), folder) != staging.end()) return "continue";
+  const std::string marker = panplay::join_storage_path(panplay::join_storage_path(prefix, folder), ".panplay-done.json");
   error.clear();
-  if (sink.file_size(journal, &error) >= 0 && error.empty()) return "continue";
+  if (sink.file_size(marker, &error) >= 0 && error.empty()) return "installed";
   return "install";
 }
 
@@ -467,6 +470,27 @@ std::shared_ptr<const ShelfListing> shelf_listing(panplay::DrivePlugin& drive, b
   return listing;
 }
 
+// 详情页实时读到的安装情况和游戏库列表缓存的不一样时，改掉列表缓存里的这一项，回到列表就是新的。
+void sync_shelf_state(const std::string& key, const std::string& name, const std::string& title_id,
+                      const std::string& state) {
+  const bool installed = state == "installed" || state == "update";
+  const bool staging = state == "continue";
+  if (!installed && !staging && state != "install") return;
+  const std::string folder = title_id.empty() ? name : title_id;
+  std::lock_guard<std::mutex> lock(shelf_mu);
+  if (!shelf_cache || shelf_cache->key != key || !shelf_cache->sink_ready) return;
+  const ShelfPlacement& old = shelf_cache->placement;
+  const bool was_staging = old.staging_dirs.count(folder) != 0;
+  const bool was_installed = old.installed_dirs.count(folder) != 0;
+  if (was_staging == staging && (staging || was_installed == installed)) return;
+  auto listing = std::make_shared<ShelfListing>(*shelf_cache);
+  if (staging) listing->placement.staging_dirs.insert(folder);
+  else listing->placement.staging_dirs.erase(folder);
+  if (installed) listing->placement.installed_dirs.insert(folder);
+  else if (!staging) listing->placement.installed_dirs.erase(folder);
+  shelf_cache = listing;
+}
+
 std::string url_decode(const std::string& text) {
   std::string out;
   for (std::size_t i = 0; i < text.size(); ++i) {
@@ -523,9 +547,15 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     std::string state = "need-settings";
     if (listing->sink_ready) state = shelf_state(placement, folder.name, folder.title_id, folder.path);
     else if (listing->dest_ready) state = "install";
-    if (state == "installed") ++installed;
-    if (filter == "installed" && state != "installed") continue;
-    if (filter == "todo" && (state == "installed" || state == "continue")) continue;
+    // 有没有新补丁要读网盘目录和完成标记，列表不读，用详情页上次读到的。
+    if (state == "installed") {
+      const auto detail = cached_game_detail(listing->key, folder.path);
+      if (detail && detail->state == "update") state = "update";
+    }
+    const bool on_console = state == "installed" || state == "update";
+    if (on_console) ++installed;
+    if (filter == "installed" && !on_console) continue;
+    if (filter == "todo" && (on_console || state == "continue")) continue;
     if (filter == "continue" && state != "continue") continue;
     std::string search_text;
     const std::string meta = game_meta_fields(folder.name, folder.title_id, overrides, false, &search_text);
@@ -542,8 +572,6 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
          ",\"all\":" + std::to_string(listing->folders.size()) + ",\"installed\":" + std::to_string(installed) +
          ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + "}";
 }
-
-std::unique_ptr<panplay::InstallSink> open_sink(const AppSettings& settings, std::string* error);
 
 // 能装的每组压缩包一项，供安装前挑选补丁。主游戏是直接放在游戏目录里最大的那组（都在子目录里时取最大的），
 // 必装；子目录里的算补丁，游戏目录里其他的（多是 backport）算附加。按主游戏、补丁（自然排序）、附加的顺序列出。
@@ -592,54 +620,89 @@ std::string layers_json(const panplay::GameFolder& game, const std::set<std::str
   return json + "]";
 }
 
-std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) {
-  const AppSettings settings = load_settings();
-  std::string error;
-  const auto files = panplay::collect_archives(drive, path, &error);
-  if (!error.empty()) return json_error(error);
+// 实时读网盘上的压缩包和主机上的安装情况。主机连不上时安装情况用 fallback（上次读到的）。
+GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& path,
+                            const std::optional<GameDetail>& fallback, std::string* error) {
+  GameDetail detail;
+  const auto files = panplay::collect_archives(drive, path, error);
+  if (!error->empty()) return detail;
   panplay::GameFolder game;
   game.name = folder_name_of(path);
   game.path = path;
   game.title_id = panplay::find_title_id(game.name);
   game.sets = panplay::group_archives(files);
   for (const auto& set : game.sets) {
-    for (const auto& part : set.parts) game.archive_bytes += part.size;
+    for (const auto& part : set.parts) detail.archive_bytes += part.size;
   }
-  // 主机上的安装情况优先用游戏库列表读过的：安装时主机的 FTP 可能正忙，再连一次要等很久。
-  std::string state = "need-settings";
-  if (const auto listing = cached_shelf(settings)) {
-    if (listing->dest_ready) state = archive_problem(game);
-    if (listing->dest_ready && state.empty()) {
-      state = listing->sink_ready ? shelf_state(listing->placement, game.name, game.title_id, path) : "install";
-    }
-  } else {
-    std::unique_ptr<panplay::InstallSink> sink;
-    panplay::Destination destination;
-    const std::string dest = settings.dest();
-    if (!dest.empty() && panplay::parse_destination(dest, &destination, &error)) {
-      sink = panplay::open_destination(destination, &error);
-    }
-    if (sink) state = archive_problem(game);
-    if (sink && state.empty()) state = game_state(*sink, settings.prefix(), game);
-    else if (!sink && !dest.empty()) state = "install";
+  detail.formats = formats_of(game);
+  detail.state = "need-settings";
+  panplay::Destination destination;
+  std::string dest_error;
+  const std::string dest = settings.dest();
+  if (!dest.empty() && panplay::parse_destination(dest, &destination, &dest_error)) {
+    detail.state = archive_problem(game);
   }
-  // 装好之后网盘里又放了补丁（或改了要装哪些）：读一下这款游戏的完成标记，和现在要装的压缩包对一下。
-  const std::set<std::string> skipped = load_skipped_sets(path);
-  std::vector<std::string> installed;
-  if (state == "installed") {
-    std::string sink_error;
-    if (auto sink = open_sink(settings, &sink_error)) {
-      if (panplay::install_outdated(*sink, settings.prefix(), path, game.sets, skipped)) state = "update";
-      installed = panplay::installed_sets(*sink, settings.prefix(), path);
+  if (detail.state.empty()) {
+    if (auto sink = panplay::open_destination(destination, &dest_error)) {
+      detail.state = game_state(*sink, settings.prefix(), game);
+      // 装好之后网盘里又放了补丁（或改了要装哪些）：读一下这款游戏的完成标记，和现在要装的压缩包对一下。
+      if (detail.state == "installed") {
+        if (panplay::install_outdated(*sink, settings.prefix(), path, game.sets, load_skipped_sets(path))) {
+          detail.state = "update";
+        }
+        detail.installed = panplay::installed_sets(*sink, settings.prefix(), path);
+      }
+    } else if (fallback && fallback->state != "need-settings") {
+      detail.state = fallback->state;
+      detail.installed = fallback->installed;
+    } else if (const auto listing = cached_shelf(settings); listing && listing->sink_ready) {
+      detail.state = shelf_state(listing->placement, game.name, game.title_id, path);
+    } else {
+      detail.state = "install";
     }
   }
-  const auto queued = queue_states();
-  if (queued.count(path) != 0) state = queued.at(path);
-  return "{\"name\":\"" + panplay::json_escape(game.name) + "\",\"path\":\"" + panplay::json_escape(game.path) +
-         "\",\"title_id\":\"" + panplay::json_escape(game.title_id) + "\",\"archive_bytes\":" +
-         std::to_string(game.archive_bytes) + ",\"formats\":\"" + panplay::json_escape(formats_of(game)) +
-         "\",\"state\":\"" + state + "\",\"layers\":" + layers_json(game, skipped, installed) +
-         game_meta_fields(game.name, game.title_id, load_name_overrides(), true) + "}";
+  detail.layers = layers_json(game, load_skipped_sets(path), detail.installed);
+  return detail;
+}
+
+// 详情页要的游戏信息。cached 时只给上次读到的（source 为 cache，没有时为 none），立刻返回；
+// 否则实时读网盘和主机（source 为 live），读到的存起来，游戏库列表缓存里这款游戏的状态也跟着改。
+std::string one_game_json(const std::string& path, bool cached) {
+  const AppSettings settings = load_settings();
+  const std::string key = shelf_key(settings);
+  const std::string name = folder_name_of(path);
+  const std::string title_id = panplay::find_title_id(name);
+  std::optional<GameDetail> detail = cached_game_detail(key, path);
+  std::string source = detail ? "cache" : "none";
+  std::string state = detail ? detail->state : "";
+  if (cached && detail) {
+    // 是否装在主机上以列表读到的为准（和格子上显示的一致），详情缓存只补上列表不知道的“有更新”。
+    const bool placement = state == "install" || state == "continue" || state == "installed" || state == "update";
+    const auto listing = cached_shelf(settings);
+    if (placement && listing && listing->sink_ready) {
+      const std::string listed = shelf_state(listing->placement, name, title_id, path);
+      state = listed == "installed" && state == "update" ? "update" : listed;
+    }
+  } else if (!cached) {
+    std::string error;
+    const GameDetail live = read_game_detail(*open_drive(), settings, path, detail, &error);
+    if (!error.empty()) return json_error(error);
+    store_game_detail(key, path, live);
+    sync_shelf_state(key, name, title_id, live.state);
+    detail = live;
+    source = "live";
+    state = live.state;
+  }
+  std::string json = "{\"name\":\"" + panplay::json_escape(name) + "\",\"path\":\"" + panplay::json_escape(path) +
+                     "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\",\"source\":\"" + source + "\"";
+  if (detail) {
+    const auto queued = queue_states();
+    if (queued.count(path) != 0) state = queued.at(path);
+    json += ",\"archive_bytes\":" + std::to_string(detail->archive_bytes) + ",\"formats\":\"" +
+            panplay::json_escape(detail->formats) + "\",\"state\":\"" + state + "\",\"layers\":" +
+            (detail->layers.empty() ? "[]" : detail->layers);
+  }
+  return json + game_meta_fields(name, title_id, load_name_overrides(), true) + "}";
 }
 
 void publish_progress(const panplay::InstallResult& snapshot) {
@@ -740,6 +803,7 @@ void queue_worker() {
       cancel = installs.current->cancel;
     }
     const panplay::InstallResult result = run_install(path, cancel.get());
+    forget_game_detail(path);
     std::lock_guard<std::mutex> lock(installs.mu);
     InstallTask done = std::move(*installs.current);
     installs.current.reset();
@@ -1139,8 +1203,7 @@ void handle_client(SOCKET client) {
       reply_json(client, 400, json_error(parse_error.empty() ? "缺少游戏目录" : parse_error));
       return;
     }
-    auto drive = open_drive();
-    const std::string payload = one_game_json(*drive, json.str("path"));
+    const std::string payload = one_game_json(json.str("path"), json.boolean_or("cached", false));
     reply_json(client, payload.rfind("{\"error\"", 0) == 0 ? 400 : 200, payload);
     return;
   }
@@ -1263,6 +1326,7 @@ void handle_client(SOCKET client) {
       reply_json(client, 500, json_error(error));
       return;
     }
+    forget_game_detail(path);
     {
       std::lock_guard<std::mutex> lock(shelf_mu);
       shelf_cache.reset();
