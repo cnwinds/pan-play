@@ -15,8 +15,34 @@
 
 #include "panplay/app_paths.hpp"
 
+#if defined(PANPLAY_EMBED_CATALOG)
+#include <zlib.h>
+
+// 构建时生成：data/panplay-catalog.json 的 gzip 数据 kCatalogGz。
+#include "panplay_catalog_gz.inc"
+#endif
+
 namespace panplay {
 namespace {
+
+#if defined(PANPLAY_EMBED_CATALOG)
+bool gunzip(const unsigned char* data, std::size_t size, std::string* out) {
+  z_stream stream{};
+  if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) return false;
+  stream.next_in = const_cast<Bytef*>(data);
+  stream.avail_in = static_cast<uInt>(size);
+  std::vector<char> buffer(1 << 16);
+  int status = Z_OK;
+  while (status == Z_OK) {
+    stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+    stream.avail_out = static_cast<uInt>(buffer.size());
+    status = inflate(&stream, Z_NO_FLUSH);
+    if (status == Z_OK || status == Z_STREAM_END) out->append(buffer.data(), buffer.size() - stream.avail_out);
+  }
+  inflateEnd(&stream);
+  return status == Z_STREAM_END;
+}
+#endif
 
 std::string read_text_file(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
@@ -100,14 +126,34 @@ std::string GameCatalog::default_path() {
 }
 
 bool GameCatalog::load_default(std::string* error) {
-  return load_file(default_path(), error);
+  if (load_file(default_path(), error)) return true;
+  return load_builtin(nullptr);
 }
 
 bool GameCatalog::reload(std::string* error) {
   std::shared_lock<std::shared_mutex> read_lock(mu_);
-  const std::string path = meta_.path.empty() ? default_path() : meta_.path;
+  const bool fallback = meta_.path.empty() || meta_.builtin;
+  const std::string path = meta_.path;
   read_lock.unlock();
-  return load_file(path, error);
+  return fallback ? load_default(error) : load_file(path, error);
+}
+
+bool GameCatalog::load_builtin(std::string* error) {
+#if defined(PANPLAY_EMBED_CATALOG)
+  std::string text;
+  if (!gunzip(kCatalogGz, sizeof(kCatalogGz), &text)) {
+    if (error) *error = "内置资料库解压失败";
+    return false;
+  }
+  std::unique_lock<std::shared_mutex> lock(mu_);
+  if (!load_text_unlocked(text, error)) return false;
+  meta_.path = "（内置）";
+  meta_.builtin = true;
+  return true;
+#else
+  if (error) *error = "这个版本没有打包资料库";
+  return false;
+#endif
 }
 
 bool GameCatalog::load_file(const std::string& path, std::string* error) {
@@ -116,28 +162,16 @@ bool GameCatalog::load_file(const std::string& path, std::string* error) {
 }
 
 bool GameCatalog::load_file_unlocked(const std::string& path, std::string* error) {
-  by_title_id_.clear();
-  loaded_ = false;
-  meta_ = {};
-
   const std::string text = read_text_file(std::filesystem::u8path(path));
   if (text.empty()) {
+    by_title_id_.clear();
+    loaded_ = false;
+    meta_ = {};
     if (error) *error = "找不到 catalog 文件: " + path;
     return false;
   }
-
-  std::string parse_error;
-  const Json root = Json::parse(text, &parse_error);
-  if (!parse_error.empty()) {
-    if (error) *error = parse_error;
-    return false;
-  }
-
+  if (!load_text_unlocked(text, error)) return false;
   meta_.path = path;
-  meta_.source = root.str("source");
-  meta_.generated_at = root.str("generated_at");
-  meta_.generated_from = root.str("generated_from");
-  meta_.version = static_cast<int>(root.num("version"));
   try {
     // 文件时钟的起点不是 1970 年，按两个时钟的当前时间差换算成 Unix 时间。
     const auto mtime = std::filesystem::last_write_time(std::filesystem::u8path(path));
@@ -149,6 +183,25 @@ bool GameCatalog::load_file_unlocked(const std::string& path, std::string* error
   } catch (...) {
     meta_.file_mtime_unix = 0;
   }
+  return true;
+}
+
+bool GameCatalog::load_text_unlocked(const std::string& text, std::string* error) {
+  by_title_id_.clear();
+  loaded_ = false;
+  meta_ = {};
+
+  std::string parse_error;
+  const Json root = Json::parse(text, &parse_error);
+  if (!parse_error.empty()) {
+    if (error) *error = parse_error;
+    return false;
+  }
+
+  meta_.source = root.str("source");
+  meta_.generated_at = root.str("generated_at");
+  meta_.generated_from = root.str("generated_from");
+  meta_.version = static_cast<int>(root.num("version"));
 
   const Json* titles = root.get("titles");
   if (titles == nullptr) titles = root.get("t");
@@ -192,6 +245,7 @@ CatalogMeta GameCatalog::meta() const {
 
 bool GameCatalog::is_stale(int max_age_days) const {
   std::shared_lock<std::shared_mutex> lock(mu_);
+  if (loaded_ && meta_.builtin) return true;
   if (!loaded_ || max_age_days <= 0 || meta_.file_mtime_unix <= 0) return false;
   const auto now = std::chrono::system_clock::now();
   const auto mtime = std::chrono::system_clock::from_time_t(static_cast<std::time_t>(meta_.file_mtime_unix));

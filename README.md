@@ -17,7 +17,7 @@
 
 游戏资料分两层，都以 `conceptId` 串起来：
 
-1. **Title ID → conceptId、英文名**：来自 [PlayStation-Titles](https://github.com/andshrew/PlayStation-Titles)（MIT，作者每天自动刷新）。程序自带一份 `data/panplay-catalog.json`，自动同步的新版写在数据目录，两份取较新的。
+1. **Title ID → conceptId、英文名**：来自 [PlayStation-Titles](https://github.com/andshrew/PlayStation-Titles)（MIT，作者每天自动刷新）。程序自带一份 `data/panplay-catalog.json`，自动同步的新版写在数据目录，两份取较新的。用 CMake 构建时（发布版都是）这份资料库会压缩后打包进程序，旁边一个资料库文件都没有时就用它，所以发出去的 exe / elf 不用再带 `data/`；打包的这份始终算过期，第一次连上 GitHub 就会被同步下来的新版替换。
 2. **中文名、封面、类型、发行商、发售日、简介**：按 `conceptId` 读取 PlayStation 商店概念页，依次试港服简体 `zh-hans-hk`、港服繁体 `zh-hant-hk`、美服 `en-us`，结果缓存在数据目录的 `store-meta.json`，封面存到数据目录的 `covers/`。
 
 只有目录名里能抽出 `CUSA` / `PPSA` 时才对照资料；没有 Title ID 时保持网盘文件夹原名，不按目录名猜测。展示名优先级是：手动改名 > 商店名称 > 英文名 > 目录名。手动改名保存在数据目录的 `name-overrides.json`。
@@ -41,6 +41,7 @@
 | 启动时 | 若 catalog 不存在，或文件超过 **7 天**未更新 → 后台线程自动拉取并重建 |
 | 运行中 | 每 **24 小时**检查一次；过期则后台同步，完成后热重载 |
 | 失败时 | 保留现有 catalog，stderr 输出简短中文错误；登录与安装不受影响 |
+| 只有打包的 catalog | 先用打包的这份，同时立刻后台同步 |
 | 首次无 catalog | 游戏列表仍可用（回退目录名），同步完成后下次请求自动 enriched |
 
 设置页 **游戏资料库** 可查看「已同步 / 正在更新 / 上次更新时间」。`GET /api/catalog` 返回 `sync` 字段（phase、last_success 等）。

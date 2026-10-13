@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # PS5 工具链（ps5-payload-sdk 的 prospero.cmake）会设置 PS5。
 option(PANPLAY_EMBED_UI "把 ui/ 打包进程序" ${PS5})
+option(PANPLAY_EMBED_CATALOG "把 data/panplay-catalog.json 压缩后打包进程序，找不到资料库文件时兜底" ON)
 set(PANPLAY_CA_BUNDLE "" CACHE FILEPATH "PEM 根证书包；为空时下载 curl.se 的 cacert.pem（非 Windows）")
 
 set(UNRAR_SOURCES
@@ -153,6 +154,20 @@ if(PANPLAY_EMBED_UI)
     VERBATIM)
   target_sources(panplay PRIVATE "${UI_CPP}")
   target_compile_definitions(panplay PRIVATE PANPLAY_EMBED_UI)
+endif()
+
+if(PANPLAY_EMBED_CATALOG)
+  set(CATALOG_JSON "${CMAKE_CURRENT_SOURCE_DIR}/data/panplay-catalog.json")
+  set(CATALOG_INC "${CMAKE_BINARY_DIR}/generated/panplay_catalog_gz.inc")
+  add_custom_command(OUTPUT "${CATALOG_INC}"
+    COMMAND ${CMAKE_COMMAND} "-DOUTPUT=${CATALOG_INC}" -DMODE=gz "-DFILES=${CATALOG_JSON}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake"
+    DEPENDS "${CATALOG_JSON}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake"
+    VERBATIM)
+  target_sources(panplay PRIVATE "${CATALOG_INC}")
+  set_source_files_properties("${CATALOG_INC}" PROPERTIES HEADER_FILE_ONLY ON)
+  target_include_directories(panplay PRIVATE "${CMAKE_BINARY_DIR}/generated")
+  target_compile_definitions(panplay PRIVATE PANPLAY_EMBED_CATALOG)
 endif()
 
 enable_testing()

@@ -140,4 +140,5 @@ jobs:
           body: |
             **Windows**：下载 `panplay-${{ github.ref_name }}-windows-x64.exe`，双击运行，会自动用浏览器打开 http://127.0.0.1:8734 。要让局域网里的手机也能用，在命令行运行 `panplay.exe serve --lan`。
             **PS5**：把 `panplay-${{ github.ref_name }}-ps5.elf` 用 payload 加载器发送到主机，主机右上角的通知里有访问地址和口令，用手机或电脑浏览器打开。
+            两个文件都自带游戏资料库，不用另外下载；联网后会自动从 GitHub 同步最新版，存在数据目录（Windows 是 `%APPDATA%\panplay`，PS5 是 `/data/panplay`）。
             网盘游戏目录怎么放，见 [网盘游戏目录整理指南](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/game-folder-guide.md)。

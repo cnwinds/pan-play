@@ -1,4 +1,5 @@
 #include "panplay/app_paths.hpp"
+#include "panplay/catalog.hpp"
 #include "panplay/drive.hpp"
 #include "panplay/dummy_ftp.hpp"
 #include "panplay/http.hpp"
@@ -123,6 +124,13 @@ int self_test() {
     std::cerr << "json list mismatch\n";
     return 1;
   }
+#if defined(PANPLAY_EMBED_CATALOG)
+  panplay::GameCatalog& catalog = panplay::GameCatalog::instance();
+  if (!catalog.load_builtin(&error) || catalog.size() < 1000 || !catalog.meta().builtin || !catalog.is_stale(7)) {
+    std::cerr << "builtin catalog: " << error << " size=" << catalog.size() << "\n";
+    return 1;
+  }
+#endif
   return 0;
 }
 

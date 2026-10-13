@@ -30,6 +30,8 @@ struct CatalogMeta {
   std::string generated_from;
   int version = 0;
   std::int64_t file_mtime_unix = 0;
+  // 用的是打包在程序里的那份（发布时的快照），一直算过期，联网同步成功就换掉。
+  bool builtin = false;
 };
 
 class GameCatalog {
@@ -39,8 +41,11 @@ class GameCatalog {
   static std::string default_path();
   static std::string synced_path();
 
+  // 先读资料库文件；一份都读不了时，用打包在程序里的那份。
   bool load_default(std::string* error = nullptr);
   bool load_file(const std::string& path, std::string* error = nullptr);
+  // 编译时没有打包资料库（PANPLAY_EMBED_CATALOG）时返回 false。
+  bool load_builtin(std::string* error = nullptr);
   bool reload(std::string* error = nullptr);
   CatalogMatch lookup(const std::string& title_id, const std::string& folder_name) const;
   CatalogMeta meta() const;
@@ -52,6 +57,7 @@ class GameCatalog {
   GameCatalog() = default;
 
   bool load_file_unlocked(const std::string& path, std::string* error);
+  bool load_text_unlocked(const std::string& text, std::string* error);
 
   mutable std::shared_mutex mu_;
   bool loaded_ = false;
