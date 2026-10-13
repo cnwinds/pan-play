@@ -22,12 +22,14 @@ class DummyFtp {
   void set_data_timeout_ms(int ms);
   // 上传结束后过多久才关文件、写出缓冲。自测里用来模拟主机磁盘慢，旧传输还没写完续传就开始了。
   void set_close_delay_ms(int ms);
+  // 学 PS5 上的 zftpd：USER 直接答 230 不要密码；从头写的 STOR 中途断了会把半截文件删掉（APPE 断了留着）。
+  void set_zftpd_style(bool on);
 
  private:
   struct Impl;
   Impl* impl_;
 };
 
-int run_dummy_ftp(std::uint16_t port, const std::string& root);
+int run_dummy_ftp(std::uint16_t port, const std::string& root, bool zftpd_style = false);
 
 }  // namespace panplay

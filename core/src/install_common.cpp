@@ -49,15 +49,16 @@ bool is_install_package_error(const std::string& message) {
   return message.rfind(kInstallPackagePrefix, 0) == 0;
 }
 
-OutputFile::OutputFile(InstallSink& sink, std::string path, std::int64_t stop, std::int64_t* written)
-    : sink_(sink), path_(std::move(path)), stop_(stop), written_(written),
+OutputFile::OutputFile(InstallSink& sink, std::string path, std::int64_t expected, std::int64_t stop,
+                       std::int64_t* written)
+    : sink_(sink), path_(std::move(path)), expected_(expected), stop_(stop), written_(written),
       crc_(static_cast<std::uint32_t>(::crc32(0L, Z_NULL, 0))) {}
 
 std::string OutputFile::open() {
   if (writer_) return "";
   if (auto error = sink_.ensure_dir(parent_path(path_)); !error.empty()) return error;
   std::string error;
-  writer_ = sink_.open_writer(path_, &error);
+  writer_ = sink_.open_writer(path_, expected_, &error);
   return writer_ ? "" : (error.empty() ? "无法写入" : error);
 }
 

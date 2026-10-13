@@ -24,10 +24,10 @@ std::string install_package_error(const std::string& name);
 bool is_install_package_error(const std::string& message);
 
 // 解压出的一个文件：第一次写入时才建目录、开写入流，同时算 CRC。
-// stop >= 0 时，累计写满 stop 字节就返回 kInterrupted，供自测模拟中断。
+// stop >= 0 时，累计写满 stop 字节就返回 kInterrupted，供自测模拟中断。expected 是压缩包里记的解压后大小。
 class OutputFile {
  public:
-  OutputFile(InstallSink& sink, std::string path, std::int64_t stop, std::int64_t* written);
+  OutputFile(InstallSink& sink, std::string path, std::int64_t expected, std::int64_t stop, std::int64_t* written);
   std::string write(const std::uint8_t* data, std::size_t size);
   // 空文件也会在这里建出来。
   std::string finish();
@@ -39,6 +39,7 @@ class OutputFile {
 
   InstallSink& sink_;
   std::string path_;
+  std::int64_t expected_;
   std::int64_t stop_;
   std::int64_t* written_;
   std::unique_ptr<FileWriter> writer_;

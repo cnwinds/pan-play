@@ -19,8 +19,8 @@ class FileWriter {
 class InstallSink {
  public:
   virtual ~InstallSink() = default;
-  // 新建或覆盖文件。写入期间不能对同一个 sink 做别的操作。
-  virtual std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) = 0;
+  // 新建或覆盖文件。写入期间不能对同一个 sink 做别的操作。size 是预计写入的字节数，不知道时为 -1。
+  virtual std::unique_ptr<FileWriter> open_writer(const std::string& path, std::int64_t size, std::string* error) = 0;
   virtual std::string ensure_dir(const std::string& path) = 0;
   // 文件不存在时返回 -1，且不设置 error。
   virtual std::int64_t file_size(const std::string& path, std::string* error) = 0;

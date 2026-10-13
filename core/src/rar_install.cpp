@@ -462,7 +462,8 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
     if (!directory && options.on_entry) options.on_entry(already);
     if (!directory && !already) {
       writer.out = std::make_unique<OutputFile>(sink, join_storage_path(options.staging_root, staged),
-                                                options.stop_after_output_bytes, options.written);
+                                                static_cast<std::int64_t>(size), options.stop_after_output_bytes,
+                                                options.written);
     }
     const int operation = directory || (already && !solid) ? RAR_SKIP : RAR_TEST;
     const int processed = RARProcessFileW(handle, operation, nullptr, nullptr);

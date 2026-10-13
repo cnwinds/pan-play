@@ -64,10 +64,10 @@
 - `panplay serve 8734 --lan`：监听所有网卡，局域网里的手机也能打开。第一次打开要输访问口令，口令在数据目录的 `access-code.txt`。
 - `panplay http-get <地址>`：排查网络，打印状态码、长度和跳转后的地址。
 - `panplay login` / `ls` / `scan` / `install` / `read`：同一套安装流程的命令行
-- `panplay dummy-ftp <端口> <根目录>`：在 `127.0.0.1` 上模拟主机 FTP 目录
+- `panplay dummy-ftp <端口> <根目录> [--zftpd]`：在 `127.0.0.1` 上模拟主机 FTP 目录。带 `--zftpd` 时学 PS5 上的 zftpd：不要密码，从头写的 STOR 中途断了会删掉半截文件
 - `panplay self-test`：检查 JSON、FTP 续写、ZIP 分卷续传，以及单卷 RAR 安装
 
-开放平台授权后，游戏库一般在 `/apps/应用名`。主游戏、补丁怎么放、叠放顺序和出了新补丁怎么只装补丁，见 [网盘游戏目录整理指南](docs/game-folder-guide.md)。能安装单卷和带分卷头的 ZIP（存储和 Deflate），以及 RAR。7z 会明确拒绝。写入规则是：远端文件大小等于已提交字节才 `APPE`；对不上就重新 `STOR` 覆盖。已校验通过的文件继续时不再重写。
+开放平台授权后，游戏库一般在 `/apps/应用名`。主游戏、补丁怎么放、叠放顺序和出了新补丁怎么只装补丁，见 [网盘游戏目录整理指南](docs/game-folder-guide.md)。能安装单卷和带分卷头的 ZIP（存储和 Deflate），以及 RAR。7z 会明确拒绝。写入规则是：远端文件大小等于已提交字节才 `APPE`；对不上就重新 `STOR` 覆盖。已校验通过的文件继续时不再重写。FTP 上超过 32 MB 的文件先 `DELE` 再只用 `APPE` 写：zftpd 上从头写的 `STOR` 断了会删掉半截文件，`APPE` 不会，大文件断线后才能从主机已存下的位置续传。
 
 ## 构建
 

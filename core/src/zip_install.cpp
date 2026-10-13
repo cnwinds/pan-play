@@ -513,7 +513,8 @@ std::string extract_member(ZipStream& stream, ExtractContext& context, const Mem
   if (read_u32(header) != kLocalHeader) return "ZIP 文件头和目录对不上: " + member.name;
   if (auto error = stream.skip(read_u16(header + 26) + read_u16(header + 28)); !error.empty()) return error;
 
-  OutputFile out(context.sink, join_storage_path(context.staging_root, member.staged), context.stop, context.written);
+  OutputFile out(context.sink, join_storage_path(context.staging_root, member.staged),
+                 static_cast<std::int64_t>(member.uncomp_size), context.stop, context.written);
   if (auto error = copy_member(stream, member, out, context.cancel); !error.empty()) return error;
   if (auto error = out.finish(); !error.empty()) return error;
   if (out.size() != static_cast<std::int64_t>(member.uncomp_size) || out.crc() != member.crc) {

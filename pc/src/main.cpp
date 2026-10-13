@@ -97,7 +97,7 @@ void print_usage() {
             << "  panplay self-test\n"
             << "  panplay bench-prefetch\n"
             << "  panplay bench-download <网盘目录> [秒] [连接数] [块MB]\n"
-            << "  panplay dummy-ftp <端口> <根目录>\n"
+            << "  panplay dummy-ftp <端口> <根目录> [--zftpd]\n"
             << "  panplay login\n"
             << "  panplay ls [目录]\n"
             << "  panplay scan <游戏库目录>\n"
@@ -350,7 +350,8 @@ int main(int argc, char** argv) {
     return panplay::run_install_pipeline_self_test();
   }
   if (command == "dummy-ftp" && argc >= 4) {
-    return panplay::run_dummy_ftp(static_cast<std::uint16_t>(std::stoi(argv[2])), argv[3]);
+    const bool zftpd = argc >= 5 && std::string(argv[4]) == "--zftpd";
+    return panplay::run_dummy_ftp(static_cast<std::uint16_t>(std::stoi(argv[2])), argv[3], zftpd);
   }
   if (command == "login") return login();
   if (command == "ls") return list_dir(argc >= 3 ? argv[2] : "/");

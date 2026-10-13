@@ -218,10 +218,10 @@ class CountingSink final : public InstallSink {
     writers_ = 0;
   }
 
-  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) override {
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::int64_t size, std::string* error) override {
     writes_[path] += 1;
     ++writers_;
-    return inner_.open_writer(path, error);
+    return inner_.open_writer(path, size, error);
   }
   std::string ensure_dir(const std::string& path) override { return inner_.ensure_dir(path); }
   std::int64_t file_size(const std::string& path, std::string* error) override { return inner_.file_size(path, error); }
@@ -262,7 +262,7 @@ class MemorySink final : public InstallSink {
 
   std::map<std::string, File> files;
 
-  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string*) override {
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::int64_t, std::string*) override {
     files[path] = File{};
     return std::make_unique<Writer>(files[path]);
   }

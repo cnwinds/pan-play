@@ -80,6 +80,7 @@ struct DummyFtp::Impl {
   std::atomic<bool> running{false};
   std::atomic<int> data_timeout_ms{10000};
   std::atomic<int> close_delay_ms{0};
+  std::atomic<bool> zftpd_style{false};
   // 像主机上的 FTP 一样可以同时连多个客户端：安装占着一条连接时，游戏库还要另开一条查安装情况。
   std::mutex sockets_mu;
   std::condition_variable sessions_done;
@@ -127,7 +128,12 @@ struct DummyFtp::Impl {
         break;
       }
       if (name == "USER") {
-        send_line(client, "331 password required");
+        if (zftpd_style.load()) {
+          authed = true;
+          send_line(client, "230 login ok");
+        } else {
+          send_line(client, "331 password required");
+        }
         continue;
       }
       if (name == "PASS") {
@@ -369,6 +375,10 @@ struct DummyFtp::Impl {
           }
           closesocket(data);
           if (failed) {
+            if (!append && zftpd_style.load()) {
+              std::error_code ignored;
+              std::filesystem::remove(local, ignored);
+            }
             send_line(client, full ? "452 insufficient storage space" : "426 transfer aborted");
             continue;
           }
@@ -446,9 +456,12 @@ void DummyFtp::set_data_timeout_ms(int ms) { impl_->data_timeout_ms = ms; }
 
 void DummyFtp::set_close_delay_ms(int ms) { impl_->close_delay_ms = ms; }
 
-int run_dummy_ftp(std::uint16_t port, const std::string& root) {
+void DummyFtp::set_zftpd_style(bool on) { impl_->zftpd_style = on; }
+
+int run_dummy_ftp(std::uint16_t port, const std::string& root, bool zftpd_style) {
   std::string error;
   DummyFtp server(root, port);
+  server.set_zftpd_style(zftpd_style);
   if (!server.start(&error)) {
     std::cerr << error << "\n";
     return 1;

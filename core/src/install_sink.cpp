@@ -48,7 +48,7 @@ class LocalSink : public InstallSink {
     std::filesystem::create_directories(root_);
   }
 
-  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) override {
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::int64_t, std::string* error) override {
     std::filesystem::path local;
     if (!storage_path(root_, path, &local, error)) return nullptr;
     auto writer = std::make_unique<LocalWriter>(local);
@@ -199,7 +199,7 @@ class FtpSink : public InstallSink {
     }
   }
 
-  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::string* error) override;
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::int64_t size, std::string* error) override;
 
   // 主机答复 452/552 是存储空间不够，重试也没用。
   static bool out_of_space(int code) { return code == 452 || code == 552; }
@@ -225,9 +225,9 @@ class FtpSink : public InstallSink {
   // 上传中途断了：问主机已经存下多少字节，再从那里续传。
   // 主机可能还在把断掉那次传输收到的数据写进文件，这时问到的大小偏小，续传会把文件写坏。
   // 所以先等主机答复断掉的那次传输（答复了说明文件已关闭）；控制连接也断了只能重连时，连问两次大小一致才算数。
-  // fatal 表示不用再试了（主机空间不足）。
-  std::string resume_upload(const std::string& path, bool reply_pending, std::int64_t* stored, SOCKET* data_socket,
-                            bool* fatal) {
+  // fatal 表示不用再试了（主机空间不足）。append_only 时主机上即使没有这个文件也用 APPE。
+  std::string resume_upload(const std::string& path, bool reply_pending, bool append_only, std::int64_t* stored,
+                            SOCKET* data_socket, bool* fatal) {
     std::string error;
     std::string reply;
     int code = 0;
@@ -257,7 +257,21 @@ class FtpSink : public InstallSink {
       previous = *stored;
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    return begin_upload(path, data_socket, *stored > 0 ? "APPE" : "STOR");
+    return begin_upload(path, data_socket, *stored > 0 || append_only ? "APPE" : "STOR");
+  }
+
+  // 先删掉旧文件，之后只用 APPE 写（不存在时 APPE 会新建）。zftpd 上从头写的 STOR 中途断了会把半截文件删掉，
+  // APPE 断了会留着，大文件才能从主机已存下的位置续传。
+  std::string begin_append_upload(const std::string& path, SOCKET* data_socket) {
+    std::string reply;
+    int code = 0;
+    std::string error;
+    if (!roundtrip("DELE " + path, &reply, &code, &error)) return error;
+    if (code != 250) {
+      if (!roundtrip("SIZE " + path, &reply, &code, &error)) return error;
+      if (code == 213) return "无法覆盖主机上的旧文件（" + reply + "）";
+    }
+    return begin_upload(path, data_socket, "APPE");
   }
 
   std::string begin_upload(const std::string& path, SOCKET* data_socket, const char* verb = "STOR") {
@@ -598,8 +612,12 @@ class FtpSink : public InstallSink {
 // 网盘读得慢时数据连接可能空闲太久被主机断开，所以留着最近发出的一段数据，断了就续传。
 class FtpWriter final : public FileWriter {
  public:
-  FtpWriter(FtpSink& sink, std::unique_lock<std::mutex> lock, std::string path, SOCKET data_socket)
-      : sink_(sink), lock_(std::move(lock)), path_(std::move(path)), data_(data_socket) {}
+  // 最近发出的数据留这么多，断了用来补发。比这长的文件断了只能从主机已存下的位置接着写，
+  // 所以用 APPE 写，主机才不会删掉半截文件。
+  static constexpr std::size_t kKeepBytes = 32u << 20;
+
+  FtpWriter(FtpSink& sink, std::unique_lock<std::mutex> lock, std::string path, SOCKET data_socket, bool append_only)
+      : sink_(sink), lock_(std::move(lock)), path_(std::move(path)), data_(data_socket), append_only_(append_only) {}
 
   ~FtpWriter() override {
     if (data_ != INVALID_SOCKET) sink_.end_upload(data_, false);
@@ -639,7 +657,6 @@ class FtpWriter final : public FileWriter {
   }
 
  private:
-  static constexpr std::size_t kKeepBytes = 32u << 20;
   static constexpr int kRetries = 5;
 
   // 环形缓冲：文件第 pos 个字节放在 pos % kKeepBytes，小文件只占自己那么大。
@@ -684,7 +701,7 @@ class FtpWriter final : public FileWriter {
       std::int64_t stored = 0;
       SOCKET socket = INVALID_SOCKET;
       bool fatal = false;
-      error = sink_.resume_upload(path_, awaiting_reply_, &stored, &socket, &fatal);
+      error = sink_.resume_upload(path_, awaiting_reply_, append_only_, &stored, &socket, &fatal);
       awaiting_reply_ = true;
       if (fatal) return error;
       if (!error.empty()) continue;
@@ -705,14 +722,17 @@ class FtpWriter final : public FileWriter {
   // 当前这次传输的结果主机还没答复（续传前要先读掉，确认主机已关掉文件）。
   bool awaiting_reply_ = true;
   bool finished_ = false;
+  bool append_only_ = false;
 };
 
-std::unique_ptr<FileWriter> FtpSink::open_writer(const std::string& path, std::string* error) {
+// 小文件照旧一条 STOR：断了也能从留着的数据从头重发，不用多一次 DELE 往返。
+std::unique_ptr<FileWriter> FtpSink::open_writer(const std::string& path, std::int64_t size, std::string* error) {
   std::unique_lock<std::mutex> lock(io_);
   SOCKET data_socket = INVALID_SOCKET;
-  *error = begin_upload(path, &data_socket);
+  const bool append_only = size < 0 || size > static_cast<std::int64_t>(FtpWriter::kKeepBytes);
+  *error = append_only ? begin_append_upload(path, &data_socket) : begin_upload(path, &data_socket);
   if (!error->empty()) return nullptr;
-  return std::make_unique<FtpWriter>(*this, std::move(lock), path, data_socket);
+  return std::make_unique<FtpWriter>(*this, std::move(lock), path, data_socket, append_only);
 }
 
 std::vector<std::uint8_t> pattern(std::size_t size, std::uint8_t seed) {
@@ -742,7 +762,7 @@ int exercise(InstallSink& sink, const std::filesystem::path& disk_root, const st
   std::string error = sink.ensure_dir("/mnt/usb0/homebrew/.panplay-staging/CUSA00001");
   if (!error.empty()) return fail(label, error);
   {
-    auto writer = sink.open_writer(staging, &error);
+    auto writer = sink.open_writer(staging, static_cast<std::int64_t>(whole.size()), &error);
     if (!writer) return fail(label, error);
     error = writer->write(first.data(), first.size());
     if (error.empty()) error = writer->write(second.data(), second.size());
@@ -757,8 +777,9 @@ int exercise(InstallSink& sink, const std::filesystem::path& disk_root, const st
   if (!storage_path(disk_root, staging, &on_disk, &error)) return fail(label, error);
   if (read_file(on_disk) != whole) return fail(label, "连续写入后的文件内容不一致");
 
+  // 不知道大小时按大文件写：先删旧文件再 APPE，旧内容不能留在前面。
   {
-    auto writer = sink.open_writer(staging, &error);
+    auto writer = sink.open_writer(staging, -1, &error);
     if (!writer) return fail(label, error);
     error = writer->write(first.data(), 10);
     if (!error.empty()) return fail(label, error);
@@ -793,11 +814,13 @@ bool login_ftp(SOCKET control, LineReader* reader, const FtpEndpoint& endpoint, 
     *error = reply.empty() ? "没有收到 FTP 欢迎语" : reply;
     return false;
   }
-  if (!send_line(control, "USER " + endpoint.user) || !reader->read_reply(&reply, &code) || code != 331) {
+  // zftpd 这类主机上的 FTP 不要密码，USER 就直接答 230。
+  if (!send_line(control, "USER " + endpoint.user) || !reader->read_reply(&reply, &code) || (code != 331 && code != 230)) {
     *error = reply.empty() ? "登录用户名被拒绝" : reply;
     return false;
   }
-  if (!send_line(control, "PASS " + endpoint.password) || !reader->read_reply(&reply, &code) || code != 230) {
+  if (code == 331 &&
+      (!send_line(control, "PASS " + endpoint.password) || !reader->read_reply(&reply, &code) || code != 230)) {
     *error = reply.empty() ? "登录被拒绝" : reply;
     return false;
   }
@@ -839,10 +862,12 @@ int run_install_sink_self_test() {
     auto sink = make_local_sink(local_root.u8string());
     if (const int code = exercise(*sink, local_root, "local")) return code;
   }
-  {
-    const std::filesystem::path ftp_root = root / "ftp";
+  for (const bool zftpd : {false, true}) {
+    const std::string label = zftpd ? "ftp-zftpd" : "ftp";
+    const std::filesystem::path ftp_root = root / label;
     std::string error;
     DummyFtp server(ftp_root, 0);
+    server.set_zftpd_style(zftpd);
     if (!server.start(&error)) {
       std::cerr << error << "\n";
       return 1;
@@ -851,10 +876,11 @@ int run_install_sink_self_test() {
     endpoint.port = server.port();
     auto sink = make_ftp_sink(endpoint, &error);
     if (!sink) {
-      std::cerr << error << "\n";
+      std::cerr << label << ": " << error << "\n";
       return 1;
     }
-    if (const int code = exercise(*sink, ftp_root, "ftp")) return code;
+    if (const int code = exercise(*sink, ftp_root, label)) return code;
+    if (zftpd) continue;
     // dummy-ftp 的控制连接 10 秒收不到命令就会断开。读网盘期间必须靠 NOOP 撑过这段空闲。
     std::this_thread::sleep_for(std::chrono::seconds(12));
     std::string idle_error;
@@ -864,36 +890,26 @@ int run_install_sink_self_test() {
     }
   }
   // 网盘读得慢时，主机会掐掉空闲的数据连接；写入方要重新连上，从主机已存下的位置续传。
-  // 第二遍让主机断开后过一秒才把缓冲写进文件：续传要等它写完再问大小，否则会把文件写坏。
-  for (const int close_delay : {0, 1000}) {
-    const std::filesystem::path ftp_root = root / ("ftp-idle-" + std::to_string(close_delay));
+  // 打开后先停 gap_first 毫秒，每段写完再停 700 毫秒，都比主机的数据超时长，会被掐断。
+  // 返回写入的错误，内容不对时返回说明。
+  const auto slow_write = [&](const std::string& label, bool zftpd, int close_delay, std::int64_t size_hint,
+                              const std::vector<std::vector<std::uint8_t>>& parts, int gap_first) -> std::string {
+    const std::filesystem::path ftp_root = root / label;
     std::string error;
     DummyFtp server(ftp_root, 0);
     server.set_data_timeout_ms(300);
     server.set_close_delay_ms(close_delay);
-    if (!server.start(&error)) {
-      std::cerr << error << "\n";
-      return 1;
-    }
+    server.set_zftpd_style(zftpd);
+    if (!server.start(&error)) return error;
     FtpEndpoint endpoint;
     endpoint.port = server.port();
     auto sink = make_ftp_sink(endpoint, &error);
-    if (!sink) {
-      std::cerr << error << "\n";
-      return 1;
-    }
-    if (auto made = sink->ensure_dir("/slow"); !made.empty()) {
-      std::cerr << "ftp-idle: " << made << "\n";
-      return 1;
-    }
-    const std::vector<std::uint8_t> parts[] = {pattern(10000, 3), pattern(200000, 4), pattern(30000, 5)};
+    if (!sink) return error;
+    if (auto made = sink->ensure_dir("/slow"); !made.empty()) return made;
     std::vector<std::uint8_t> whole;
-    auto writer = sink->open_writer("/slow/file.bin", &error);
-    if (!writer) {
-      std::cerr << "ftp-idle: " << error << "\n";
-      return 1;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    auto writer = sink->open_writer("/slow/file.bin", size_hint, &error);
+    if (!writer) return error;
+    if (gap_first > 0) std::this_thread::sleep_for(std::chrono::milliseconds(gap_first));
     for (const auto& part : parts) {
       if (error.empty()) error = writer->write(part.data(), part.size());
       whole.insert(whole.end(), part.begin(), part.end());
@@ -901,14 +917,33 @@ int run_install_sink_self_test() {
     }
     if (error.empty()) error = writer->finish();
     writer.reset();
-    if (!error.empty()) {
-      std::cerr << "ftp-idle: 断开后没有续传: " << error << "\n";
-      return 1;
+    if (!error.empty()) return error;
+    if (read_file(ftp_root / "slow" / "file.bin") != whole) return "续传后的文件内容不对";
+    return "";
+  };
+  // 第二遍让主机断开后过一秒才把缓冲写进文件：续传要等它写完再问大小，否则会把文件写坏。
+  // zftpd 会删掉断掉的 STOR 写了一半的文件，小文件要能从留着的数据从头重发。
+  const std::vector<std::vector<std::uint8_t>> small = {pattern(10000, 3), pattern(200000, 4), pattern(30000, 5)};
+  for (const bool zftpd : {false, true}) {
+    for (const int close_delay : {0, 1000}) {
+      const std::string label = std::string(zftpd ? "ftp-zftpd-idle-" : "ftp-idle-") + std::to_string(close_delay);
+      if (auto error = slow_write(label, zftpd, close_delay, 240000, small, 700); !error.empty()) {
+        std::cerr << label << ": 断开后没有续传: " << error << "\n";
+        return 1;
+      }
     }
-    if (read_file(ftp_root / "slow" / "file.bin") != whole) {
-      std::cerr << "ftp-idle: 续传后的文件内容不对\n";
-      return 1;
-    }
+  }
+  // 比留着的数据长的文件：写过 32 MB 后被掐断。按大文件写（APPE）时 zftpd 留着半截，能接着写；
+  // 当成小文件用 STOR 写时半截被删，接不上，说明上面那条确实是靠 APPE 才过的。
+  const std::vector<std::vector<std::uint8_t>> large = {pattern(40u << 20, 6), pattern(1u << 20, 7)};
+  const std::int64_t large_size = (41 << 20);
+  if (auto error = slow_write("ftp-zftpd-large", true, 0, large_size, large, 0); !error.empty()) {
+    std::cerr << "ftp-zftpd-large: 大文件断开后没有续传: " << error << "\n";
+    return 1;
+  }
+  if (slow_write("ftp-zftpd-large-stor", true, 0, 1, large, 0).empty()) {
+    std::cerr << "ftp-zftpd-large-stor: 模拟的 zftpd 没有删掉断掉的 STOR 文件\n";
+    return 1;
   }
   return 0;
 }
