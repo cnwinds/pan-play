@@ -281,7 +281,11 @@ int bench_download(const std::string& dir, int seconds, int connections, int blo
 }  // namespace
 
 int main(int argc, char** argv) {
-#if !defined(_WIN32)
+#if defined(_WIN32)
+  // 输出都是 UTF-8；中文系统的控制台默认按 GBK 显示，不切过来就是乱码。
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
+#else
   // 对方先关了连接时 send 会触发 SIGPIPE，默认会结束进程。
   std::signal(SIGPIPE, SIG_IGN);
 #endif
