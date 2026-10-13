@@ -71,3 +71,73 @@ jobs:
         with:
           name: panplay-ps5
           path: build-ps5/panplay.elf
+
+  # 自测要 WinRAR 生成测试压缩包，这里没有，自测交给 linux 那边。
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-zlib
+
+      # 界面打包进 exe，发出去只有一个文件。
+      - name: 编译
+        run: |
+          set -o pipefail
+          { cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DPANPLAY_EMBED_UI=ON \
+              && cmake --build build-win; } 2>&1 | tee build.log \
+            || { .github/report-errors.sh build.log; exit 1; }
+
+      - name: 检查能单独运行
+        run: |
+          set -o pipefail
+          if objdump -p build-win/panplay.exe | grep -iE 'DLL Name: (lib|zlib)'; then
+            echo "::error title=动态依赖::panplay.exe 还依赖 MinGW 的 DLL，别的电脑上打不开"
+            exit 1
+          fi
+          ./build-win/panplay.exe http-get https://pan.baidu.com/ > http.log 2>&1 || { .github/report-errors.sh http.log; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panplay-windows
+          path: build-win/panplay.exe
+
+  # 推送 v 开头的标签时发布：Windows 的 exe 和 PS5 的 elf 挂到 Release 上。
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, ps5, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: panplay-{windows,ps5}
+          path: dist
+          merge-multiple: true
+
+      - name: 整理文件
+        run: |
+          mv dist/panplay.exe "dist/panplay-${GITHUB_REF_NAME}-windows-x64.exe"
+          mv dist/panplay.elf "dist/panplay-${GITHUB_REF_NAME}-ps5.elf"
+          cd dist && sha256sum * > SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            **Windows**：下载 `panplay-${{ github.ref_name }}-windows-x64.exe`，双击运行，会自动用浏览器打开 http://127.0.0.1:8734 。要让局域网里的手机也能用，在命令行运行 `panplay.exe serve --lan`。
+            **PS5**：把 `panplay-${{ github.ref_name }}-ps5.elf` 用 payload 加载器发送到主机，主机右上角的通知里有访问地址和口令，用手机或电脑浏览器打开。
+            网盘游戏目录怎么放，见 [网盘游戏目录整理指南](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/game-folder-guide.md)。

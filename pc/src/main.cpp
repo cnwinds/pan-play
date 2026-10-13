@@ -309,6 +309,21 @@ int main(int argc, char** argv) {
     return code;
   }
 #endif
+#if defined(_WIN32)
+  // 双击 exe 时不带参数：直接开本机界面，并用默认浏览器打开。窗口一关程序就退出，所以出错时停住让人看到原因。
+  if (argc < 2) {
+    ServerOptions options;
+    options.on_ready = [](const std::string& url, const std::string&) {
+      ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    };
+    const int code = run_server(options);
+    if (code != 0) {
+      std::cout << "端口 " << options.port << " 可能已被占用，盘游是不是已经开着了？按回车关闭" << std::endl;
+      std::cin.get();
+    }
+    return code;
+  }
+#endif
   if (argc < 2) {
     print_usage();
     return 1;

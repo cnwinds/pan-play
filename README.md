@@ -58,6 +58,7 @@
 
 ## 这一版能做的事
 
+- Windows 上直接双击 `panplay.exe`：等同 `panplay serve`，并自动用浏览器打开界面。端口被占用（比如已经开着一个盘游）时窗口会停住说明原因。
 - `panplay serve`：在 `http://127.0.0.1:8734` 打开界面。设置页填写 AppKey、SecretKey、游戏库目录和存放位置，只保存在这台电脑。
 - `panplay serve 8734 --lan`：监听所有网卡，局域网里的手机也能打开。第一次打开要输访问口令，口令在数据目录的 `access-code.txt`。
 - `panplay http-get <地址>`：排查网络，打印状态码、长度和跳转后的地址。
@@ -81,7 +82,7 @@ $unrar = @(
   "unpack","headers","threadpool","rs16","cmddata","ui","largepage","filestr","scantree","dll","qopen","isnt","motw"
 ) | ForEach-Object { "third_party/unrar/$_.cpp" }
 $src = @(Get-ChildItem core\src\*.cpp, pc\src\*.cpp | ForEach-Object { $_.FullName }) + $unrar
-& "D:\tools\msys64\mingw64\bin\g++.exe" -std=c++17 -O2 -DRARDLL -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -I core/include -I pc/src -I third_party/unrar @src -lwinhttp -lws2_32 -lz -lole32 -luuid -ladvapi32 -lpowrprof -lshell32 -o build/panplay.exe
+& "D:\tools\msys64\mingw64\bin\g++.exe" -static -std=c++17 -O2 -DRARDLL -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -I core/include -I pc/src -I third_party/unrar @src -lwinhttp -lws2_32 -lz -lole32 -luuid -ladvapi32 -lpowrprof -lshell32 -o build/panplay.exe
 .\build\panplay.exe self-test
 ```
 
@@ -109,6 +110,8 @@ $PS5_PAYLOAD_SDK/bin/prospero-cmake -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYP
 
 载荷不带参数启动时，直接以局域网模式在 8734 端口开界面，主机右上角通知里给出地址和访问口令。数据在 `/data/panplay`，游戏装到「主机目录」设置的本机路径（默认 `/mnt/usb0/homebrew`）。
 
-推送后 GitHub Actions（`.github/workflows/build.yml`）会编出 Linux 版并跑自测，再编出 PS5 的 `panplay.elf`，都在运行记录的 Artifacts 里下载。
+推送后 GitHub Actions（`.github/workflows/build.yml`）会编出 Linux 版并跑自测，再编出 PS5 的 `panplay.elf` 和 Windows 的 `panplay.exe`（MSYS2 MinGW 静态链接、界面打包在里面，单个文件就能运行），都在运行记录的 Artifacts 里下载。
+
+发布新版本：在 `main` 上打 `v` 开头的标签并推送（如 `git tag v0.1.0 && git push origin v0.1.0`），三个平台都编过后，自动建 GitHub Release，挂上 Windows 的 exe、PS5 的 elf 和 `SHA256SUMS.txt`。
 
 界面里保存密钥。开发时环境变量 `PANPLAY_BAIDU_APP_KEY` 和 `PANPLAY_BAIDU_SECRET_KEY` 可以覆盖本机设置。会话在数据目录的 `baidu-session.json`。

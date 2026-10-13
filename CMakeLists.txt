@@ -77,7 +77,11 @@ if(PS5)
 endif()
 
 if(WIN32)
-  target_link_libraries(panplay PRIVATE winhttp ws2_32 z ole32 uuid advapi32 powrprof)
+  target_link_libraries(panplay PRIVATE winhttp ws2_32 z ole32 uuid advapi32 powrprof shell32)
+  # 静态链接 libstdc++、zlib 等，发出去的 exe 单独一个文件就能运行。
+  if(MINGW)
+    target_link_options(panplay PRIVATE -static)
+  endif()
 else()
   include(FetchContent)
   find_package(Threads REQUIRED)
