@@ -44,6 +44,19 @@ bool run_rar(const std::string& args) {
   return std::system(command.c_str()) == 0;
 }
 
+// 用 7-Zip 命令行生成测试 7z：Windows 上默认装在 Program Files，其他平台是 PATH 里的 7z，也可以用 PANPLAY_7Z 指定。
+bool run_7z(const std::string& args) {
+  const char* custom = std::getenv("PANPLAY_7Z");
+#if defined(_WIN32)
+  const std::string program = custom != nullptr && *custom != 0 ? custom : "C:\\Program Files\\7-Zip\\7z.exe";
+  const std::string command = "\"\"" + program + "\" " + args + " >NUL 2>&1\"";
+#else
+  const std::string program = custom != nullptr && *custom != 0 ? custom : "7z";
+  const std::string command = "\"" + program + "\" " + args + " >/dev/null 2>&1";
+#endif
+  return std::system(command.c_str()) == 0;
+}
+
 struct FakeFile {
   std::int64_t size = 0;
   Generator fill;
@@ -1189,6 +1202,183 @@ int cancel_install_test() {
   return 0;
 }
 
+// 压缩不了的随机内容，用来把 7z 撑出多个分卷。
+std::vector<std::uint8_t> noise(std::size_t size, std::uint32_t seed) {
+  std::vector<std::uint8_t> bytes(size);
+  std::uint32_t state = seed * 2654435761u + 1;
+  for (auto& byte : bytes) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    byte = static_cast<std::uint8_t>(state >> 24);
+  }
+  return bytes;
+}
+
+std::vector<std::uint8_t> read_disk_file(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in), {});
+}
+
+void write_disk_file(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+int sevenzip_test() {
+  const auto work = std::filesystem::temp_directory_path() / "panplay-7z-test";
+  std::error_code ignored;
+  std::filesystem::remove_all(work, ignored);
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code remove_error;
+      std::filesystem::remove_all(path, remove_error);
+    }
+  } cleanup{work};
+
+  // 游戏根目录是 Game/，外面的 readme.txt 不装。eboot.bin 里塞了很多 E8，让 x86 过滤器真的有东西可转。
+  const auto param = pattern(300, 1);
+  auto eboot = pattern(300000, 2);
+  for (std::size_t i = 0; i < eboot.size(); i += 37) eboot[i] = 0xE8;
+  const auto big = noise(400000, 3);
+  const auto src = work / "src";
+  write_disk_file(src / "Game" / "sce_sys" / "param.json", param);
+  write_disk_file(src / "Game" / "eboot.bin", eboot);
+  write_disk_file(src / "Game" / "data" / "big.bin", big);
+  write_disk_file(src / "Game" / "data" / "empty.bin", {});
+  std::filesystem::create_directories(src / "Game" / "data" / "emptydir");
+  write_disk_file(src / "readme.txt", pattern(50, 4));
+  const std::map<std::string, const std::vector<std::uint8_t>*> expected{
+      {"sce_sys/param.json", &param}, {"eboot.bin", &eboot}, {"data/big.bin", &big}};
+
+  FakeDrive drive;
+  // 打包成 7z，按名字顺序把各分卷放进网盘目录。返回分卷数，失败时为 0。
+  const auto pack = [&](const std::string& name, const std::string& options, const std::string& dir) -> std::size_t {
+    const auto out_dir = work / name;
+    std::filesystem::create_directories(out_dir);
+    if (!run_7z("a -y -bd " + options + " " + shell_quoted(out_dir / "game.7z") + " " + shell_quoted(src / "Game") + " " +
+                shell_quoted(src / "readme.txt"))) {
+      return 0;
+    }
+    std::vector<std::filesystem::path> volumes;
+    for (const auto& entry : std::filesystem::directory_iterator(out_dir)) volumes.push_back(entry.path());
+    std::sort(volumes.begin(), volumes.end());
+    for (const auto& volume : volumes) drive.add(dir + "/" + volume.filename().string(), read_disk_file(volume));
+    return volumes.size();
+  };
+
+  struct Case {
+    const char* name;
+    const char* options;
+    std::size_t min_volumes;
+  };
+  const Case cases[] = {
+      {"lzma2-bcj-split", "-mx=5 -mf=BCJ -v100k", 4},
+      {"lzma-arm64", "-m0=ARM64 -m1=LZMA:d=64k -ms=off", 1},
+      {"delta-lzma2", "-m0=Delta:4 -m1=LZMA2 -ms=on", 1},
+      {"copy", "-m0=Copy", 1},
+  };
+  int index = 0;
+  for (const auto& test : cases) {
+    const std::string id = "CUSA3000" + std::to_string(index++);
+    const std::string dir = std::string("/apps/panplay/Seven ") + id;
+    const std::size_t volumes = pack(test.name, test.options, dir);
+    if (volumes == 0) return fail(std::string("7-Zip 没能生成测试 7z（可以用 PANPLAY_7Z 指定 7z 程序）: ") + test.name);
+    if (volumes < test.min_volumes) return fail(std::string("测试 7z 分卷数不对: ") + test.name);
+
+    std::string error;
+    const auto games = scan_library(drive, "/apps/panplay", &error);
+    const GameFolder* game = nullptr;
+    for (const auto& found : games) {
+      if (found.title_id == id) game = &found;
+    }
+    if (game == nullptr || game->sets.size() != 1 || game->sets[0].format != "7z" || game->sets[0].parts.size() != volumes) {
+      return fail(std::string("没有把 7z 分卷认成一组: ") + test.name);
+    }
+
+    const auto local_root = work / ("install-" + std::string(test.name));
+    auto local = make_local_sink(local_root.u8string());
+    CountingSink counted(*local);
+    InstallRequest request;
+    request.source_dir = dir;
+    request.dest_prefix = "/data/homebrew";
+    std::int64_t last_bytes = -1;
+    std::int64_t bytes_total = 0;
+    bool bytes_backwards = false;
+    request.on_progress = [&](const InstallResult& snapshot) {
+      if (snapshot.bytes_done < last_bytes) bytes_backwards = true;
+      last_bytes = snapshot.bytes_done;
+      bytes_total = snapshot.bytes_total;
+    };
+    const bool resume = test.min_volumes > 1;
+    if (resume) {
+      // 中途断开，第二次接着装，装好的文件不再重写。
+      request.stop_after_output_bytes = 650000;
+      const InstallResult stopped = install_game(drive, counted, request);
+      if (stopped.status != "interrupted") return fail("7z 中途断开后状态不对: " + stopped.status + " " + stopped.message);
+      request.stop_after_output_bytes = -1;
+      counted.reset();
+      last_bytes = -1;
+    }
+    const InstallResult installed = install_game(drive, counted, request);
+    if (installed.status != "installed" || installed.files_total != 4) {
+      return fail(std::string("7z 没装好: ") + test.name + " " + installed.message);
+    }
+    if (resume && (counted.writers_opened() >= 4 || installed.files_checked == 0)) return fail("7z 续装时重写了已装好的文件");
+    if (bytes_total <= 0 || last_bytes != bytes_total || bytes_backwards) {
+      return fail(std::string("7z 按字节的安装进度不对: ") + test.name);
+    }
+    const auto game_dir = local_root / "data" / "homebrew" / id;
+    for (const auto& [name, bytes] : expected) {
+      if (read_disk_file(game_dir / name) != *bytes) return fail(std::string("7z 解压内容不对: ") + test.name + " " + name);
+    }
+    if (!std::filesystem::exists(game_dir / "data" / "empty.bin") || std::filesystem::file_size(game_dir / "data" / "empty.bin") != 0) {
+      return fail(std::string("7z 里的空文件没装上: ") + test.name);
+    }
+    if (!std::filesystem::is_directory(game_dir / "data" / "emptydir")) return fail(std::string("7z 里的空目录没建出来: ") + test.name);
+    if (std::filesystem::exists(game_dir / "readme.txt") || std::filesystem::exists(game_dir / "Game")) {
+      return fail(std::string("7z 游戏根目录外的文件被装进去了: ") + test.name);
+    }
+    if (std::filesystem::exists(local_root / "data" / "homebrew" / ".panplay-staging")) {
+      return fail(std::string("7z 装完后暂存区没有清干净: ") + test.name);
+    }
+    if (install_game(drive, *local, request).status != "already") return fail(std::string("7z 装完后没有显示已安装: ") + test.name);
+  }
+
+  // 不支持的方法在读目录时就拒绝，不写任何文件。精简版 7zr 不能压 PPMd，生成不了就跳过这一项。
+  struct Refused {
+    const char* name;
+    const char* options;
+    const char* word;
+    bool optional;
+  };
+  const Refused refused[] = {{"ppmd", "-m0=PPMd", "PPMd", true},
+                             {"bcj2", "-mf=BCJ2", "BCJ2", false},
+                             {"password", "-ppanplay", "密码", false},
+                             {"password-header", "-ppanplay -mhe=on", "密码", false}};
+  int refused_index = 0;
+  for (const auto& test : refused) {
+    const std::string dir = "/apps/panplay/Refused CUSA3100" + std::to_string(refused_index++);
+    if (pack(test.name, test.options, dir) == 0) {
+      if (test.optional) continue;
+      return fail(std::string("7-Zip 没能生成测试 7z: ") + test.name);
+    }
+    MemorySink sink;
+    InstallRequest request;
+    request.source_dir = dir;
+    const InstallResult result = install_game(drive, sink, request);
+    if (result.status != "error" || result.message.find(test.word) == std::string::npos ||
+        result.message.find("ZIP / RAR") == std::string::npos) {
+      return fail(std::string("不支持的 7z 没有明确拒绝: ") + test.name + " " + result.message);
+    }
+    if (result.retryable) return fail(std::string("不支持的 7z 失败不该能重试: ") + test.name);
+    if (!sink.files.empty()) return fail(std::string("拒绝 7z 之前写了文件: ") + test.name);
+  }
+  return 0;
+}
+
 }  // namespace
 
 int run_install_pipeline_self_test() {
@@ -1314,7 +1504,7 @@ int run_install_pipeline_self_test() {
   rejected.source_dir = "/apps/panplay/Old";
   auto local_probe = make_local_sink(std::filesystem::temp_directory_path().u8string());
   InstallResult only_7z = install_game(drive, *local_probe, rejected);
-  if (only_7z.status != "error" || only_7z.message.find("7z") == std::string::npos) return fail("7z 没有被拒绝");
+  if (only_7z.status != "error" || only_7z.message.find("7z") == std::string::npos) return fail("坏的 7z 没有报错");
 
   const auto root = std::filesystem::temp_directory_path() / "panplay-install-test";
   std::error_code ignored;
@@ -1492,6 +1682,7 @@ int run_install_pipeline_self_test() {
   if (const int code = zip64_split_test()) return code;
   if (const int code = cancel_install_test()) return code;
   if (const int code = large_file_test()) return code;
+  if (const int code = sevenzip_test()) return code;
 
   std::cout << "self-test ok\n";
   return 0;

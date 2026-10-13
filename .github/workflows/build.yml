@@ -11,8 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # 自测也要用 7-Zip 现做测试 7z。
       - name: 安装依赖
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+        run: |
+          sudo apt-get update && sudo apt-get install -y cmake ninja-build 7zip
+          echo "PANPLAY_7Z=$(command -v 7zz || command -v 7z)" >> "$GITHUB_ENV"
 
       # 自测要用 RAR 命令行现做测试压缩包。
       - name: 下载 RAR 命令行
@@ -72,7 +75,7 @@ jobs:
           name: panplay-ps5
           path: build-ps5/panplay.elf
 
-  # 自测要 WinRAR 生成测试压缩包，这里没有，自测交给 linux 那边。
+  # 自测要 WinRAR 和 7-Zip 生成测试压缩包，这里没有，自测交给 linux 那边。
   windows:
     runs-on: windows-2022
     defaults:

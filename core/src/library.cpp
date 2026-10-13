@@ -30,17 +30,26 @@ bool parse_z_volume(const std::string& lower, std::string* stem, int* order) {
   return true;
 }
 
-bool parse_zip_parts(const std::string& lower, std::string* stem, int* order) {
-  const auto marker = lower.rfind(".zip.");
+// 直接切开的分卷：name.zip.001、name.7z.001 这样，marker 是 ".zip." 或 ".7z."。
+bool parse_numbered_parts(const std::string& lower, const std::string& marker_text, std::string* stem, int* order) {
+  const auto marker = lower.rfind(marker_text);
   if (marker == std::string::npos) return false;
-  const std::string number = lower.substr(marker + 5);
-  if (number.empty()) return false;
+  const std::string number = lower.substr(marker + marker_text.size());
+  if (number.empty() || number.size() > 6) return false;
   for (char ch : number) {
     if (!std::isdigit(static_cast<unsigned char>(ch))) return false;
   }
   *stem = lower.substr(0, marker);
   *order = std::stoi(number);
   return true;
+}
+
+bool parse_zip_parts(const std::string& lower, std::string* stem, int* order) {
+  return parse_numbered_parts(lower, ".zip.", stem, order);
+}
+
+bool parse_7z_parts(const std::string& lower, std::string* stem, int* order) {
+  return parse_numbered_parts(lower, ".7z.", stem, order);
 }
 
 bool parse_part_rar(const std::string& lower, std::string* stem, int* order) {
@@ -75,7 +84,7 @@ bool is_archive_name(const std::string& name) {
   if (parse_z_volume(lower, &stem, &order) || parse_zip_parts(lower, &stem, &order)) return true;
   if (parse_part_rar(lower, &stem, &order) || parse_old_rar_volume(lower, &stem, &order)) return true;
   if (ends_with(lower, ".zip") || ends_with(lower, ".7z") || ends_with(lower, ".rar")) return true;
-  return lower.find(".7z.") != std::string::npos;
+  return parse_7z_parts(lower, &stem, &order);
 }
 
 std::string archive_format(const std::string& name) {
@@ -85,7 +94,7 @@ std::string archive_format(const std::string& name) {
   if (parse_zip_parts(lower, &stem, &order) || parse_z_volume(lower, &stem, &order) || ends_with(lower, ".zip")) {
     return "zip";
   }
-  if (ends_with(lower, ".7z") || lower.find(".7z.") != std::string::npos) return "7z";
+  if (ends_with(lower, ".7z") || parse_7z_parts(lower, &stem, &order)) return "7z";
   return "rar";
 }
 
@@ -175,8 +184,11 @@ std::vector<ArchiveSet> group_archives(const std::vector<DriveEntry>& files) {
         item.key = "single:" + std::to_string(single++);
         item.order = 0;
       }
+    } else if (parse_7z_parts(lower, &stem, &order)) {
+      item.key = "7znum:" + stem;
+      item.order = order;
     } else {
-      item.key = "other:" + std::to_string(single++);
+      item.key = "single:" + std::to_string(single++);
       item.order = 0;
     }
     items.push_back(std::move(item));

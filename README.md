@@ -66,9 +66,9 @@
 - `panplay http-get <地址>`：排查网络，打印状态码、长度和跳转后的地址。
 - `panplay login` / `ls` / `scan` / `install` / `read`：同一套安装流程的命令行
 - `panplay dummy-ftp <端口> <根目录> [--zftpd]`：在 `127.0.0.1` 上模拟主机 FTP 目录。带 `--zftpd` 时学 PS5 上的 zftpd：不要密码，从头写的 STOR 中途断了会删掉半截文件
-- `panplay self-test`：检查 JSON、FTP 续写、ZIP 分卷续传，以及单卷 RAR 安装
+- `panplay self-test`：检查 JSON、FTP 续写、ZIP 分卷续传、RAR 安装，以及 7z 分卷、固实、过滤器、续传和不支持方法的拒绝
 
-开放平台授权后，游戏库一般在 `/apps/应用名`。主游戏、补丁怎么放、叠放顺序和出了新补丁怎么只装补丁，见 [网盘游戏目录整理指南](docs/game-folder-guide.md)。能安装单卷和带分卷头的 ZIP（存储和 Deflate），以及 RAR。7z 会明确拒绝。写入规则是：远端文件大小等于已提交字节才 `APPE`；对不上就重新 `STOR` 覆盖。已校验通过的文件继续时不再重写。FTP 上超过 32 MB 的文件先 `DELE` 再只用 `APPE` 写：zftpd 上从头写的 `STOR` 断了会删掉半截文件，`APPE` 不会，大文件断线后才能从主机已存下的位置续传。
+开放平台授权后，游戏库一般在 `/apps/应用名`。主游戏、补丁怎么放、叠放顺序和出了新补丁怎么只装补丁，见 [网盘游戏目录整理指南](docs/game-folder-guide.md)。能安装单卷和带分卷头的 ZIP（存储和 Deflate）、RAR，以及 7z（单个或 `.7z.001` 分卷；存储、LZMA、LZMA2，可带 BCJ / ARM64 等可执行文件过滤器和 Delta）。7z 用了 PPMd、BCJ2 或加了密码时明确拒绝，提示用默认设置重新压缩或换成 ZIP / RAR；PS5 上字典超过 128 MB 的也拒绝。7z 同样边下载边解压：固实块里不需要的文件解出来直接丢掉，不落盘。写入规则是：远端文件大小等于已提交字节才 `APPE`；对不上就重新 `STOR` 覆盖。已校验通过的文件继续时不再重写。FTP 上超过 32 MB 的文件先 `DELE` 再只用 `APPE` 写：zftpd 上从头写的 `STOR` 断了会删掉半截文件，`APPE` 不会，大文件断线后才能从主机已存下的位置续传。
 
 ## 构建
 
@@ -83,8 +83,16 @@ $unrar = @(
   "getbits","sha1","sha256","blake2s","hash","extinfo","extract","volume","list","find",
   "unpack","headers","threadpool","rs16","cmddata","ui","largepage","filestr","scantree","dll","qopen","isnt","motw"
 ) | ForEach-Object { "third_party/unrar/$_.cpp" }
-$src = @(Get-ChildItem core\src\*.cpp, pc\src\*.cpp | ForEach-Object { $_.FullName }) + $unrar
-& "D:\tools\msys64\mingw64\bin\g++.exe" -static -std=c++17 -O2 -DRARDLL -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -I core/include -I pc/src -I third_party/unrar @src -lwinhttp -lws2_32 -lz -lole32 -luuid -ladvapi32 -lpowrprof -lshell32 -o build/panplay.exe
+# 7z 用到的 LZMA SDK 是 C 代码，先用 gcc 编成目标文件。
+New-Item -ItemType Directory -Force -Path build\lzma | Out-Null
+$lzma = @(
+  "7zArcIn","7zBuf","7zCrc","7zCrcOpt","7zDec","7zStream","Bcj2","Bra","Bra86","BraIA64","CpuArch","Delta","LzmaDec","Lzma2Dec"
+) | ForEach-Object {
+  & "D:\tools\msys64\mingw64\bin\gcc.exe" -c -O2 "third_party/lzma/$_.c" -o "build/lzma/$_.o"
+  "build/lzma/$_.o"
+}
+$src = @(Get-ChildItem core\src\*.cpp, pc\src\*.cpp | ForEach-Object { $_.FullName }) + $unrar + $lzma
+& "D:\tools\msys64\mingw64\bin\g++.exe" -static -std=c++17 -O2 -DRARDLL -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -I core/include -I pc/src -I third_party/unrar -I third_party/lzma @src -lwinhttp -lws2_32 -lz -lole32 -luuid -ladvapi32 -lpowrprof -lshell32 -o build/panplay.exe
 .\build\panplay.exe self-test
 ```
 
@@ -97,7 +105,7 @@ cmake --build build --config Release
 
 ### Linux 和 PS5
 
-Windows 以外的平台用自带的 HTTPS 客户端（mbedTLS），mbedTLS、zlib 和根证书包（curl.se 的 `cacert.pem`）在 CMake 配置时下载。Linux 上自测需要 PATH 里有 `rar`，或者用 `PANPLAY_RAR` 指定。
+Windows 以外的平台用自带的 HTTPS 客户端（mbedTLS），mbedTLS、zlib 和根证书包（curl.se 的 `cacert.pem`）在 CMake 配置时下载。Linux 上自测需要 PATH 里有 `rar` 和 `7z`，或者用 `PANPLAY_RAR`、`PANPLAY_7Z` 指定；Windows 上默认用 `C:\Program Files\WinRAR\Rar.exe` 和 `C:\Program Files\7-Zip\7z.exe`，7-Zip 装在别处时用 `PANPLAY_7Z` 指定（精简版 `7zr.exe` 也行，它压不了 PPMd，那一项会跳过）。
 
 ```bash
 cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-linux

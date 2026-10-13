@@ -1,6 +1,8 @@
 #pragma once
 
+#include "panplay/drive.hpp"
 #include "panplay/install.hpp"
+#include "panplay/prefetch.hpp"
 #include "panplay/sink.hpp"
 
 #include <chrono>
@@ -15,6 +17,46 @@ inline constexpr const char* kInterrupted = "interrupted";
 
 std::string parent_path(const std::string& path);
 
+// 压缩包里的路径换成安全的相对路径：反斜杠换成斜杠，去掉 "." 和多余斜杠，目录保留结尾斜杠。
+// 绝对路径、".."、带冒号或控制字符的返回 false。
+bool safe_archive_name(const std::string& name, std::string* normalized, bool* directory);
+
+// 一组分卷里的一卷。start 是它在整组拼接后的起点。
+struct ArchiveVolume {
+  std::string file_id;
+  std::int64_t size = 0;
+  std::int64_t start = 0;
+};
+
+std::vector<ArchiveVolume> archive_volumes(const std::vector<DriveEntry>& parts);
+
+// 随机读一小段，可以跨卷。只用于读目录。
+std::string read_span(DrivePlugin& drive, const std::vector<ArchiveVolume>& volumes, std::int64_t position, std::size_t size,
+                      std::vector<std::uint8_t>* out);
+
+// 在整组分卷上顺序读，每卷一个预读器。
+class VolumeStream {
+ public:
+  VolumeStream(DrivePlugin& drive, std::vector<ArchiveVolume> volumes, const CancelToken* cancel, PrefetchOptions options);
+
+  std::int64_t position() const { return position_; }
+  std::string seek(std::int64_t position);
+  // 读满 size 字节，读不满算出错。
+  std::string read(std::uint8_t* dst, std::size_t size);
+  std::string skip(std::int64_t size);
+
+ private:
+  void open_volume(std::size_t index);
+
+  DrivePlugin& drive_;
+  std::vector<ArchiveVolume> volumes_;
+  const CancelToken* cancel_;
+  PrefetchOptions options_;
+  std::size_t index_ = 0;
+  std::unique_ptr<PrefetchReader> reader_;
+  std::int64_t position_ = 0;
+};
+
 // 索尼的 .pkg 安装包要在主机上用安装工具安装，解压到 homebrew 里主机和 ShadowMountPlus 都不认。
 // 压缩包里没有 sce_sys、却有这么大的 .pkg，就当作安装包拒绝；小的 .pkg 可能是游戏自己的数据文件。
 inline constexpr std::int64_t kInstallPackageMinBytes = 64ll << 20;
@@ -22,6 +64,8 @@ bool is_install_package(const std::string& name, std::int64_t size);
 bool in_sce_sys(const std::string& name);
 std::string install_package_error(const std::string& name);
 bool is_install_package_error(const std::string& message);
+// 7z 用了不支持的方法、加了密码或字典太大：压缩包本身的问题，再装一次也一样。
+bool is_unsupported_7z_error(const std::string& message);
 
 // 解压出的一个文件：第一次写入时才建目录、开写入流，同时算 CRC。
 // stop >= 0 时，累计写满 stop 字节就返回 kInterrupted，供自测模拟中断。expected 是压缩包里记的解压后大小。

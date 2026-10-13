@@ -63,11 +63,19 @@ if(WIN32)
   list(APPEND UNRAR_SOURCES third_party/unrar/isnt.cpp third_party/unrar/motw.cpp)
 endif()
 
+# LZMA SDK 里解 7z 要用的部分：读目录、LZMA/LZMA2 解码和可执行文件过滤器。
+set(LZMA_SOURCES 7zArcIn 7zBuf 7zCrc 7zCrcOpt 7zDec 7zStream Bcj2 Bra Bra86 BraIA64 CpuArch Delta LzmaDec Lzma2Dec)
+list(TRANSFORM LZMA_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lzma/")
+list(TRANSFORM LZMA_SOURCES APPEND ".c")
+add_library(panplay_lzma STATIC ${LZMA_SOURCES})
+target_include_directories(panplay_lzma PUBLIC third_party/lzma)
+
 file(GLOB CORE_SOURCES CONFIGURE_DEPENDS core/src/*.cpp)
 file(GLOB PC_SOURCES CONFIGURE_DEPENDS pc/src/*.cpp)
 
 add_executable(panplay ${CORE_SOURCES} ${PC_SOURCES} ${UNRAR_SOURCES})
 target_include_directories(panplay PRIVATE core/include pc/src third_party/unrar)
+target_link_libraries(panplay PRIVATE panplay_lzma)
 target_compile_definitions(panplay PRIVATE RARDLL _FILE_OFFSET_BITS=64 _LARGEFILE_SOURCE)
 set_source_files_properties(${UNRAR_SOURCES} PROPERTIES CXX_STANDARD 11)
 

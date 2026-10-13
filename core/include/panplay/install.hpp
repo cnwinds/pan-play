@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -85,6 +86,65 @@ struct RarExtract {
 std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
                                 const RarExtract& options, std::vector<FinishedFile>* done,
                                 std::vector<ListedRarEntry>* listed);
+
+struct SevenZipFile {
+  // 已换成安全的相对路径，目录带结尾斜杠。
+  std::string name;
+  bool directory = false;
+  // 符号链接：照常解码，但不装。
+  bool link = false;
+  bool has_crc = false;
+  std::uint32_t crc = 0;
+  std::uint64_t size = 0;
+  // 数据在哪个块里；-1 表示没有数据（目录或空文件）。
+  int folder = -1;
+};
+
+// 7z 的一个块：一段压缩数据解出一串首尾相接的文件。固实压缩时整包可能只有一块。
+struct SevenZipFolder {
+  // 压缩数据在整组分卷拼接后的位置。
+  std::int64_t pack_offset = 0;
+  std::uint64_t pack_size = 0;
+  std::uint64_t unpack_size = 0;
+  std::uint32_t method = 0;
+  std::vector<std::uint8_t> props;
+  // 解压后再过一遍的过滤器，0 表示没有。
+  std::uint32_t filter = 0;
+  std::vector<std::uint8_t> filter_props;
+  bool has_crc = false;
+  std::uint32_t crc = 0;
+  // 块里依次是哪些文件（SevenZipArchive::files 的下标）。
+  std::vector<std::size_t> files;
+};
+
+struct SevenZipArchive {
+  std::vector<SevenZipFile> files;
+  std::vector<SevenZipFolder> folders;
+};
+
+// 只读包头和包尾的目录。用了这一版不支持的压缩方法、加了密码、字典超过主机内存时直接报错，不开始下载。
+std::string read_7z_archive(DrivePlugin& drive, const std::vector<DriveEntry>& parts, SevenZipArchive* archive);
+
+struct SevenZipExtract {
+  std::string staging_root;
+  JournalWriter* journal = nullptr;
+  std::int64_t* written = nullptr;
+  std::int64_t stop_after_output_bytes = -1;
+  const CancelToken* cancel = nullptr;
+  PrefetchOptions prefetch;
+  // 按 SevenZipArchive::files 的下标给出暂存区里的路径；空的不装。
+  std::vector<std::string> targets;
+  // 上次已装好的文件（暂存区路径 -> 大小和 CRC），这次只核对后跳过。
+  const std::map<std::string, std::pair<std::int64_t, std::uint32_t>>* finished_before = nullptr;
+  std::function<void(const std::vector<FinishedFile>& done)> on_file_done;
+  std::function<void(bool already)> on_entry;
+  std::function<void(std::int64_t archive_bytes)> on_bytes;
+};
+
+// 按块顺序边下载边解压：块里不需要的文件解码后丢掉，块里最后一个要装的文件解完就不再往下读。
+std::string extract_7z_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
+                               const SevenZipArchive& archive, const SevenZipExtract& options,
+                               std::vector<FinishedFile>* done);
 
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request);
 // 游戏已经装好，但网盘目录里（除去 skip_sets）的压缩包和装的时候不一样了（比如多了补丁）。没装好时返回 false。

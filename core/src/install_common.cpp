@@ -2,6 +2,7 @@
 
 #include "panplay/json.hpp"
 
+#include <algorithm>
 #include <cctype>
 
 #include <zlib.h>
@@ -12,6 +13,118 @@ std::string parent_path(const std::string& path) {
   const auto slash = path.rfind('/');
   if (slash == std::string::npos || slash == 0) return "/";
   return path.substr(0, slash);
+}
+
+bool safe_archive_name(const std::string& name, std::string* normalized, bool* directory) {
+  std::string path = name;
+  for (char& ch : path) {
+    if (ch == '\\') ch = '/';
+  }
+  *directory = !path.empty() && path.back() == '/';
+  if (path.empty() || path.front() == '/') return false;
+  for (const char ch : path) {
+    if (static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F) return false;
+  }
+  std::string out;
+  std::size_t index = 0;
+  while (index < path.size()) {
+    while (index < path.size() && path[index] == '/') ++index;
+    if (index >= path.size()) break;
+    const auto slash = path.find('/', index);
+    const auto end = slash == std::string::npos ? path.size() : slash;
+    const std::string segment = path.substr(index, end - index);
+    index = end;
+    if (segment.empty() || segment == ".") continue;
+    if (segment == ".." || segment.find(':') != std::string::npos) return false;
+    if (!out.empty()) out += "/";
+    out += segment;
+  }
+  if (out.empty()) return false;
+  if (*directory) out += "/";
+  *normalized = out;
+  return true;
+}
+
+std::vector<ArchiveVolume> archive_volumes(const std::vector<DriveEntry>& parts) {
+  std::vector<ArchiveVolume> volumes;
+  std::int64_t start = 0;
+  for (const auto& part : parts) {
+    volumes.push_back(ArchiveVolume{part.file_id, part.size, start});
+    start += part.size;
+  }
+  return volumes;
+}
+
+std::string read_span(DrivePlugin& drive, const std::vector<ArchiveVolume>& volumes, std::int64_t position, std::size_t size,
+                      std::vector<std::uint8_t>* out) {
+  out->clear();
+  out->reserve(size);
+  for (const auto& volume : volumes) {
+    if (out->size() == size) break;
+    const std::int64_t end = volume.start + volume.size;
+    if (position >= end) continue;
+    if (position < volume.start) return "压缩包偏移越界";
+    while (out->size() < size && position < end) {
+      const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size - out->size()),
+                                                                         end - position));
+      ReadResult got = drive.read_at(volume.file_id, position - volume.start, want);
+      if (!got.error.empty()) return got.error;
+      if (got.bytes.empty() || got.bytes.size() > want) return "压缩包意外结束";
+      out->insert(out->end(), got.bytes.begin(), got.bytes.end());
+      position += static_cast<std::int64_t>(got.bytes.size());
+    }
+  }
+  return out->size() == size ? "" : "压缩包意外结束";
+}
+
+VolumeStream::VolumeStream(DrivePlugin& drive, std::vector<ArchiveVolume> volumes, const CancelToken* cancel,
+                           PrefetchOptions options)
+    : drive_(drive), volumes_(std::move(volumes)), cancel_(cancel), options_(options) {}
+
+std::string VolumeStream::seek(std::int64_t position) {
+  for (std::size_t i = 0; i < volumes_.size(); ++i) {
+    const ArchiveVolume& volume = volumes_[i];
+    if (position < volume.start || position >= volume.start + volume.size) continue;
+    if (i != index_ || !reader_) open_volume(i);
+    position_ = position;
+    return reader_->seek(position - volume.start);
+  }
+  return "压缩包偏移越界";
+}
+
+std::string VolumeStream::read(std::uint8_t* dst, std::size_t size) {
+  std::size_t filled = 0;
+  while (filled < size) {
+    if (!reader_ || reader_->position() >= reader_->size()) {
+      const std::size_t next = reader_ ? index_ + 1 : 0;
+      if (next >= volumes_.size()) return "压缩包意外结束";
+      open_volume(next);
+      continue;
+    }
+    std::string error;
+    const std::size_t got = reader_->read(dst + filled, size - filled, &error);
+    if (!error.empty()) return error;
+    if (got == 0) {
+      if (index_ + 1 >= volumes_.size()) return "压缩包意外结束";
+      open_volume(index_ + 1);
+      continue;
+    }
+    filled += got;
+    position_ += static_cast<std::int64_t>(got);
+  }
+  return "";
+}
+
+std::string VolumeStream::skip(std::int64_t size) {
+  if (size == 0) return "";
+  return seek(position_ + size);
+}
+
+void VolumeStream::open_volume(std::size_t index) {
+  reader_.reset();
+  index_ = index;
+  reader_ = std::make_unique<PrefetchReader>(drive_, volumes_[index].file_id, volumes_[index].size, cancel_, options_);
+  position_ = volumes_[index].start;
 }
 
 namespace {

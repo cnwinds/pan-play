@@ -20,13 +20,6 @@
 namespace panplay {
 namespace {
 
-// 一组分卷里的一卷。start 是它在整组拼接后的起点。
-struct ZipVolume {
-  std::string file_id;
-  std::int64_t size = 0;
-  std::int64_t start = 0;
-};
-
 struct Member {
   int set_index = 0;
   std::string name;
@@ -39,6 +32,8 @@ struct Member {
   std::uint64_t uncomp_size = 0;
   // 本地文件头在整组拼接后的位置。
   std::int64_t local_offset = 0;
+  // 在 7z 文件列表里的序号。
+  std::size_t seven_index = 0;
 };
 
 std::uint16_t read_u16(const std::uint8_t* data) {
@@ -61,133 +56,6 @@ std::string base_name(std::string path) {
   return path.substr(slash + 1);
 }
 
-bool safe_zip_name(const std::string& name, std::string* normalized, bool* directory) {
-  std::string path = name;
-  for (char& ch : path) {
-    if (ch == '\\') ch = '/';
-  }
-  *directory = !path.empty() && path.back() == '/';
-  if (path.empty() || path.front() == '/') return false;
-  for (const char ch : path) {
-    if (static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F) return false;
-  }
-  std::string out;
-  std::size_t index = 0;
-  while (index < path.size()) {
-    while (index < path.size() && path[index] == '/') ++index;
-    if (index >= path.size()) break;
-    const auto slash = path.find('/', index);
-    const auto end = slash == std::string::npos ? path.size() : slash;
-    const std::string segment = path.substr(index, end - index);
-    index = end;
-    if (segment.empty() || segment == ".") continue;
-    if (segment == ".." || segment.find(':') != std::string::npos) return false;
-    if (!out.empty()) out += "/";
-    out += segment;
-  }
-  if (out.empty()) return false;
-  if (*directory) out += "/";
-  *normalized = out;
-  return true;
-}
-
-std::vector<ZipVolume> zip_volumes(const std::vector<DriveEntry>& parts) {
-  std::vector<ZipVolume> volumes;
-  std::int64_t start = 0;
-  for (const auto& part : parts) {
-    volumes.push_back(ZipVolume{part.file_id, part.size, start});
-    start += part.size;
-  }
-  return volumes;
-}
-
-// 随机读一小段，可以跨卷。只用于读目录。
-std::string read_span(DrivePlugin& drive, const std::vector<ZipVolume>& volumes, std::int64_t position, std::size_t size,
-                      std::vector<std::uint8_t>* out) {
-  out->clear();
-  out->reserve(size);
-  for (const auto& volume : volumes) {
-    if (out->size() == size) break;
-    const std::int64_t end = volume.start + volume.size;
-    if (position >= end) continue;
-    if (position < volume.start) return "压缩包偏移越界";
-    while (out->size() < size && position < end) {
-      const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size - out->size()),
-                                                                         end - position));
-      ReadResult got = drive.read_at(volume.file_id, position - volume.start, want);
-      if (!got.error.empty()) return got.error;
-      if (got.bytes.empty() || got.bytes.size() > want) return "压缩包意外结束";
-      out->insert(out->end(), got.bytes.begin(), got.bytes.end());
-      position += static_cast<std::int64_t>(got.bytes.size());
-    }
-  }
-  return out->size() == size ? "" : "压缩包意外结束";
-}
-
-// 在整组分卷上顺序读，每卷一个预读器。
-class ZipStream {
- public:
-  ZipStream(DrivePlugin& drive, std::vector<ZipVolume> volumes, const CancelToken* cancel, PrefetchOptions options)
-      : drive_(drive), volumes_(std::move(volumes)), cancel_(cancel), options_(options) {}
-
-  std::int64_t position() const { return position_; }
-
-  std::string seek(std::int64_t position) {
-    for (std::size_t i = 0; i < volumes_.size(); ++i) {
-      const ZipVolume& volume = volumes_[i];
-      if (position < volume.start || position >= volume.start + volume.size) continue;
-      if (i != index_ || !reader_) open_volume(i);
-      position_ = position;
-      return reader_->seek(position - volume.start);
-    }
-    return "压缩包偏移越界";
-  }
-
-  std::string read(std::uint8_t* dst, std::size_t size) {
-    std::size_t filled = 0;
-    while (filled < size) {
-      if (!reader_ || reader_->position() >= reader_->size()) {
-        const std::size_t next = reader_ ? index_ + 1 : 0;
-        if (next >= volumes_.size()) return "压缩包意外结束";
-        open_volume(next);
-        continue;
-      }
-      std::string error;
-      const std::size_t got = reader_->read(dst + filled, size - filled, &error);
-      if (!error.empty()) return error;
-      if (got == 0) {
-        if (index_ + 1 >= volumes_.size()) return "压缩包意外结束";
-        open_volume(index_ + 1);
-        continue;
-      }
-      filled += got;
-      position_ += static_cast<std::int64_t>(got);
-    }
-    return "";
-  }
-
-  std::string skip(std::int64_t size) {
-    if (size == 0) return "";
-    return seek(position_ + size);
-  }
-
- private:
-  void open_volume(std::size_t index) {
-    reader_.reset();
-    index_ = index;
-    reader_ = std::make_unique<PrefetchReader>(drive_, volumes_[index].file_id, volumes_[index].size, cancel_, options_);
-    position_ = volumes_[index].start;
-  }
-
-  DrivePlugin& drive_;
-  std::vector<ZipVolume> volumes_;
-  const CancelToken* cancel_;
-  PrefetchOptions options_;
-  std::size_t index_ = 0;
-  std::unique_ptr<PrefetchReader> reader_;
-  std::int64_t position_ = 0;
-};
-
 constexpr std::uint32_t kLocalHeader = 0x04034b50;
 constexpr std::uint32_t kCentralHeader = 0x02014b50;
 constexpr std::uint32_t kEndRecord = 0x06054b50;
@@ -203,14 +71,14 @@ struct CentralDirectory {
 };
 
 // 分卷 ZIP 的偏移按卷号分别算；单个 ZIP 和 .zip.001 这种直接切开的，卷号都是 0，偏移就是拼接后的位置。
-std::string to_logical(const std::vector<ZipVolume>& volumes, std::uint64_t disk, std::uint64_t offset, std::int64_t* out) {
+std::string to_logical(const std::vector<ArchiveVolume>& volumes, std::uint64_t disk, std::uint64_t offset, std::int64_t* out) {
   if (disk >= volumes.size()) return "ZIP 记录的分卷号超出了分卷数";
   *out = volumes[static_cast<std::size_t>(disk)].start + static_cast<std::int64_t>(offset);
   return "";
 }
 
-std::string find_central_directory(DrivePlugin& drive, const std::vector<ZipVolume>& volumes, CentralDirectory* cd) {
-  const ZipVolume& last = volumes.back();
+std::string find_central_directory(DrivePlugin& drive, const std::vector<ArchiveVolume>& volumes, CentralDirectory* cd) {
+  const ArchiveVolume& last = volumes.back();
   const std::size_t tail_size = static_cast<std::size_t>(std::min<std::int64_t>(last.size, 22 + 65535 + 20));
   const std::int64_t tail_start = last.start + last.size - static_cast<std::int64_t>(tail_size);
   std::vector<std::uint8_t> tail;
@@ -250,7 +118,7 @@ std::string find_central_directory(DrivePlugin& drive, const std::vector<ZipVolu
   return "";
 }
 
-std::string read_zip_members(DrivePlugin& drive, const std::vector<ZipVolume>& volumes, int set_index,
+std::string read_zip_members(DrivePlugin& drive, const std::vector<ArchiveVolume>& volumes, int set_index,
                              std::vector<Member>* members) {
   CentralDirectory cd;
   if (auto error = find_central_directory(drive, volumes, &cd); !error.empty()) return error;
@@ -309,7 +177,7 @@ std::string read_zip_members(DrivePlugin& drive, const std::vector<ZipVolume>& v
     at += record;
 
     if ((flags & 1) != 0) return "ZIP 有密码，这一版不能安装";
-    if (!safe_zip_name(raw_name, &member.name, &member.directory)) return "压缩包路径不安全";
+    if (!safe_archive_name(raw_name, &member.name, &member.directory)) return "压缩包路径不安全";
     if (!member.directory && method != 0 && method != 8) return "ZIP 使用了不支持的压缩方法";
     if (auto error = to_logical(volumes, disk, local, &member.local_offset); !error.empty()) return error;
     members->push_back(std::move(member));
@@ -420,7 +288,7 @@ void remove_stale(InstallSink& sink, const std::string& final_root, const std::v
     const std::string name = entry.str("name");
     std::string normalized;
     bool directory = false;
-    if (!safe_zip_name(name, &normalized, &directory) || directory || current.count(normalized) != 0) continue;
+    if (!safe_archive_name(name, &normalized, &directory) || directory || current.count(normalized) != 0) continue;
     sink.remove_file(join_storage_path(final_root, normalized));
     for (auto slash = normalized.rfind('/'); slash != std::string::npos; slash = normalized.rfind('/', slash - 1)) {
       dirs.insert(normalized.substr(0, slash));
@@ -453,7 +321,7 @@ bool already_done(const ExtractContext& context, const Member& member) {
 
 bool cancelled(const CancelToken* cancel) { return cancel != nullptr && cancel->cancelled(); }
 
-std::string copy_member(ZipStream& stream, const Member& member, OutputFile& out, const CancelToken* cancel) {
+std::string copy_member(VolumeStream& stream, const Member& member, OutputFile& out, const CancelToken* cancel) {
   constexpr std::size_t kChunk = 64u << 10;
   std::vector<std::uint8_t> input(kChunk);
   std::uint64_t left = member.comp_size;
@@ -501,7 +369,7 @@ std::string copy_member(ZipStream& stream, const Member& member, OutputFile& out
   return error;
 }
 
-std::string extract_member(ZipStream& stream, ExtractContext& context, const Member& member, std::vector<FinishedFile>* done) {
+std::string extract_member(VolumeStream& stream, ExtractContext& context, const Member& member, std::vector<FinishedFile>* done) {
   if (member.directory) return "";
   if (already_done(context, member)) return "";
   if (context.stop >= 0 && *context.written >= context.stop) return kInterrupted;
@@ -616,7 +484,7 @@ bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const s
   if (!read_marker(sink, dest_prefix, source_dir, &marker)) return false;
   std::vector<ArchiveSet> installable;
   for (const auto& set : sets) {
-    if ((set.format == "zip" || set.format == "rar") && skip_sets.count(archive_set_id(set)) == 0) {
+    if ((set.format == "zip" || set.format == "rar" || set.format == "7z") && skip_sets.count(archive_set_id(set)) == 0) {
       installable.push_back(set);
     }
   }
@@ -667,7 +535,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   const auto fail = [&](const std::string& message) {
     result.status = message == kInterrupted ? "interrupted" : "error";
     result.message = message == kInterrupted ? "已中断，再次执行安装会继续" : message;
-    result.retryable = !is_install_package_error(message);
+    result.retryable = !is_install_package_error(message) && !is_unsupported_7z_error(message);
     return result;
   };
   const auto interrupted = [&]() {
@@ -683,20 +551,20 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   const auto sets = group_archives(files);
   std::vector<ArchiveSet> zips;
   std::vector<ArchiveSet> rars;
-  bool other = false;
+  std::vector<ArchiveSet> sevens;
   for (const auto& set : sets) {
     if (set.format == "zip") zips.push_back(set);
     else if (set.format == "rar") rars.push_back(set);
-    else other = true;
+    else if (set.format == "7z") sevens.push_back(set);
   }
-  if (zips.empty() && rars.empty()) return fail(other ? "还不能安装 7z" : "这个目录里没有压缩包");
+  if (zips.empty() && rars.empty() && sevens.empty()) return fail("这个目录里没有压缩包");
 
   // 每个压缩包（可能分卷）各自原样解压到暂存区，最后按各自的游戏根目录合并。
   // 多个压缩包时各占暂存区里的 "<序号>/" 子目录，免得同名文件互相覆盖。
   struct Source {
     bool rar = false;
     const ArchiveSet* set = nullptr;
-    std::vector<ZipVolume> volumes;
+    std::vector<ArchiveVolume> volumes;
     std::vector<Member> members;
     std::string prefix;
     std::int64_t start = 0;
@@ -707,10 +575,16 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     // 这一层的身份：各分卷的文件名和大小。完成标记按它记下装过哪些层。
     std::string id;
     bool extracted = false;
+    bool sevenzip = false;
+    SevenZipArchive seven;
   };
   std::vector<Source> sources;
   for (const auto& set : zips) sources.push_back(Source{false, &set});
   for (const auto& set : rars) sources.push_back(Source{true, &set});
+  for (const auto& set : sevens) {
+    sources.push_back(Source{false, &set});
+    sources.back().sevenzip = true;
+  }
   // 暂存区序号按全部压缩包编，改了要装哪些之后，没跳过的仍落在原来的子目录里。
   for (std::size_t i = 0; i < sources.size(); ++i) {
     sources[i].folder = archive_folder(request.source_dir, sources[i].set->parts.front().path);
@@ -724,8 +598,25 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   for (std::size_t i = 0; i < sources.size(); ++i) {
     Source& source = sources[i];
     if (source.rar) continue;
-    source.volumes = zip_volumes(source.set->parts);
-    if (auto zip_error = read_zip_members(drive, source.volumes, static_cast<int>(i), &source.members); !zip_error.empty()) {
+    source.volumes = archive_volumes(source.set->parts);
+    if (source.sevenzip) {
+      if (auto seven_error = read_7z_archive(drive, source.set->parts, &source.seven); !seven_error.empty()) {
+        return fail(seven_error);
+      }
+      for (std::size_t k = 0; k < source.seven.files.size(); ++k) {
+        const SevenZipFile& file = source.seven.files[k];
+        if (file.link) continue;
+        Member member;
+        member.set_index = static_cast<int>(i);
+        member.seven_index = k;
+        member.name = file.name;
+        member.directory = file.directory;
+        member.crc = file.crc;
+        member.uncomp_size = file.size;
+        source.members.push_back(std::move(member));
+      }
+    } else if (auto zip_error = read_zip_members(drive, source.volumes, static_cast<int>(i), &source.members);
+               !zip_error.empty()) {
       return fail(zip_error);
     }
     for (auto& member : source.members) member.staged = source.prefix + member.name;
@@ -768,7 +659,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       for (const auto& entry : entries->array) {
         Member member;
         bool directory = false;
-        if (!safe_zip_name(entry.str("name"), &member.name, &directory) || directory) continue;
+        if (!safe_archive_name(entry.str("name"), &member.name, &directory) || directory) continue;
         try {
           member.crc = static_cast<std::uint32_t>(std::stoul(entry.str("crc32")));
           member.uncomp_size = std::stoull(entry.str("size"));
@@ -853,13 +744,40 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       }
       return find_game_root(source.members, &source.root, &source.has_param);
     }
+    if (source.sevenzip) {
+      SevenZipExtract options;
+      options.staging_root = staging_root;
+      options.journal = &journal;
+      options.written = &written;
+      options.stop_after_output_bytes = request.stop_after_output_bytes;
+      options.cancel = request.cancel;
+      options.prefetch = request.prefetch;
+      options.targets.resize(source.seven.files.size());
+      for (const auto& member : source.members) {
+        if (member.directory || member.name.compare(0, source.root.size(), source.root) != 0) continue;
+        options.targets[member.seven_index] = member.staged;
+      }
+      options.finished_before = &context.finished_before;
+      options.on_file_done = [&](const std::vector<FinishedFile>& now_done) {
+        result.files_done = static_cast<int>(now_done.size());
+        report(phase);
+      };
+      options.on_bytes = [&](std::int64_t bytes) {
+        result.bytes_done = source.start + bytes;
+        report(phase);
+      };
+      options.on_entry = enter_entry;
+      const std::string seven_error = extract_7z_entries(drive, sink, source.set->parts, source.seven, options, &done);
+      result.files_done = static_cast<int>(done.size());
+      return seven_error;
+    }
     std::vector<const Member*> ordered;
     for (const auto& member : source.members) {
       if (member.name.compare(0, source.root.size(), source.root) == 0) ordered.push_back(&member);
     }
     std::sort(ordered.begin(), ordered.end(),
               [](const Member* left, const Member* right) { return left->local_offset < right->local_offset; });
-    ZipStream stream(drive, source.volumes, request.cancel, request.prefetch);
+    VolumeStream stream(drive, source.volumes, request.cancel, request.prefetch);
     for (const Member* member : ordered) {
       if (!member->directory) enter_entry(already_done(context, *member));
       const std::string zip_error = extract_member(stream, context, *member, &done);

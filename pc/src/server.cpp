@@ -270,7 +270,7 @@ std::string json_error(const std::string& message) { return "{\"error\":\"" + pa
 std::string archive_problem(const panplay::GameFolder& game) {
   if (game.sets.empty()) return "empty";
   for (const auto& set : game.sets) {
-    if (set.format == "zip" || set.format == "rar") return "";
+    if (set.format == "zip" || set.format == "rar" || set.format == "7z") return "";
   }
   return "unsupported";
 }
@@ -599,7 +599,7 @@ std::string layers_json(const panplay::GameFolder& game, const std::set<std::str
   };
   std::vector<Layer> layers;
   for (const auto& set : game.sets) {
-    if (set.format != "zip" && set.format != "rar") continue;
+    if (set.format != "zip" && set.format != "rar" && set.format != "7z") continue;
     Layer layer{&set, panplay::archive_set_id(set), panplay::archive_folder(game.path, set.parts.front().path)};
     for (const auto& part : set.parts) layer.bytes += part.size;
     layers.push_back(std::move(layer));
