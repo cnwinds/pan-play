@@ -35,6 +35,17 @@ bool net_startup(std::string* error) {
   return true;
 }
 
+void set_listen_exclusive(SOCKET socket) {
+  const int on = 1;
+#if defined(_WIN32)
+  // Windows 的 SO_REUSEADDR 允许别的进程绑同一个端口，请求会被随机一方接走；要用独占。
+  setsockopt(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&on), sizeof(on));
+#else
+  // POSIX 的 SO_REUSEADDR 只是让 TIME_WAIT 里的端口能马上重新监听，不允许两个进程同时监听。
+  setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+#endif
+}
+
 void set_socket_timeout(SOCKET socket, int milliseconds) {
 #if defined(_WIN32)
   const DWORD timeout = static_cast<DWORD>(milliseconds);

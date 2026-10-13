@@ -49,8 +49,7 @@ SOCKET listen_on(std::uint16_t port, std::uint16_t* bound, std::string* error) {
     *error = "无法创建套接字";
     return INVALID_SOCKET;
   }
-  const int reuse = 1;
-  setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+  set_listen_exclusive(socket);
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(port);

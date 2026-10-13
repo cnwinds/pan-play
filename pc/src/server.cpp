@@ -1384,8 +1384,7 @@ int run_server(const ServerOptions& options) {
   if (lan.enabled) lan.code = load_or_create_access_code();
   const char* bind_host = lan.enabled ? "0.0.0.0" : "127.0.0.1";
   SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  const int reuse = 1;
-  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+  panplay::set_listen_exclusive(listener);
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(static_cast<std::uint16_t>(port));

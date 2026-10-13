@@ -38,6 +38,8 @@ using socklen = socklen_t;
 #endif
 
 bool net_startup(std::string* error);
+// 监听套接字在 bind 前调用：端口被别的进程占着时 bind 要失败，不能两个进程一起监听同一个端口。
+void set_listen_exclusive(SOCKET socket);
 void set_socket_timeout(SOCKET socket, int milliseconds);
 // 从别的线程关掉套接字时用：POSIX 上只 close 叫不醒阻塞在 accept/recv 里的线程，要先 shutdown。
 void close_socket_now(SOCKET socket);
