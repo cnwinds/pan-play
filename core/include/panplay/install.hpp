@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,8 @@ struct InstallRequest {
   std::function<void(const InstallResult&)> on_progress;
   const CancelToken* cancel = nullptr;
   PrefetchOptions prefetch;
+  // 用户选了不装的压缩包组（按 archive_set_id）。是否已安装、有没有更新也只看没跳过的。
+  std::set<std::string> skip_sets;
 };
 
 struct Destination {
@@ -84,6 +87,11 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
                                 std::vector<ListedRarEntry>* listed);
 
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request);
+// 游戏已经装好，但网盘目录里（除去 skip_sets）的压缩包和装的时候不一样了（比如多了补丁）。没装好时返回 false。
+bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
+                      const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets = {});
+// 已装好的游戏按顺序叠了哪些压缩包组（archive_set_id）。没装好或旧版本装的返回空。
+std::vector<std::string> installed_sets(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 // 删掉没装完的游戏留在暂存区的全部文件，之后只能从头装。已经装好的游戏不受影响。
 std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 bool parse_destination(const std::string& text, Destination* destination, std::string* error);

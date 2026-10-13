@@ -543,6 +543,55 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
          ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + "}";
 }
 
+std::unique_ptr<panplay::InstallSink> open_sink(const AppSettings& settings, std::string* error);
+
+// 能装的每组压缩包一项，供安装前挑选补丁。主游戏是直接放在游戏目录里最大的那组（都在子目录里时取最大的），
+// 必装；子目录里的算补丁，游戏目录里其他的（多是 backport）算附加。按主游戏、补丁（自然排序）、附加的顺序列出。
+std::string layers_json(const panplay::GameFolder& game, const std::set<std::string>& skipped,
+                        const std::vector<std::string>& installed) {
+  struct Layer {
+    const panplay::ArchiveSet* set;
+    std::string id;
+    std::string folder;
+    std::int64_t bytes = 0;
+    std::string role;
+  };
+  std::vector<Layer> layers;
+  for (const auto& set : game.sets) {
+    if (set.format != "zip" && set.format != "rar") continue;
+    Layer layer{&set, panplay::archive_set_id(set), panplay::archive_folder(game.path, set.parts.front().path)};
+    for (const auto& part : set.parts) layer.bytes += part.size;
+    layers.push_back(std::move(layer));
+  }
+  Layer* main = nullptr;
+  for (const bool root_only : {true, false}) {
+    for (auto& layer : layers) {
+      if (root_only && !layer.folder.empty()) continue;
+      if (main == nullptr || layer.bytes > main->bytes) main = &layer;
+    }
+    if (main != nullptr) break;
+  }
+  for (auto& layer : layers) layer.role = &layer == main ? "main" : layer.folder.empty() ? "extra" : "patch";
+  const auto rank = [](const Layer& layer) { return layer.role == "main" ? 0 : layer.role == "patch" ? 1 : 2; };
+  std::stable_sort(layers.begin(), layers.end(), [&](const Layer& left, const Layer& right) {
+    if (rank(left) != rank(right)) return rank(left) < rank(right);
+    if (const int order = panplay::natural_compare(left.folder, right.folder); order != 0) return order < 0;
+    return panplay::natural_compare(left.set->parts.front().name, right.set->parts.front().name) < 0;
+  });
+  std::string json = "[";
+  for (const auto& layer : layers) {
+    if (json.size() > 1) json += ",";
+    const bool is_installed = std::find(installed.begin(), installed.end(), layer.id) != installed.end();
+    json += "{\"id\":\"" + panplay::json_escape(layer.id) + "\",\"name\":\"" +
+            panplay::json_escape(layer.set->parts.front().name) + "\",\"folder\":\"" + panplay::json_escape(layer.folder) +
+            "\",\"parts\":" + std::to_string(layer.set->parts.size()) + ",\"bytes\":" + std::to_string(layer.bytes) +
+            ",\"role\":\"" + layer.role + "\",\"skipped\":" +
+            (layer.role != "main" && skipped.count(layer.id) != 0 ? "true" : "false") +
+            ",\"installed\":" + (is_installed ? "true" : "false") + "}";
+  }
+  return json + "]";
+}
+
 std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) {
   const AppSettings settings = load_settings();
   std::string error;
@@ -574,12 +623,23 @@ std::string one_game_json(panplay::DrivePlugin& drive, const std::string& path) 
     if (sink && state.empty()) state = game_state(*sink, settings.prefix(), game);
     else if (!sink && !dest.empty()) state = "install";
   }
+  // 装好之后网盘里又放了补丁（或改了要装哪些）：读一下这款游戏的完成标记，和现在要装的压缩包对一下。
+  const std::set<std::string> skipped = load_skipped_sets(path);
+  std::vector<std::string> installed;
+  if (state == "installed") {
+    std::string sink_error;
+    if (auto sink = open_sink(settings, &sink_error)) {
+      if (panplay::install_outdated(*sink, settings.prefix(), path, game.sets, skipped)) state = "update";
+      installed = panplay::installed_sets(*sink, settings.prefix(), path);
+    }
+  }
   const auto queued = queue_states();
   if (queued.count(path) != 0) state = queued.at(path);
   return "{\"name\":\"" + panplay::json_escape(game.name) + "\",\"path\":\"" + panplay::json_escape(game.path) +
          "\",\"title_id\":\"" + panplay::json_escape(game.title_id) + "\",\"archive_bytes\":" +
          std::to_string(game.archive_bytes) + ",\"formats\":\"" + panplay::json_escape(formats_of(game)) +
-         "\",\"state\":\"" + state + "\"" + game_meta_fields(game.name, game.title_id, load_name_overrides(), true) + "}";
+         "\",\"state\":\"" + state + "\",\"layers\":" + layers_json(game, skipped, installed) +
+         game_meta_fields(game.name, game.title_id, load_name_overrides(), true) + "}";
 }
 
 void publish_progress(const panplay::InstallResult& snapshot) {
@@ -644,6 +704,7 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
       request.dest_prefix = settings.prefix();
       request.on_progress = publish_progress;
       request.cancel = cancel;
+      request.skip_sets = load_skipped_sets(path);
       result = panplay::install_game(*drive, *sink, request);
     }
   } catch (const std::exception& ex) {
@@ -1124,6 +1185,17 @@ void handle_client(SOCKET client) {
         if (installs.discarding.count(path) != 0) {
           reply_json(client, 409, json_error("正在删除这个游戏没装完的文件，删完再装"));
           return;
+        }
+        // 带了 skip 就是用户刚选过要装哪些；没带（继续、重试）沿用上次的选择。
+        if (const panplay::Json* skip = json.get("skip")) {
+          std::set<std::string> skipped;
+          for (const auto& id : skip->array) {
+            if (!id.text.empty()) skipped.insert(id.text);
+          }
+          if (const std::string save_error = save_skipped_sets(path, skipped); !save_error.empty()) {
+            reply_json(client, 500, json_error(save_error));
+            return;
+          }
         }
         erase_path(installs.finished, path);
         InstallTask task;

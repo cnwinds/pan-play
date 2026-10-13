@@ -505,6 +505,32 @@ body.drawer-open { overflow: hidden; }
 
 .drawer-close:hover { color: var(--text); background: var(--raise); }
 
+.hero-refresh {
+  position: absolute;
+  top: 14px;
+  right: 56px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(19, 26, 39, 0.7);
+  color: var(--muted);
+  transition: color 0.15s, background-color 0.15s;
+}
+
+.hero-refresh:hover:not(:disabled) { color: var(--text); background: var(--raise); }
+.hero-refresh[hidden] { display: none; }
+.hero-refresh:disabled { cursor: progress; }
+.hero-refresh[data-state="busy"] { color: var(--signal-hi); }
+.hero-refresh[data-state="busy"] svg { animation: spin 0.9s linear infinite; }
+.hero-refresh[data-state="done"] { color: var(--mint); }
+.hero-refresh[data-state="warn"] { color: var(--amber); }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .hero {
   position: relative;
   overflow: hidden;
@@ -610,7 +636,33 @@ body.drawer-open { overflow: hidden; }
 
 .progress-row .link:hover { color: var(--danger); }
 
-.install .discard {
+.action-row {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.action-row .btn.primary { flex: 1; min-width: 0; }
+.action-row[hidden],
+.action-row .btn[hidden] { display: none; }
+
+.install .btn.discard {
+  flex: none;
+  min-width: 76px;
+  padding: 0 1rem;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-weight: 500;
+  transition: border-color 0.15s, color 0.15s, background-color 0.15s;
+}
+
+.install .btn.discard:hover:not(:disabled) {
+  border-color: rgba(255, 138, 122, 0.55);
+  background: rgba(255, 138, 122, 0.08);
+  color: var(--danger);
+}
+
+.install .text-link {
   justify-self: center;
   padding: 0;
   border: 0;
@@ -621,8 +673,93 @@ body.drawer-open { overflow: hidden; }
   text-underline-offset: 3px;
 }
 
-.install .discard:hover { color: var(--danger); }
-.install .discard:disabled { opacity: 0.6; text-decoration: none; }
+.install .text-link:hover { color: var(--text); }
+
+/* 安装前挑选要装的补丁 */
+.layer-picker {
+  display: grid;
+  gap: 0.6rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--deck);
+}
+
+.layer-picker[hidden] { display: none; }
+
+.picker-head { font-weight: 700; }
+.picker-hint { color: var(--muted); font-size: 0.84rem; }
+
+.layer-list {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0.2rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.layer-item label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.layer-item label:hover { border-color: var(--faint); }
+
+.layer-item label:has(input:checked) {
+  border-color: rgba(77, 139, 255, 0.55);
+  background: rgba(77, 139, 255, 0.07);
+}
+
+.layer-item label:has(input:disabled) { cursor: default; }
+
+.layer-item input {
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0;
+  accent-color: var(--signal);
+}
+
+.layer-text { display: grid; min-width: 0; }
+
+.layer-name,
+.layer-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.layer-meta { color: var(--muted); font-size: 0.78rem; }
+
+.layer-item label:not(:has(input:checked)) .layer-name { color: var(--muted); text-decoration: line-through; }
+
+.layer-tags { display: flex; gap: 0.3rem; }
+
+.layer-tag {
+  padding: 0.1rem 0.45rem;
+  border-radius: 5px;
+  background: var(--line);
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.layer-tag.main { background: rgba(77, 139, 255, 0.18); color: var(--signal-hi); }
+.layer-tag.patch { background: rgba(240, 179, 87, 0.16); color: var(--amber); }
+.layer-tag.installed { background: rgba(95, 211, 160, 0.14); color: var(--mint); }
+
+.picker-warn { color: var(--amber); font-size: 0.84rem; }
+.picker-warn[hidden] { display: none; }
+.picker-total { color: var(--muted); font-size: 0.84rem; }
+
+.picker-actions { display: flex; gap: 0.6rem; }
+.picker-actions .btn.primary { flex: 1; min-height: 42px; font-size: 0.95rem; }
 
 .meter {
   display: block;

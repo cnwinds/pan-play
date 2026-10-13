@@ -230,6 +230,7 @@ function paintArt(art, game) {
   art.querySelector(".badge")?.remove();
   if (game.state === "installed") art.append(el("span", "badge installed", "已安装"));
   if (game.state === "continue") art.append(el("span", "badge continue", "未装完"));
+  if (game.state === "update") art.append(el("span", "badge continue", "有更新"));
   if (game.state === "queued") art.append(el("span", "badge queued num", "排队 " + (queuePosition(game.path) || "")));
 }
 
@@ -517,8 +518,9 @@ async function discardInstall(game) {
   return "";
 }
 
-async function startInstall(game) {
-  const error = await queueAction("/api/install", { path: game.path });
+// skip 是选了不装的压缩包组；不传时沿用上次的选择。
+async function startInstall(game, skip) {
+  const error = await queueAction("/api/install", skip ? { path: game.path, skip } : { path: game.path });
   if (error && detail && detail.game === game) detail.fail(error);
 }
 
@@ -685,6 +687,7 @@ dockClear.addEventListener("click", () => queueAction("/api/queue/clear", {}));
 const actionText = {
   install: "安装到主机",
   continue: "继续安装",
+  update: "安装更新",
   installed: "已安装到主机",
   installing: "正在安装…",
   unsupported: "这种压缩包还不能安装",
@@ -710,6 +713,94 @@ function nameSourceText(game) {
   return "网盘目录名";
 }
 
+const layerRoleText = { main: "主游戏", patch: "补丁", extra: "附加" };
+
+// 安装前挑选要装哪些压缩包组。主游戏必装；按列表从上到下叠加，后装的覆盖先装的同名文件。
+function buildLayerPicker(onConfirm, onCancel) {
+  const panel = el("div", "layer-picker");
+  panel.hidden = true;
+  const head = el("p", "picker-head", "选择要安装的内容");
+  const hint = el("p", "picker-hint", "按从上到下的顺序叠加，后面的覆盖前面的同名文件。用不上的补丁可以不装。");
+  const list = el("ul", "layer-list");
+  const warn = el("p", "picker-warn");
+  const total = el("p", "picker-total num");
+  const actions = el("div", "picker-actions");
+  const confirm = el("button", "btn primary", "开始安装");
+  confirm.type = "button";
+  const cancel = el("button", "btn quiet", "取消");
+  cancel.type = "button";
+  actions.append(confirm, cancel);
+  panel.append(head, hint, list, warn, total, actions);
+
+  let layers = [];
+  let unchanged = false;
+  const boxes = new Map();
+  const refresh = () => {
+    const chosen = layers.filter((layer) => boxes.get(layer.id).checked);
+    const dropped = layers.filter((layer) => layer.installed && !boxes.get(layer.id).checked);
+    const fresh = chosen.filter((layer) => !layer.installed);
+    const bytes = (items) => items.reduce((sum, layer) => sum + layer.bytes, 0);
+    warn.textContent = dropped.length
+      ? `取消已装的「${dropped.map((layer) => layer.folder || layer.name).join("」「")}」后，要从头重装整个游戏，主游戏也会重新下载。`
+      : "";
+    warn.hidden = !warn.textContent;
+    const installed = layers.some((layer) => layer.installed);
+    total.textContent = installed && !dropped.length
+      ? `这次新装 ${fresh.length} 项，共 ${formatBytes(bytes(fresh))}`
+      : `共 ${chosen.length} 项，${formatBytes(bytes(chosen))}`;
+    unchanged = installed && !dropped.length && !fresh.length &&
+      layers.every((layer) => boxes.get(layer.id).checked !== Boolean(layer.skipped) || layer.role === "main");
+    if (unchanged) confirm.textContent = "保持现状";
+    else if (installed && !dropped.length) confirm.textContent = fresh.length ? "安装所选补丁" : "保存选择";
+    else confirm.textContent = "开始安装";
+  };
+
+  confirm.addEventListener("click", () => {
+    const skip = layers.filter((layer) => !boxes.get(layer.id).checked).map((layer) => layer.id);
+    panel.hidden = true;
+    if (unchanged) onCancel();
+    else onConfirm(skip);
+  });
+  cancel.addEventListener("click", () => {
+    panel.hidden = true;
+    onCancel();
+  });
+
+  return {
+    panel,
+    open(items) {
+      layers = items;
+      boxes.clear();
+      list.replaceChildren(...layers.map((layer) => {
+        const item = el("li", "layer-item");
+        const label = el("label");
+        const box = el("input");
+        box.type = "checkbox";
+        box.checked = layer.role === "main" || !layer.skipped;
+        box.disabled = layer.role === "main";
+        box.addEventListener("change", refresh);
+        boxes.set(layer.id, box);
+        const text = el("span", "layer-text");
+        const name = el("span", "layer-name", layer.folder || layer.name);
+        const tags = el("span", "layer-tags");
+        tags.append(el("span", `layer-tag ${layer.role}`, layerRoleText[layer.role] || ""));
+        if (layer.installed) tags.append(el("span", "layer-tag installed", "已装"));
+        const meta = [layer.folder ? layer.name : "", layer.parts > 1 ? `${layer.parts} 卷` : "", formatBytes(layer.bytes)];
+        text.append(name, el("span", "layer-meta num", meta.filter(Boolean).join(" · ")));
+        label.append(box, text, tags);
+        item.append(label);
+        return item;
+      }));
+      refresh();
+      panel.hidden = false;
+      confirm.focus();
+    },
+    close() {
+      panel.hidden = true;
+    },
+  };
+}
+
 function openDetail(game, opener) {
   closeDetail();
   detailOverlay.hidden = false;
@@ -726,7 +817,10 @@ function openDetail(game, opener) {
   const facts = el("div", "facts num");
   heading.append(title, facts);
   row.append(artSlot, heading);
-  hero.append(backdrop, row);
+  const refreshMeta = el("button", "hero-refresh");
+  refreshMeta.type = "button";
+  refreshMeta.innerHTML = '<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5v3h-3"/></svg>';
+  hero.append(backdrop, row, refreshMeta);
 
   const install = el("div", "drawer-section install");
   const action = el("button", "btn primary");
@@ -753,9 +847,27 @@ function openDetail(game, opener) {
   queueRow.append(queueText, queueLinks);
   const status = el("p", "status-text");
   status.setAttribute("role", "status");
-  const discard = el("button", "discard", "删除已装了一部分的文件");
+  const discard = el("button", "btn discard", "删除");
   discard.type = "button";
-  install.append(action, discard, progress, queueRow, status);
+  discard.title = "删除已经装了一部分的文件，之后要从头装";
+  const actionRow = el("div", "action-row");
+  actionRow.append(action, discard);
+  const adjust = el("button", "text-link", "调整要装的补丁");
+  adjust.type = "button";
+  // picking：选择面板开着；waitingLayers：点了安装但压缩包列表还没读到，读到后再决定要不要先选。
+  let picking = false;
+  let waitingLayers = false;
+  const picker = buildLayerPicker((skip) => {
+    picking = false;
+    status.hidden = true;
+    startInstall(game, skip);
+    paint();
+  }, () => {
+    picking = false;
+    paint();
+    action.focus();
+  });
+  install.append(actionRow, picker.panel, adjust, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -779,9 +891,18 @@ function openDetail(game, opener) {
 
   let coverKey = null;
   let archivesRead = false;
+  // refreshing：正在向商店重新取资料；refreshResult：刚取完时图标短暂显示的结果（done / warn）。
+  let refreshing = false;
+  let refreshResult = "";
   const paint = () => {
     syncGameState(game);
     title.textContent = displayName(game);
+    refreshMeta.hidden = !game.concept_id;
+    refreshMeta.disabled = refreshing;
+    refreshMeta.dataset.state = refreshing ? "busy" : refreshResult;
+    const refreshLabel = refreshing ? "正在刷新商店资料…" : { done: "商店资料已更新", warn: "这次没有取到商店资料" }[refreshResult] || "刷新商店资料";
+    refreshMeta.title = refreshLabel;
+    refreshMeta.setAttribute("aria-label", refreshLabel);
     facts.replaceChildren(...detailFacts(game).map((text) => el("span", "", text)));
     if (coverKey !== (game.cover_url || "")) {
       coverKey = game.cover_url || "";
@@ -798,14 +919,21 @@ function openDetail(game, opener) {
     let label = actionText[game.state] || "安装到主机";
     if (queued) label = "已加入安装队列";
     else if (refused) label = "不能直接安装";
-    else if (queueBusy() && (game.state === "install" || game.state === "continue")) {
-      label = game.state === "continue" ? "排队继续安装" : "加入安装队列";
+    else if (queueBusy() && ["install", "continue", "update"].includes(game.state)) {
+      label = { continue: "排队继续安装", update: "排队安装更新" }[game.state] || "加入安装队列";
     }
+    if (waitingLayers) label = "正在读取压缩包…";
     action.textContent = label;
     action.classList.toggle("done", game.state === "installed");
-    action.disabled = running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
+    action.disabled = waitingLayers || running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
       (game.state !== "need-settings" && archivesRead && !game.formats);
+    if (picking && (running || queued)) {
+      picking = false;
+      picker.close();
+    }
+    actionRow.hidden = picking;
     discard.hidden = game.state !== "continue" || running || queued;
+    adjust.hidden = picking || game.state !== "installed" || running || queued || (game.layers || []).length < 2;
     progress.hidden = !running;
     if (running) {
       progressText.textContent = jobText(task);
@@ -841,13 +969,64 @@ function openDetail(game, opener) {
     origin.replaceChildren(...originRows.flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]));
   };
 
+  // 有多组压缩包时，新装和装更新前先让用户选要装哪些；继续安装沿用上次的选择。
+  const openPicker = () => {
+    picking = true;
+    status.hidden = true;
+    paint();
+    picker.open(game.layers);
+  };
+  const beginInstall = () => {
+    if (["install", "update"].includes(game.state) && (game.layers || []).length > 1) {
+      openPicker();
+      return;
+    }
+    status.hidden = true;
+    startInstall(game);
+  };
   action.addEventListener("click", () => {
     if (game.state === "need-settings") {
       show("settings");
       return;
     }
-    status.hidden = true;
-    startInstall(game);
+    if (!archivesRead && ["install", "update"].includes(game.state)) {
+      waitingLayers = true;
+      paint();
+      return;
+    }
+    beginInstall();
+  });
+  adjust.addEventListener("click", openPicker);
+
+  // 立即向商店重新取中文名、封面和简介：服务端把这款插到最前面，这里每秒问一次，取完就刷新详情和封面。
+  refreshMeta.addEventListener("click", async () => {
+    if (refreshing) return;
+    refreshing = true;
+    refreshResult = "";
+    paint();
+    const current = () => detail && detail.game === game;
+    try {
+      Object.assign(game, await api("/api/meta/refresh", { name: game.name }));
+      for (let round = 0; round < 45 && game.meta_state === "pending" && current(); round += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        const item = ((await api("/api/meta", { names: [game.name], detail: true })).items || [])[0];
+        if (item && item.name === game.name) Object.assign(game, item);
+      }
+      refreshResult = game.meta_state === "ready" ? "done" : "warn";
+    } catch (error) {
+      refreshResult = "warn";
+      if (current()) detail.fail(error.message);
+    }
+    refreshing = false;
+    shareMeta(game);
+    if (!current()) return;
+    paint();
+    rename.sync();
+    window.setTimeout(() => {
+      if (refreshing) return;
+      refreshResult = "";
+      if (current()) paint();
+    }, 2000);
   });
   cancel.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
   discard.addEventListener("click", async () => {
@@ -878,10 +1057,17 @@ function openDetail(game, opener) {
     if (!detail || detail.game !== game) return;
     Object.assign(game, data);
     archivesRead = true;
+    const pending = waitingLayers;
+    waitingLayers = false;
     paint();
     rename.sync();
+    if (pending && !action.disabled) beginInstall();
   }).catch((error) => {
-    if (detail && detail.game === game) detail.fail(error.message);
+    waitingLayers = false;
+    if (detail && detail.game === game) {
+      paint();
+      detail.fail(error.message);
+    }
   });
 
   detail = {
@@ -922,9 +1108,7 @@ function buildRenameForm(game, onSaved) {
   const actions = el("div", "rename-actions");
   const reset = el("button", "btn quiet small", "恢复自动名称");
   reset.type = "button";
-  const refetch = el("button", "btn quiet small", "重新获取商店资料");
-  refetch.type = "button";
-  actions.append(reset, refetch);
+  actions.append(reset);
   const note = el("p", "note");
   note.setAttribute("role", "status");
   const line = el("div", "rename-line");
@@ -934,8 +1118,7 @@ function buildRenameForm(game, onSaved) {
   const sync = () => {
     input.value = game.name_source === "user" ? game.display_name : "";
     reset.hidden = game.name_source !== "user";
-    refetch.hidden = !game.concept_id;
-    actions.hidden = reset.hidden && refetch.hidden;
+    actions.hidden = reset.hidden;
   };
   const send = async (path, body, done) => {
     note.textContent = "";
@@ -956,7 +1139,6 @@ function buildRenameForm(game, onSaved) {
     if (value) send("/api/name", { name: game.name, display_name: value }, "已改名。");
   });
   reset.addEventListener("click", () => send("/api/name", { name: game.name, display_name: "" }, "已恢复自动名称。"));
-  refetch.addEventListener("click", () => send("/api/meta/refresh", { name: game.name }, "已排队，稍后自动更新。"));
   sync();
   return { form: formEl, sync };
 }

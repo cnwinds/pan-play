@@ -167,6 +167,67 @@ std::string save_name_override(const std::string& key, const std::string& name) 
   return ec ? "无法保存名称" : "";
 }
 
+namespace {
+
+std::mutex choices_mu;
+
+std::filesystem::path choices_path() { return app_dir() / "layer-choices.json"; }
+
+std::map<std::string, std::set<std::string>> read_choices_unlocked() {
+  std::map<std::string, std::set<std::string>> choices;
+  const panplay::Json json = read_json(choices_path());
+  const panplay::Json* games = json.get("skipped");
+  if (games == nullptr) return choices;
+  for (const auto& [path, ids] : games->object) {
+    for (const auto& id : ids.array) {
+      if (!id.text.empty()) choices[path].insert(id.text);
+    }
+  }
+  return choices;
+}
+
+}  // namespace
+
+std::set<std::string> load_skipped_sets(const std::string& game_path) {
+  std::lock_guard<std::mutex> lock(choices_mu);
+  const auto choices = read_choices_unlocked();
+  const auto it = choices.find(game_path);
+  return it == choices.end() ? std::set<std::string>{} : it->second;
+}
+
+std::string save_skipped_sets(const std::string& game_path, const std::set<std::string>& skipped) {
+  std::lock_guard<std::mutex> lock(choices_mu);
+  auto choices = read_choices_unlocked();
+  if (skipped.empty()) choices.erase(game_path);
+  else choices[game_path] = skipped;
+  std::string json = "{\"skipped\":{";
+  bool first_game = true;
+  for (const auto& [path, ids] : choices) {
+    if (!first_game) json += ",";
+    first_game = false;
+    json += "\"" + panplay::json_escape(path) + "\":[";
+    bool first_id = true;
+    for (const auto& id : ids) {
+      if (!first_id) json += ",";
+      first_id = false;
+      json += "\"" + panplay::json_escape(id) + "\"";
+    }
+    json += "]";
+  }
+  json += "}}";
+  std::error_code ec;
+  std::filesystem::create_directories(app_dir(), ec);
+  std::filesystem::path tmp = choices_path();
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    out << json;
+    if (!out) return "无法保存要装的补丁";
+  }
+  std::filesystem::rename(tmp, choices_path(), ec);
+  return ec ? "无法保存要装的补丁" : "";
+}
+
 AppSettings load_settings() {
   AppSettings settings;
   const panplay::Json json = read_json(settings_file_path());

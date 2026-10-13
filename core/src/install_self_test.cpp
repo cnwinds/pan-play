@@ -796,7 +796,131 @@ int game_root_test() {
   if (refused.status != "error" || refused.message.find("多个游戏目录") == std::string::npos) {
     return fail("有两个游戏目录时应该拒绝安装");
   }
-  return 0;
+
+  // 主游戏在根层，正式补丁各占一个子目录按名字里的数字排，固件补丁最后叠上去。
+  const auto bytes = [](const char* text) { return std::vector<std::uint8_t>(text, text + std::strlen(text)); };
+  const std::string dir = "/apps/panplay/Layers PPSA71000";
+  const auto game_zip = make_zip({{"sce_sys/param.json", bytes("param-1.00"), false},
+                                  {"eboot.bin", bytes("eboot-1.00"), true},
+                                  {"data/a.bin", bytes("a-1.00"), true},
+                                  {"data/keep.bin", bytes("keep"), false}},
+                                 {})
+                            .front();
+  const auto patch10 = make_zip({{"PPSA71000-patch/sce_sys/param.json", bytes("param-1.10"), false},
+                                 {"PPSA71000-patch/eboot.bin", bytes("eboot-1.10"), true}},
+                                {})
+                           .front();
+  const auto patch2 = make_zip({{"sce_sys/param.json", bytes("param-1.05"), false},
+                                {"eboot.bin", bytes("eboot-1.05"), true},
+                                {"data/a.bin", bytes("a-1.05"), true}},
+                               {})
+                          .front();
+  const auto backport = make_zip({{"eboot.bin", bytes("eboot-fix"), true}}, {}).front();
+  const auto library = [&](bool with_patch2, bool with_patch10) {
+    auto drive = std::make_unique<FakeDrive>();
+    drive->add(dir + "/game.zip", game_zip);
+    drive->add(dir + "/backport.zip", backport);
+    if (with_patch2) drive->add(dir + "/补丁2 v1.05/patch.zip", patch2);
+    if (with_patch10) drive->add(dir + "/补丁10 v1.10/patch.zip", patch10);
+    return drive;
+  };
+  MemorySink console;
+  CountingSink counted(console);
+  InstallRequest layered_request;
+  layered_request.source_dir = dir;
+  const std::string out = "/mnt/usb0/homebrew/PPSA71000/";
+  const auto expect = [&](const std::string& name, const char* text, const std::string& why) {
+    return console.files[out + name].bytes == bytes(text) ? 0 : fail(why + "（" + name + "）");
+  };
+  const auto staging_clean = [&]() {
+    for (const auto& entry : console.files) {
+      if (entry.first.find(".panplay-staging") != std::string::npos) return fail("暂存区有文件留下: " + entry.first);
+    }
+    return 0;
+  };
+
+  std::string scan_error;
+  // 先装只有一个补丁的版本，再放第二个补丁：只叠补丁，主游戏的文件一个都不重写。
+  auto shelf = library(true, false);
+  InstallResult stacked = install_game(*shelf, counted, layered_request);
+  if (stacked.status != "installed") return fail("主游戏加补丁没装上: " + stacked.message);
+  if (install_outdated(counted, "/mnt/usb0/homebrew", dir, scan_library(*shelf, "/apps/panplay", &scan_error).front().sets)) {
+    return fail("刚装好就说有更新");
+  }
+  shelf = library(true, true);
+  if (!install_outdated(counted, "/mnt/usb0/homebrew", dir, scan_library(*shelf, "/apps/panplay", &scan_error).front().sets)) {
+    return fail("网盘里多了补丁没有显示有更新");
+  }
+  counted.reset();
+  stacked = install_game(*shelf, counted, layered_request);
+  if (stacked.status != "installed" || stacked.message.find("已更新") == std::string::npos) {
+    return fail("多了补丁没有只装补丁: " + stacked.message);
+  }
+  if (counted.writes_ending("/keep.bin") != 0 || counted.writes_ending("/a.bin") != 0) return fail("只装补丁时重写了主游戏的文件");
+  if (int code = expect("sce_sys/param.json", "param-1.10", "param 不是最后一个补丁的"); code != 0) return code;
+  if (int code = expect("eboot.bin", "eboot-fix", "固件补丁没有最后叠上去"); code != 0) return code;
+  if (int code = expect("data/a.bin", "a-1.05", "前一个补丁的文件被丢了"); code != 0) return code;
+  if (int code = expect("data/keep.bin", "keep", "补丁没碰的文件丢了"); code != 0) return code;
+  if (int code = staging_clean(); code != 0) return code;
+  if (install_game(*shelf, counted, layered_request).status != "already") return fail("叠完补丁再装没有显示已安装");
+
+  // 去掉一个补丁就分不出原来的内容了，只能整个重装。
+  shelf = library(false, true);
+  stacked = install_game(*shelf, counted, layered_request);
+  if (stacked.status != "installed" || stacked.message.find("已更新") != std::string::npos) {
+    return fail("少了补丁应该整个重装: " + stacked.message);
+  }
+  if (int code = expect("data/a.bin", "a-1.00", "去掉补丁重装后没有恢复主游戏的文件"); code != 0) return code;
+  if (int code = expect("eboot.bin", "eboot-fix", "重装后固件补丁没有叠上去"); code != 0) return code;
+  if (int code = staging_clean(); code != 0) return code;
+
+  // 用户选了不装的补丁：装的时候跳过，也不算有更新。
+  shelf = library(true, true);
+  const auto sets = scan_library(*shelf, "/apps/panplay", &scan_error).front().sets;
+  const auto set_in = [&](const std::string& folder) {
+    for (const auto& set : sets) {
+      if (archive_folder(dir, set.parts.front().path) == folder) return archive_set_id(set);
+    }
+    return std::string();
+  };
+  const std::string skip2 = set_in("补丁2 v1.05");
+  const std::string skip10 = set_in("补丁10 v1.10");
+  if (skip2.empty() || skip10.empty()) return fail("找不到补丁对应的压缩包组");
+  if (!install_outdated(counted, "/mnt/usb0/homebrew", dir, sets)) return fail("没跳过补丁时应该显示有更新");
+  if (install_outdated(counted, "/mnt/usb0/homebrew", dir, sets, {skip2})) return fail("跳过的补丁不该算更新");
+  layered_request.skip_sets = {skip2};
+  counted.reset();
+  if (install_game(*shelf, counted, layered_request).status != "already") return fail("跳过新补丁后应该显示已安装");
+  if (counted.writes_ending(".bin") != 0) return fail("跳过新补丁后还写了文件");
+
+  // 不装已经装上的补丁：整个重装，回到没有这个补丁的样子。
+  layered_request.skip_sets = {skip2, skip10};
+  stacked = install_game(*shelf, counted, layered_request);
+  if (stacked.status != "installed" || stacked.message.find("已更新") != std::string::npos) {
+    return fail("去掉已装的补丁应该整个重装: " + stacked.message);
+  }
+  if (int code = expect("sce_sys/param.json", "param-1.00", "跳过的补丁还留在游戏里"); code != 0) return code;
+  if (int code = expect("eboot.bin", "eboot-fix", "跳过补丁后固件补丁没有叠上去"); code != 0) return code;
+  const auto layers = installed_sets(counted, "/mnt/usb0/homebrew", dir);
+  if (layers.size() != 2 || std::find(layers.begin(), layers.end(), skip10) != layers.end()) {
+    return fail("完成标记里记的层不对");
+  }
+
+  // 再勾回来：只叠这一个补丁。
+  layered_request.skip_sets = {skip2};
+  counted.reset();
+  stacked = install_game(*shelf, counted, layered_request);
+  if (stacked.status != "installed" || stacked.message.find("已更新") == std::string::npos) {
+    return fail("勾回补丁应该只装补丁: " + stacked.message);
+  }
+  if (counted.writes_ending("/a.bin") != 0) return fail("勾回补丁时重写了主游戏的文件");
+  if (int code = expect("sce_sys/param.json", "param-1.10", "勾回的补丁没装上"); code != 0) return code;
+
+  std::set<std::string> everything;
+  for (const auto& set : sets) everything.insert(archive_set_id(set));
+  layered_request.skip_sets = everything;
+  if (install_game(*shelf, counted, layered_request).message != "没有选中要安装的压缩包") return fail("全跳过时应该拒绝");
+  return staging_clean();
 }
 
 // 只有 .pkg 安装包的压缩包要尽早拒绝；各个压缩包里内容一样的同名文件（资源站的说明文件）留一份。
@@ -1343,6 +1467,22 @@ int run_install_pipeline_self_test() {
     }
     const InstallResult again = install_game(drive, *local, request);
     if (again.status != "already" || again.files_total != 3) return fail("RAR 加补丁装完后没有显示已安装");
+
+    // 出了正式补丁：RAR 本体不用再解压，补丁叠上去后固件补丁还在最上面。
+    const std::vector<std::uint8_t> patched_param{'p', 'a', 't', 'c', 'h', 'e', 'd'};
+    drive.add("/apps/panplay/Wrapped PPSA88888/补丁1/patch.zip",
+              make_zip({{"sce_sys/param.json", patched_param, false}, {"eboot.bin", pattern(30, 5), true}}, {}).front());
+    CountingSink counted(*local);
+    const InstallResult patched = install_game(drive, counted, request);
+    if (patched.status != "installed" || patched.message.find("已更新") == std::string::npos) {
+      return fail("RAR 游戏出了补丁没有只装补丁: " + patched.message);
+    }
+    if (counted.writes_ending("/param.json") != 1) return fail("只装补丁时又解压了 RAR 本体");
+    error = local->read_file("/mnt/usb0/homebrew/PPSA88888/eboot.bin", &got, 100);
+    if (!error.empty() || got != fixed_eboot) return fail("叠上正式补丁后固件补丁没有留在最上面");
+    error = local->read_file("/mnt/usb0/homebrew/PPSA88888/sce_sys/param.json", &got, 100);
+    if (!error.empty() || got != patched_param) return fail("正式补丁的 param.json 没有装上");
+    if (install_game(drive, *local, request).status != "already") return fail("RAR 游戏叠完补丁后没有显示已安装");
   }
 
   if (const int code = prefetch_tests()) return code;

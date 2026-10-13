@@ -14,6 +14,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 
 namespace panplay {
@@ -316,9 +317,15 @@ std::string read_zip_members(DrivePlugin& drive, const std::vector<ZipVolume>& v
   return "";
 }
 
+struct LayerRecord {
+  std::string source;
+  bool param = false;
+};
+
 // 安装标记里的 source 是网盘上各个压缩包文件的名字和大小。再次安装时只比对它，不用为了比对去读压缩包。
+// layers 按叠放顺序记下每一层，出了新补丁时据此只叠新的部分。
 std::string marker_json(const std::string& title_id, const std::string& plugin, const std::string& source,
-                        std::vector<Member> members) {
+                        const std::vector<LayerRecord>& layers, std::vector<Member> members) {
   std::sort(members.begin(), members.end(), [](const Member& left, const Member& right) { return left.name < right.name; });
   std::string json = "{\"entries\":[";
   bool first = true;
@@ -329,24 +336,18 @@ std::string marker_json(const std::string& title_id, const std::string& plugin, 
     json += "{\"crc32\":" + std::to_string(member.crc) + ",\"name\":\"" + json_escape(member.name) +
             "\",\"size\":" + std::to_string(member.uncomp_size) + "}";
   }
+  json += "],\"layers\":[";
+  for (std::size_t i = 0; i < layers.size(); ++i) {
+    if (i > 0) json += ",";
+    json += "{\"param\":" + std::string(layers[i].param ? "true" : "false") + ",\"source\":\"" +
+            json_escape(layers[i].source) + "\"}";
+  }
   json += "],\"plugin\":\"" + json_escape(plugin) + "\",\"source\":\"" + json_escape(source) + "\",\"title_id\":\"" +
           json_escape(title_id) + "\"}";
   return json;
 }
 
-std::string source_signature(const std::vector<ArchiveSet>& sets) {
-  std::vector<std::string> parts;
-  for (const auto& set : sets) {
-    for (const auto& part : set.parts) parts.push_back(part.name + ":" + std::to_string(part.size));
-  }
-  std::sort(parts.begin(), parts.end());
-  std::string signature;
-  for (const auto& part : parts) {
-    if (!signature.empty()) signature += "|";
-    signature += part;
-  }
-  return signature;
-}
+std::string source_signature(const std::vector<ArchiveSet>& sets) { return archive_sets_signature(sets); }
 
 // PS5 只认 homebrew/<游戏>/sce_sys 这一层。压缩包里游戏外面常包着一两层目录（如 PPSA05106-app0/），
 // 找出 sce_sys 所在的那层作为游戏根目录，安装时去掉外层；没有 sce_sys 时去掉所有文件共有的外层目录。
@@ -591,6 +592,46 @@ std::string install_folder(const std::string& source_dir) {
 
 }  // namespace
 
+namespace {
+
+bool read_marker(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir, Json* marker) {
+  const std::string folder = install_folder(source_dir);
+  if (folder.empty()) return false;
+  std::vector<std::uint8_t> bytes;
+  if (!sink.read_file(join_storage_path(join_storage_path(dest_prefix, folder), ".panplay-done.json"), &bytes, 256u << 20)
+           .empty()) {
+    return false;
+  }
+  std::string parse_error;
+  *marker = Json::parse(std::string(bytes.begin(), bytes.end()), &parse_error);
+  return parse_error.empty();
+}
+
+}  // namespace
+
+bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
+                      const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets) {
+  Json marker;
+  if (!read_marker(sink, dest_prefix, source_dir, &marker)) return false;
+  std::vector<ArchiveSet> installable;
+  for (const auto& set : sets) {
+    if ((set.format == "zip" || set.format == "rar") && skip_sets.count(archive_set_id(set)) == 0) {
+      installable.push_back(set);
+    }
+  }
+  return !installable.empty() && marker.str("source") != source_signature(installable);
+}
+
+std::vector<std::string> installed_sets(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
+  std::vector<std::string> ids;
+  Json marker;
+  if (!read_marker(sink, dest_prefix, source_dir, &marker)) return ids;
+  const Json* layers = marker.get("layers");
+  if (layers == nullptr) return ids;
+  for (const auto& layer : layers->array) ids.push_back(layer.str("source"));
+  return ids;
+}
+
 std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
   const std::string folder = install_folder(source_dir);
   if (folder.empty()) return "游戏目录名不能作为存放目录";
@@ -660,15 +701,27 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     std::int64_t start = 0;
     std::string root;
     bool has_param = false;
+    // 压缩包在游戏目录下的哪个子目录里，直接放在游戏目录里时为空。
+    std::string folder;
+    // 这一层的身份：各分卷的文件名和大小。完成标记按它记下装过哪些层。
+    std::string id;
+    bool extracted = false;
   };
   std::vector<Source> sources;
   for (const auto& set : zips) sources.push_back(Source{false, &set});
   for (const auto& set : rars) sources.push_back(Source{true, &set});
+  // 暂存区序号按全部压缩包编，改了要装哪些之后，没跳过的仍落在原来的子目录里。
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    sources[i].folder = archive_folder(request.source_dir, sources[i].set->parts.front().path);
+    sources[i].id = archive_set_id(*sources[i].set);
+    sources[i].prefix = sources.size() > 1 ? std::to_string(i + 1) + "/" : "";
+  }
+  sources.erase(std::remove_if(sources.begin(), sources.end(),
+                               [&](const Source& source) { return request.skip_sets.count(source.id) > 0; }),
+                sources.end());
+  if (sources.empty()) return fail("没有选中要安装的压缩包");
   for (std::size_t i = 0; i < sources.size(); ++i) {
     Source& source = sources[i];
-    source.prefix = sources.size() > 1 ? std::to_string(i + 1) + "/" : "";
-    source.start = result.bytes_total;
-    for (const auto& part : source.set->parts) result.bytes_total += part.size;
     if (source.rar) continue;
     source.volumes = zip_volumes(source.set->parts);
     if (auto zip_error = read_zip_members(drive, source.volumes, static_cast<int>(i), &source.members); !zip_error.empty()) {
@@ -686,8 +739,8 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       return fail(root_error);
     }
   }
-  std::vector<ArchiveSet> archives = zips;
-  archives.insert(archives.end(), rars.begin(), rars.end());
+  std::vector<ArchiveSet> archives;
+  for (const auto& source : sources) archives.push_back(*source.set);
   const std::string signature = source_signature(archives);
 
   const std::string staging_root = join_storage_path(request.dest_prefix, ".panplay-staging/" + folder);
@@ -696,11 +749,35 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   const std::string journal_path = join_storage_path(staging_root, ".panplay-journal.jsonl");
 
   std::vector<std::uint8_t> existing;
+  // 已装的各层（按叠放顺序）和它们带不带 param。旧版本写的标记没有这项。
+  std::vector<std::string> old_layers;
+  std::map<std::string, bool> old_param;
+  std::vector<Member> old_entries;
   error = sink.read_file(marker_path, &existing, 256u << 20);
   if (error.empty()) {
     std::string parse_error;
     const Json old = Json::parse(std::string(existing.begin(), existing.end()), &parse_error);
     const Json* entries = old.get("entries");
+    const Json* layers = old.get("layers");
+    if (parse_error.empty() && entries != nullptr && layers != nullptr && old.str("plugin") == drive.id()) {
+      for (const auto& layer : layers->array) {
+        old_layers.push_back(layer.str("source"));
+        old_param[layer.str("source")] = layer.boolean_or("param", false);
+      }
+      for (const auto& entry : entries->array) {
+        Member member;
+        bool directory = false;
+        if (!safe_zip_name(entry.str("name"), &member.name, &directory) || directory) continue;
+        try {
+          member.crc = static_cast<std::uint32_t>(std::stoul(entry.str("crc32")));
+          member.uncomp_size = std::stoull(entry.str("size"));
+        } catch (const std::exception&) {
+          old_layers.clear();
+          break;
+        }
+        old_entries.push_back(std::move(member));
+      }
+    }
     if (parse_error.empty() && entries != nullptr && old.str("source") == signature && old.str("plugin") == drive.id()) {
       sink.remove_file(journal_path);
       sink.remove_dir(staging_root);
@@ -736,7 +813,11 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   JournalWriter journal(sink, journal_path);
   ExtractContext context{sink, staging_root, journal, &written, request.stop_after_output_bytes, request.cancel, {}};
   for (const auto& file : done) context.finished_before[file.name] = {file.size, file.crc};
-  for (auto& source : sources) {
+  // 解压一层到暂存区。进度按要解压的压缩包字节算，所以开始解压时才把这层的大小加进总数。
+  const auto extract = [&](Source& source) -> std::string {
+    source.extracted = true;
+    source.start = result.bytes_total;
+    for (const auto& part : source.set->parts) result.bytes_total += part.size;
     if (source.rar) {
       RarExtract options;
       options.staging_root = staging_root;
@@ -756,10 +837,9 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       };
       options.on_entry = enter_entry;
       std::vector<ListedRarEntry> listed;
-      error = extract_rar_entries(drive, sink, source.set->parts, options, &done, &listed);
+      const std::string rar_error = extract_rar_entries(drive, sink, source.set->parts, options, &done, &listed);
       result.files_done = static_cast<int>(done.size());
-      if (error == kInterrupted) return interrupted();
-      if (!error.empty()) return fail(error);
+      if (!rar_error.empty()) return rar_error;
       for (const auto& entry : listed) {
         Member member;
         member.set_index = -1;
@@ -770,10 +850,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
         member.uncomp_size = entry.size;
         source.members.push_back(std::move(member));
       }
-      if (auto root_error = find_game_root(source.members, &source.root, &source.has_param); !root_error.empty()) {
-        return fail(root_error);
-      }
-      continue;
+      return find_game_root(source.members, &source.root, &source.has_param);
     }
     std::vector<const Member*> ordered;
     for (const auto& member : source.members) {
@@ -784,37 +861,71 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     ZipStream stream(drive, source.volumes, request.cancel, request.prefetch);
     for (const Member* member : ordered) {
       if (!member->directory) enter_entry(already_done(context, *member));
-      error = extract_member(stream, context, *member, &done);
+      const std::string zip_error = extract_member(stream, context, *member, &done);
       result.files_done = static_cast<int>(done.size());
-      if (error == kInterrupted) return interrupted();
-      if (!error.empty()) return fail(error);
+      if (!zip_error.empty()) return zip_error;
       result.bytes_done = source.start + member->local_offset + static_cast<std::int64_t>(member->comp_size);
       report(phase);
     }
+    return "";
+  };
+  const auto extract_or_stop = [&](Source& source) -> std::optional<InstallResult> {
+    const std::string extract_error = extract(source);
+    if (extract_error == kInterrupted) return interrupted();
+    if (!extract_error.empty()) return fail(extract_error);
+    return std::nullopt;
+  };
+
+  // 已装过的层带不带 param 记在完成标记里，不用为了排顺序再解压一遍（RAR 要解压完才知道）。
+  // 第一轮只解压新的层。
+  for (auto& source : sources) {
+    const auto known = old_param.find(source.id);
+    if (!old_layers.empty() && known != old_param.end()) {
+      if (source.rar) source.has_param = known->second;
+      continue;
+    }
+    if (auto stop = extract_or_stop(source)) return *stop;
+  }
+
+  // 叠放顺序（规则见 docs/game-folder-guide.md）：带 param 的（游戏本体、正式补丁）在前，不带的（固件补丁）在后；
+  // 同类里游戏目录里直接放的在前，子目录里的按子目录名排；同一处的按文件名排。名字里的数字按大小比。
+  std::vector<Source*> layers;
+  for (auto& source : sources) layers.push_back(&source);
+  std::stable_sort(layers.begin(), layers.end(), [](const Source* left, const Source* right) {
+    if (left->has_param != right->has_param) return left->has_param;
+    if (left->folder.empty() != right->folder.empty()) return left->folder.empty();
+    if (const int order = natural_compare(left->folder, right->folder); order != 0) return order < 0;
+    return natural_compare(left->set->parts.front().name, right->set->parts.front().name) < 0;
+  });
+
+  // 已装好的游戏只多了补丁：已装的各层在新顺序里原样都在，就保留前面没变的那几层，从第一个新层起往后重新叠。
+  // 后面原有的层（如固件补丁）也要重叠，因为新补丁可能盖掉了它改过的文件。有层被删或换了就整个重装。
+  std::size_t keep = 0;
+  if (!old_layers.empty()) {
+    std::size_t matched = 0;
+    for (const Source* layer : layers) {
+      if (matched < old_layers.size() && layer->id == old_layers[matched]) ++matched;
+    }
+    if (matched == old_layers.size()) {
+      while (keep < old_layers.size() && layers[keep]->id == old_layers[keep]) ++keep;
+    }
+  }
+  const bool patch_only = keep > 0;
+  for (std::size_t i = keep; i < layers.size(); ++i) {
+    if (layers[i]->extracted) continue;
+    if (auto stop = extract_or_stop(*layers[i])) return *stop;
   }
 
   // 收尾会删掉日志，所以先把攒着的写完，免得析构时又把日志写回暂存区。
   if (auto flush_error = journal.flush(); !flush_error.empty()) return fail(flush_error);
 
-  // 带 param 的是游戏本体，其余（如固件补丁）按各自的根目录覆盖上去。
-  std::vector<const Source*> games;
-  for (const auto& source : sources) {
-    if (source.has_param) games.push_back(&source);
-  }
-  if (games.size() > 1) {
-    return fail("压缩包里有多个游戏目录（" + games[0]->set->parts.front().name + "、" + games[1]->set->parts.front().name +
-                "），不知道该装哪个");
-  }
-  std::vector<const Source*> layers = games;
-  for (const auto& source : sources) {
-    if (!source.has_param) layers.push_back(&source);
-  }
   std::vector<Member> members;
   std::map<std::string, std::pair<std::size_t, const Source*>> placed;
   std::vector<std::string> staged;
   std::vector<std::string> leftovers;
   int outside = 0;
-  for (const Source* source : layers) {
+  for (std::size_t i = keep; i < layers.size(); ++i) {
+    const Source* source = layers[i];
     for (const auto& member : source->members) {
       if (!member.directory) staged.push_back(member.staged);
       if (member.name.compare(0, source->root.size(), source->root) != 0) {
@@ -840,8 +951,12 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
         leftovers.push_back(final_member.staged);
         continue;
       }
-      const bool patch_over_game = found->second.second->has_param && !source->has_param;
-      if (earlier.directory != final_member.directory || !patch_over_game) return fail("压缩包里有重复文件");
+      // 后叠的覆盖先叠的。只有同一处的两个固件补丁之间分不出先后，这时报错。
+      const Source* below = found->second.second;
+      const bool ordered = below != source && (below->has_param || below->folder != source->folder);
+      if (earlier.directory != final_member.directory || !ordered) {
+        return fail("压缩包里有重复文件（" + final_member.name + "），分不出哪个该覆盖哪个");
+      }
       leftovers.push_back(earlier.staged);
       earlier = std::move(final_member);
       found->second.second = source;
@@ -854,14 +969,25 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   result.bytes_done = result.bytes_total;
   report("正在收尾");
 
-  const std::string expected = marker_json(title_id, drive.id(), signature, members);
+  // 只装补丁时，完成标记里的文件清单是原有的加上这次叠上去的。
+  std::vector<Member> recorded = members;
+  if (patch_only) {
+    for (const auto& entry : old_entries) {
+      if (placed.count(entry.name) == 0) recorded.push_back(entry);
+    }
+  }
+  std::vector<LayerRecord> layer_records;
+  for (const Source* layer : layers) layer_records.push_back({layer->id, layer->has_param});
+  const std::string expected = marker_json(title_id, drive.id(), signature, layer_records, recorded);
   error = finish_install(sink, staging_root, final_root, members, expected, marker_path);
   if (!error.empty()) return fail(error);
-  if (!existing.empty()) remove_stale(sink, final_root, existing, members);
+  if (!existing.empty() && !patch_only) remove_stale(sink, final_root, existing, members);
   clean_staging(sink, staging_root, journal_path, staged, leftovers);
   result.status = "installed";
   result.files_done = result.files_total;
-  result.message = "已安装 " + folder + "，" + std::to_string(result.files_done) + " 个文件";
+  result.message = (patch_only ? "已更新 " : "已安装 ") + folder + "，" +
+                   (patch_only ? "叠上 " + std::to_string(layers.size() - keep) + " 层、写入 " : std::string()) +
+                   std::to_string(result.files_done) + " 个文件";
   if (outside > 0) result.message += "（游戏目录外的 " + std::to_string(outside) + " 个文件没有装）";
   return result;
 }

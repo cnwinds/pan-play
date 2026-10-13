@@ -222,6 +222,60 @@ std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& 
   return files;
 }
 
+std::string archive_sets_signature(const std::vector<ArchiveSet>& sets) {
+  std::vector<std::string> parts;
+  for (const auto& set : sets) {
+    for (const auto& part : set.parts) parts.push_back(part.name + ":" + std::to_string(part.size));
+  }
+  std::sort(parts.begin(), parts.end());
+  std::string signature;
+  for (const auto& part : parts) {
+    if (!signature.empty()) signature += "|";
+    signature += part;
+  }
+  return signature;
+}
+
+std::string archive_set_id(const ArchiveSet& set) { return archive_sets_signature({set}); }
+
+std::string archive_folder(std::string game_dir, const std::string& archive_path) {
+  while (game_dir.size() > 1 && game_dir.back() == '/') game_dir.pop_back();
+  const auto slash = archive_path.rfind('/');
+  if (slash == std::string::npos) return "";
+  const std::string parent = archive_path.substr(0, slash);
+  if (parent == game_dir || parent.rfind(game_dir + "/", 0) != 0) return "";
+  return parent.substr(game_dir.size() + 1);
+}
+
+int natural_compare(const std::string& left, const std::string& right) {
+  const auto digit = [](char ch) { return std::isdigit(static_cast<unsigned char>(ch)) != 0; };
+  std::size_t i = 0;
+  std::size_t j = 0;
+  while (i < left.size() && j < right.size()) {
+    if (digit(left[i]) && digit(right[j])) {
+      while (i < left.size() && left[i] == '0') ++i;
+      while (j < right.size() && right[j] == '0') ++j;
+      std::size_t end_i = i;
+      std::size_t end_j = j;
+      while (end_i < left.size() && digit(left[end_i])) ++end_i;
+      while (end_j < right.size() && digit(right[end_j])) ++end_j;
+      if (end_i - i != end_j - j) return end_i - i < end_j - j ? -1 : 1;
+      if (const int order = left.compare(i, end_i - i, right, j, end_j - j); order != 0) return order < 0 ? -1 : 1;
+      i = end_i;
+      j = end_j;
+      continue;
+    }
+    const int a = std::tolower(static_cast<unsigned char>(left[i]));
+    const int b = std::tolower(static_cast<unsigned char>(right[j]));
+    if (a != b) return a < b ? -1 : 1;
+    ++i;
+    ++j;
+  }
+  if (i < left.size()) return 1;
+  if (j < right.size()) return -1;
+  return 0;
+}
+
 std::vector<GameFolder> scan_library(DrivePlugin& drive, const std::string& root, std::string* error) {
   std::vector<GameFolder> games;
   const auto children = drive.list(root, error);

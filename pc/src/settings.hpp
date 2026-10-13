@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -40,3 +41,7 @@ std::string drive_session_path(const std::string& drive_id);
 // 键是 Title ID，目录名里没有 Title ID 时用目录名。
 std::map<std::string, std::string> load_name_overrides();
 std::string save_name_override(const std::string& key, const std::string& name);
+
+// 用户选了不装的压缩包组（archive_set_id），按游戏目录记。没选过时为空，即全装。
+std::set<std::string> load_skipped_sets(const std::string& game_path);
+std::string save_skipped_sets(const std::string& game_path, const std::set<std::string>& skipped);

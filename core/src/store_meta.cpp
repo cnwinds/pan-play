@@ -331,7 +331,11 @@ void StoreMetaCache::refresh(std::int64_t concept_id) {
   std::lock_guard<std::mutex> lock(mu_);
   retry_after_.erase(concept_id);
   forced_.insert(concept_id);
-  enqueue_locked(concept_id);
+  // 用户点的刷新插到最前面，不用等游戏库里排着的其他游戏。
+  if (queued_.count(concept_id) != 0) queue_.erase(std::remove(queue_.begin(), queue_.end(), concept_id), queue_.end());
+  queued_.insert(concept_id);
+  queue_.push_front(concept_id);
+  cv_.notify_one();
 }
 
 void StoreMetaCache::enqueue_locked(std::int64_t concept_id) {
