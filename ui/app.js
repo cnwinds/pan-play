@@ -814,6 +814,21 @@ function buildLayerPicker(onConfirm, onCancel) {
   };
 }
 
+// 没装完的游戏上次装到哪里。总数按这次要装的压缩包算：已装好的层不会再解压。
+function resumeProgress(game, task) {
+  if (game.state !== "continue") return null;
+  const record = game.resume || {};
+  const finished = task && task.state === "done" && settledState(task) === "continue" ? task : {};
+  const done = Math.max(record.bytes_done || 0, finished.bytes_done || 0);
+  const files = Math.max(record.files_done || 0, finished.files_done || 0);
+  if (!done && !files) return null;
+  const chosen = (game.layers || []).filter((layer) => layer.role === "main" || !layer.skipped);
+  const fresh = chosen.filter((layer) => !layer.installed);
+  const planned = (fresh.length ? fresh : chosen).reduce((sum, layer) => sum + layer.bytes, 0) || game.archive_bytes || 0;
+  const total = Math.max(planned, record.bytes_total || 0, finished.bytes_total || 0);
+  return { done: Math.min(done, total || done), total, files };
+}
+
 function openDetail(game, opener) {
   closeDetail();
   detailOverlay.hidden = false;
@@ -848,6 +863,11 @@ function openDetail(game, opener) {
   const meter = el("span", "meter");
   meter.append(el("span"));
   progress.append(meter, progressRow);
+  const resume = el("div", "progress resume");
+  const resumeMeter = el("span", "meter");
+  resumeMeter.append(el("span"));
+  const resumeText = el("span", "progress-row num");
+  resume.append(resumeMeter, resumeText);
   const queueRow = el("div", "progress-row queue-row");
   const queueText = el("span");
   queueText.setAttribute("role", "status");
@@ -880,7 +900,7 @@ function openDetail(game, opener) {
     paint();
     action.focus();
   });
-  install.append(actionRow, picker.panel, adjust, progress, queueRow, status);
+  install.append(actionRow, picker.panel, adjust, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -947,6 +967,14 @@ function openDetail(game, opener) {
     actionRow.hidden = picking;
     discard.hidden = game.state !== "continue" || running || queued;
     adjust.hidden = picking || game.state !== "installed" || running || queued || (game.layers || []).length < 2;
+    const last = picking ? null : resumeProgress(game, task);
+    resume.hidden = !last;
+    if (last) {
+      resumeMeter.style.setProperty("--p", last.total ? last.done / last.total : 0);
+      resumeText.textContent = last.total
+        ? `上次装到 ${formatBytes(last.done)} / ${formatBytes(last.total)}（${Math.floor((last.done / last.total) * 100)}%）· ${last.files} 个文件`
+        : `上次已装好 ${last.files} 个文件`;
+    }
     progress.hidden = !running;
     if (running) {
       progressText.textContent = jobText(task);

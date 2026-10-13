@@ -228,6 +228,83 @@ std::string save_skipped_sets(const std::string& game_path, const std::set<std::
   return ec ? "无法保存要装的补丁" : "";
 }
 
+namespace {
+
+std::mutex progress_mu;
+
+std::filesystem::path progress_path() { return app_dir() / "install-progress.json"; }
+
+std::map<std::string, InstallProgress> read_progress_unlocked() {
+  std::map<std::string, InstallProgress> records;
+  const panplay::Json json = read_json(progress_path());
+  const panplay::Json* games = json.get("games");
+  if (games == nullptr) return records;
+  for (const auto& [path, item] : games->object) {
+    InstallProgress progress;
+    progress.bytes_done = static_cast<std::int64_t>(item.num("bytes_done"));
+    progress.bytes_total = static_cast<std::int64_t>(item.num("bytes_total"));
+    progress.files_done = static_cast<int>(item.num("files_done"));
+    records[path] = progress;
+  }
+  return records;
+}
+
+void write_progress_unlocked(const std::map<std::string, InstallProgress>& records) {
+  std::string json = "{\"games\":{";
+  bool first = true;
+  for (const auto& [path, progress] : records) {
+    if (!first) json += ",";
+    first = false;
+    json += "\"" + panplay::json_escape(path) + "\":{\"bytes_done\":" + std::to_string(progress.bytes_done) +
+            ",\"bytes_total\":" + std::to_string(progress.bytes_total) +
+            ",\"files_done\":" + std::to_string(progress.files_done) + "}";
+  }
+  json += "}}";
+  std::error_code ec;
+  std::filesystem::create_directories(app_dir(), ec);
+  std::filesystem::path tmp = progress_path();
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    out << json;
+    if (!out) return;
+  }
+  std::filesystem::rename(tmp, progress_path(), ec);
+}
+
+}  // namespace
+
+std::optional<InstallProgress> load_install_progress(const std::string& game_path) {
+  std::lock_guard<std::mutex> lock(progress_mu);
+  const auto records = read_progress_unlocked();
+  const auto it = records.find(game_path);
+  if (it == records.end()) return std::nullopt;
+  return it->second;
+}
+
+void save_install_progress(const std::string& game_path, const InstallProgress& progress) {
+  if (progress.bytes_done <= 0 && progress.files_done <= 0) return;
+  std::lock_guard<std::mutex> lock(progress_mu);
+  auto records = read_progress_unlocked();
+  InstallProgress& record = records[game_path];
+  const InstallProgress before = record;
+  record.bytes_done = std::max(record.bytes_done, progress.bytes_done);
+  record.bytes_total = std::max(record.bytes_total, progress.bytes_total);
+  record.files_done = std::max(record.files_done, progress.files_done);
+  if (record.bytes_done == before.bytes_done && record.bytes_total == before.bytes_total &&
+      record.files_done == before.files_done) {
+    return;
+  }
+  write_progress_unlocked(records);
+}
+
+void forget_install_progress(const std::string& game_path) {
+  std::lock_guard<std::mutex> lock(progress_mu);
+  auto records = read_progress_unlocked();
+  if (records.erase(game_path) == 0) return;
+  write_progress_unlocked(records);
+}
+
 AppSettings load_settings() {
   AppSettings settings;
   const panplay::Json json = read_json(settings_file_path());

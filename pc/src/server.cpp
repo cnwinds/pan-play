@@ -689,6 +689,8 @@ std::string one_game_json(const std::string& path, bool cached) {
     if (!error.empty()) return json_error(error);
     store_game_detail(key, path, live);
     sync_shelf_state(key, name, title_id, live.state);
+    // 暂存区已经没了（在别处删掉或装完），下次就是从头装，旧记录取较大值会把进度显示高。
+    if (live.state == "install" || live.state == "installed" || live.state == "update") forget_install_progress(path);
     detail = live;
     source = "live";
     state = live.state;
@@ -696,26 +698,52 @@ std::string one_game_json(const std::string& path, bool cached) {
   std::string json = "{\"name\":\"" + panplay::json_escape(name) + "\",\"path\":\"" + panplay::json_escape(path) +
                      "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\",\"source\":\"" + source + "\"";
   if (detail) {
+    std::string resume = "null";
+    if (state == "continue") {
+      if (const auto progress = load_install_progress(path)) {
+        resume = "{\"bytes_done\":" + std::to_string(progress->bytes_done) +
+                 ",\"bytes_total\":" + std::to_string(progress->bytes_total) +
+                 ",\"files_done\":" + std::to_string(progress->files_done) + "}";
+      }
+    }
     const auto queued = queue_states();
     if (queued.count(path) != 0) state = queued.at(path);
     json += ",\"archive_bytes\":" + std::to_string(detail->archive_bytes) + ",\"formats\":\"" +
             panplay::json_escape(detail->formats) + "\",\"state\":\"" + state + "\",\"layers\":" +
-            (detail->layers.empty() ? "[]" : detail->layers);
+            (detail->layers.empty() ? "[]" : detail->layers) + ",\"resume\":" + resume;
   }
   return json + game_meta_fields(name, title_id, load_name_overrides(), true) + "}";
 }
 
+InstallProgress progress_of(const panplay::InstallResult& result) {
+  InstallProgress progress;
+  progress.bytes_done = result.bytes_done;
+  progress.bytes_total = result.bytes_total;
+  progress.files_done = result.files_done;
+  return progress;
+}
+
 void publish_progress(const panplay::InstallResult& snapshot) {
-  std::lock_guard<std::mutex> lock(installs.mu);
-  InstallTask* task = installs.current.get();
-  if (task == nullptr || task->cancel->cancelled()) return;
-  task->result.message = snapshot.message;
-  task->result.files_done = snapshot.files_done;
-  task->result.files_total = snapshot.files_total;
-  task->result.bytes_done = snapshot.bytes_done;
-  task->result.bytes_total = snapshot.bytes_total;
-  task->result.files_checked = snapshot.files_checked;
-  task->result.files_to_check = snapshot.files_to_check;
+  std::string path;
+  {
+    std::lock_guard<std::mutex> lock(installs.mu);
+    InstallTask* task = installs.current.get();
+    if (task == nullptr || task->cancel->cancelled()) return;
+    task->result.message = snapshot.message;
+    task->result.files_done = snapshot.files_done;
+    task->result.files_total = snapshot.files_total;
+    task->result.bytes_done = snapshot.bytes_done;
+    task->result.bytes_total = snapshot.bytes_total;
+    task->result.files_checked = snapshot.files_checked;
+    task->result.files_to_check = snapshot.files_to_check;
+    path = task->path;
+  }
+  // 程序被直接关掉或断电时，详情页还能看到大致装到哪里。
+  static auto last_saved = std::chrono::steady_clock::time_point{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_saved < std::chrono::seconds(10)) return;
+  last_saved = now;
+  save_install_progress(path, progress_of(snapshot));
 }
 
 std::filesystem::path queue_file() { return panplay::app_data_dir() / "install-queue.json"; }
@@ -803,6 +831,8 @@ void queue_worker() {
       cancel = installs.current->cancel;
     }
     const panplay::InstallResult result = run_install(path, cancel.get());
+    if (result.status == "installed" || result.status == "already") forget_install_progress(path);
+    else save_install_progress(path, progress_of(result));
     forget_game_detail(path);
     std::lock_guard<std::mutex> lock(installs.mu);
     InstallTask done = std::move(*installs.current);
@@ -1322,6 +1352,7 @@ void handle_client(SOCKET client) {
       installs.discarding.erase(path);
       if (error.empty()) erase_path(installs.finished, path);
     }
+    if (error.empty()) forget_install_progress(path);
     if (!error.empty()) {
       reply_json(client, 500, json_error(error));
       return;

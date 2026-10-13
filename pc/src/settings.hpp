@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -45,3 +47,15 @@ std::string save_name_override(const std::string& key, const std::string& name);
 // 用户选了不装的压缩包组（archive_set_id），按游戏目录记。没选过时为空，即全装。
 std::set<std::string> load_skipped_sets(const std::string& game_path);
 std::string save_skipped_sets(const std::string& game_path, const std::set<std::string>& skipped);
+
+// 没装完的游戏上次装到哪里，按游戏目录记。字节按压缩包算，和安装时的进度条一致。
+struct InstallProgress {
+  std::int64_t bytes_done = 0;
+  std::int64_t bytes_total = 0;
+  int files_done = 0;
+};
+
+std::optional<InstallProgress> load_install_progress(const std::string& game_path);
+// 和已记下的取较大值：续装开头核对已装文件时进度会从头走一遍，不能把记录往回改。
+void save_install_progress(const std::string& game_path, const InstallProgress& progress);
+void forget_install_progress(const std::string& game_path);
