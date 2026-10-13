@@ -61,7 +61,8 @@
 
 - Windows 上直接双击 `panplay.exe`：等同 `panplay serve`，并自动用浏览器打开界面。端口被占用（比如已经开着一个盘游）时窗口会停住说明原因。
 - `panplay serve`：在 `http://127.0.0.1:8734` 打开界面。设置页填写 AppKey、SecretKey、游戏库目录和存放位置，只保存在这台电脑。
-- `panplay serve 8734 --lan`：监听所有网卡，局域网里的手机也能打开。第一次打开要输访问口令，口令在数据目录的 `access-code.txt`。
+- 局域网访问：默认开着、不要口令，同一网络里的手机、平板直接打开 `http://<电脑 IP>:8734`（地址在启动输出和设置页里）。设置页「局域网访问」可以关掉局域网访问（只能在运行盘游的电脑上关），或开启访问口令：开了以后其他设备第一次打开要输口令，本机不用；口令可在设置页修改，存放在数据目录的 `access-code.txt`。只在家里内网用的话默认就够了，有更高的安全要求再自己开口令。
+- `panplay serve 8734 --local` / `--lan`：只对这次启动强制只许本机 / 允许局域网访问，不改设置。
 - `panplay http-get <地址>`：排查网络，打印状态码、长度和跳转后的地址。
 - `panplay login` / `ls` / `scan` / `install` / `read`：同一套安装流程的命令行
 - `panplay dummy-ftp <端口> <根目录> [--zftpd]`：在 `127.0.0.1` 上模拟主机 FTP 目录。带 `--zftpd` 时学 PS5 上的 zftpd：不要密码，从头写的 STOR 中途断了会删掉半截文件
@@ -109,7 +110,7 @@ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 $PS5_PAYLOAD_SDK/bin/prospero-cmake -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-ps5
 ```
 
-载荷不带参数启动时，直接以局域网模式在 8734 端口开界面，主机右上角通知里给出地址和访问口令。数据在 `/data/panplay`，游戏装到「主机目录」设置的本机路径（默认 `/mnt/usb0/homebrew`）。
+载荷不带参数启动时在 8734 端口开界面，主机右上角通知里给出地址（开了访问口令时还有口令）。PS5 上只能从其他设备打开界面，所以局域网访问一直开着、不能关；访问口令默认关，可在设置页开启。数据在 `/data/panplay`，游戏装到「主机目录」设置的本机路径（默认 `/data/homebrew`）。
 
 推送后 GitHub Actions（`.github/workflows/build.yml`）会编出 Linux 版并跑自测，再编出 PS5 的 `panplay.elf` 和 Windows 的 `panplay.exe`（MSYS2 MinGW 静态链接、界面打包在里面，单个文件就能运行），都在运行记录的 Artifacts 里下载。
 

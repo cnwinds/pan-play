@@ -77,13 +77,15 @@ int http_get(const std::string& url) {
   return response.status >= 200 && response.status < 400 ? 0 : 1;
 }
 
-// panplay serve [端口] [--lan]
+// panplay serve [端口] [--lan|--local]
 int serve(int argc, char** argv) {
   ServerOptions options;
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--lan") {
       options.lan = true;
+    } else if (arg == "--local") {
+      options.lan = false;
     } else {
       options.port = std::stoi(arg);
     }
@@ -93,7 +95,7 @@ int serve(int argc, char** argv) {
 
 void print_usage() {
   std::cout << "盘游 Panplay\n"
-            << "  panplay serve [端口] [--lan]   --lan 让局域网里的手机也能打开，要访问口令\n"
+            << "  panplay serve [端口] [--lan|--local]   默认按设置（局域网可访问）；--local 这次只许本机打开\n"
             << "  panplay self-test\n"
             << "  panplay bench-prefetch\n"
             << "  panplay bench-download <网盘目录> [秒] [连接数] [块MB]\n"
@@ -308,9 +310,9 @@ int main(int argc, char** argv) {
   // 载荷由 ELF 加载器启动，通常不带参数：直接开局域网界面。
   if (argc < 2) {
     ServerOptions options;
-    options.lan = true;
-    options.on_ready = [](const std::string& url, const std::string& code) {
-      notify("盘游已启动 " + url + " 口令 " + code);
+    options.lan_required = true;
+    options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
+      notify("盘游已启动 " + url + (code.empty() ? "" : " 口令 " + code));
     };
     const int code = run_server(options);
     if (code != 0) notify("盘游没能启动：端口 " + std::to_string(options.port) + " 可能已被占用");
@@ -321,7 +323,7 @@ int main(int argc, char** argv) {
   // 双击 exe 时不带参数：直接开本机界面，并用默认浏览器打开。窗口一关程序就退出，所以出错时停住让人看到原因。
   if (argc < 2) {
     ServerOptions options;
-    options.on_ready = [](const std::string& url, const std::string&) {
+    options.on_ready = [](const std::string& url, const std::string&, const std::string&) {
       ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     };
     const int code = run_server(options);

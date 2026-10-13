@@ -752,14 +752,14 @@ int fail(const std::string& label, const std::string& message) {
 }
 
 int exercise(InstallSink& sink, const std::filesystem::path& disk_root, const std::string& label) {
-  const std::string staging = "/mnt/usb0/homebrew/.panplay-staging/CUSA00001/eboot.bin";
-  const std::string final_path = "/mnt/usb0/homebrew/CUSA00001/eboot.bin";
+  const std::string staging = "/data/homebrew/.panplay-staging/CUSA00001/eboot.bin";
+  const std::string final_path = "/data/homebrew/CUSA00001/eboot.bin";
   const std::vector<std::uint8_t> first = pattern(10000, 1);
   const std::vector<std::uint8_t> second = pattern(30000, 9);
   std::vector<std::uint8_t> whole = first;
   whole.insert(whole.end(), second.begin(), second.end());
 
-  std::string error = sink.ensure_dir("/mnt/usb0/homebrew/.panplay-staging/CUSA00001");
+  std::string error = sink.ensure_dir("/data/homebrew/.panplay-staging/CUSA00001");
   if (!error.empty()) return fail(label, error);
   {
     auto writer = sink.open_writer(staging, static_cast<std::int64_t>(whole.size()), &error);
@@ -790,7 +790,7 @@ int exercise(InstallSink& sink, const std::filesystem::path& disk_root, const st
   if (!error.empty()) return fail(label, error);
   if (read_file(on_disk) != whole) return fail(label, "覆盖后的文件内容不一致");
 
-  error = sink.ensure_dir("/mnt/usb0/homebrew/CUSA00001");
+  error = sink.ensure_dir("/data/homebrew/CUSA00001");
   if (!error.empty()) return fail(label, error);
   error = sink.rename_path(staging, final_path);
   if (!error.empty()) return fail(label, error);

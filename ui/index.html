@@ -112,7 +112,7 @@
               </label>
             </div>
             <label class="field">主机目录
-              <input name="ftp_dir" placeholder="/mnt/usb0/homebrew" spellcheck="false">
+              <input name="ftp_dir" placeholder="/data/homebrew" spellcheck="false">
               <span class="hint">每个游戏装到主机这个目录下以 Title ID 命名的文件夹里。</span>
             </label>
           </div>
@@ -121,6 +121,36 @@
       <div class="settings-actions">
         <button type="submit" class="btn primary">保存设置</button>
         <p class="note" id="settings-note" role="status"></p>
+      </div>
+    </form>
+
+    <form id="access-form" class="settings-section" aria-labelledby="set-access">
+      <div class="settings-intro">
+        <h2 id="set-access">局域网访问</h2>
+        <p>让家里的手机、平板也能打开盘游。自家网络里用，默认不要口令；想更稳妥可以开口令。</p>
+      </div>
+      <div class="fields">
+        <div class="choices">
+          <label class="choice-card">
+            <input type="checkbox" name="lan">
+            <strong>允许局域网访问</strong>
+            <span id="access-lan-hint">同一网络里的设备可以打开盘游</span>
+          </label>
+          <label class="choice-card">
+            <input type="checkbox" name="require_code">
+            <strong>需要访问口令</strong>
+            <span>其他设备第一次打开时要输口令，本机不用</span>
+          </label>
+        </div>
+        <p class="catalog-status" id="access-url" hidden></p>
+        <label class="field" id="access-code">访问口令
+          <input name="code" autocomplete="off" spellcheck="false" maxlength="32">
+          <span class="hint">4 到 32 个字符，不能有空格。改了以后其他设备要重新输入。</span>
+        </label>
+        <div class="settings-actions">
+          <button type="submit" class="btn primary">保存</button>
+          <p class="note" id="access-note" role="status"></p>
+        </div>
       </div>
     </form>
 
@@ -167,9 +197,9 @@
   <section class="unlock" id="unlock-box" hidden aria-labelledby="unlock-title">
     <form class="login-card" id="unlock-form">
       <h1 id="unlock-title">输入访问口令</h1>
-      <p class="login-text">口令在主机启动盘游时的通知里，也写在数据目录的 access-code.txt。</p>
+      <p class="login-text">口令在盘游设置的“局域网访问”里，PS5 启动通知里也有，还写在数据目录的 access-code.txt。</p>
       <label class="field">访问口令
-        <input name="code" inputmode="numeric" autocomplete="off" spellcheck="false" required>
+        <input name="code" autocomplete="off" spellcheck="false" required>
       </label>
       <button type="submit" class="btn primary">进入</button>
       <p class="note error" id="unlock-note" role="status"></p>

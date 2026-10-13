@@ -19,7 +19,7 @@ constexpr const char* kDefaultTarget = "local";
 #else
 constexpr const char* kDefaultTarget = "ftp";
 #endif
-constexpr const char* kConsoleDir = "/mnt/usb0/homebrew";
+constexpr const char* kConsoleDir = "/data/homebrew";
 
 std::string env_or_empty(const char* name) {
   const char* value = std::getenv(name);
@@ -52,6 +52,8 @@ void read_current(const panplay::Json& json, AppSettings* settings) {
   settings->ftp_host = json.str("ftp_host");
   if (!json.str("ftp_port").empty()) settings->ftp_port = json.str("ftp_port");
   if (!json.str("ftp_dir").empty()) settings->ftp_dir = json.str("ftp_dir");
+  settings->lan_access = json.boolean_or("lan_access", true);
+  settings->require_code = json.boolean_or("require_code", false);
 }
 
 // 版本 1 只有百度一个插件；存放位置是一个地址加主机目录，本机目录也会再套一层主机目录。
@@ -61,7 +63,8 @@ void read_legacy(const panplay::Json& json, AppSettings* settings) {
   baidu.values["secret_key"] = json.str("secret_key");
   if (!json.str("library_path").empty()) baidu.library_path = json.str("library_path");
   const std::string dest = json.str("dest");
-  const std::string prefix = json.str("prefix").empty() ? kConsoleDir : json.str("prefix");
+  // 旧版配置不写 prefix 时用的是当时的默认目录。
+  const std::string prefix = json.str("prefix").empty() ? "/mnt/usb0/homebrew" : json.str("prefix");
   if (dest.rfind("ftp://", 0) == 0) {
     settings->target = "ftp";
     std::string host_port = dest.substr(6);
@@ -348,7 +351,9 @@ std::string save_settings(const AppSettings& settings) {
   }
   json += "},\"target\":\"" + json_escape(settings.target) + "\",\"local_dir\":\"" + json_escape(settings.local_dir) +
           "\",\"ftp_host\":\"" + json_escape(settings.ftp_host) + "\",\"ftp_port\":\"" + json_escape(settings.ftp_port) +
-          "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) + "\"}";
+          "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) + "\",\"lan_access\":" +
+          (settings.lan_access ? "true" : "false") + ",\"require_code\":" + (settings.require_code ? "true" : "false") +
+          "}";
   const std::filesystem::path path = settings_file_path();
   std::filesystem::path tmp = path;
   tmp += ".tmp";

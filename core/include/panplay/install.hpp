@@ -31,7 +31,7 @@ struct InstallResult {
 
 struct InstallRequest {
   std::string source_dir;
-  std::string dest_prefix = "/mnt/usb0/homebrew";
+  std::string dest_prefix = "/data/homebrew";
   std::int64_t stop_after_output_bytes = -1;
   // 扫描和逐个文件完成时回调。安装结束前就会调用，方便界面不必等到整包结束。
   std::function<void(const InstallResult&)> on_progress;
@@ -45,7 +45,7 @@ struct Destination {
   bool ftp = false;
   std::string local_root;
   FtpEndpoint endpoint;
-  std::string prefix = "/mnt/usb0/homebrew";
+  std::string prefix = "/data/homebrew";
 };
 
 struct ListedRarEntry {

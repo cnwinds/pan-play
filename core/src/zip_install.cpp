@@ -1051,12 +1051,12 @@ int run_scan_cli(DrivePlugin& drive, const std::string& dir) {
 
 int run_install_cli(DrivePlugin& drive, int argc, char** argv) {
   if (argc < 3) {
-    std::cerr << "用法: panplay install <网盘游戏目录> --to <本机目录或 ftp://主机:端口> [--prefix /mnt/usb0/homebrew]"
+    std::cerr << "用法: panplay install <网盘游戏目录> --to <本机目录或 ftp://主机:端口> [--prefix /data/homebrew]"
                  " [--connections N] [--block-mb M] [--blocks K]\n";
     return 1;
   }
   std::string to;
-  std::string prefix = "/mnt/usb0/homebrew";
+  std::string prefix = "/data/homebrew";
   PrefetchOptions prefetch;
   for (int i = 3; i < argc; ++i) {
     const std::string arg = argv[i];

@@ -22,7 +22,10 @@ struct AppSettings {
   std::string local_dir;
   std::string ftp_host;
   std::string ftp_port = "2121";
-  std::string ftp_dir = "/mnt/usb0/homebrew";
+  std::string ftp_dir = "/data/homebrew";
+  // 局域网里别的设备能不能打开界面，以及要不要访问口令。家里内网用，默认开着、不要口令。
+  bool lan_access = true;
+  bool require_code = false;
 
   DriveSettings current_drive() const;
   std::string library_path() const { return current_drive().library_path; }

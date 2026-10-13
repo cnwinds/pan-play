@@ -523,15 +523,15 @@ int resume_on(InstallSink& raw, FakeDrive& drive, const std::vector<std::uint8_t
   CountingSink sink(raw);
   InstallRequest request;
   request.source_dir = "/apps/panplay/Demo CUSA12345";
-  request.dest_prefix = "/mnt/usb0/homebrew";
+  request.dest_prefix = "/data/homebrew";
   request.stop_after_output_bytes = 150;
   InstallResult first = install_game(drive, sink, request);
   if (first.status != "interrupted" || first.files_done != 1) return fail("中断后状态不对: " + first.status + " " + first.message);
   std::string error;
-  const std::string partial = "/mnt/usb0/homebrew/.panplay-staging/CUSA12345/eboot.bin";
+  const std::string partial = "/data/homebrew/.panplay-staging/CUSA12345/eboot.bin";
   if (sink.file_size(partial, &error) != 50 || !error.empty()) return fail("中断时第二个文件不是 50 字节");
   std::vector<std::uint8_t> journal;
-  error = sink.read_file("/mnt/usb0/homebrew/.panplay-staging/CUSA12345/.panplay-journal.jsonl", &journal, 1 << 20);
+  error = sink.read_file("/data/homebrew/.panplay-staging/CUSA12345/.panplay-journal.jsonl", &journal, 1 << 20);
   if (!error.empty()) return fail(error);
   const std::string journal_text(journal.begin(), journal.end());
   if (journal_text.find("param.sfo") == std::string::npos || journal_text.find("eboot.bin") != std::string::npos) {
@@ -563,9 +563,9 @@ int resume_on(InstallSink& raw, FakeDrive& drive, const std::vector<std::uint8_t
 
   std::vector<std::uint8_t> got_param;
   std::vector<std::uint8_t> got_eboot;
-  error = sink.read_file("/mnt/usb0/homebrew/CUSA12345/param.sfo", &got_param, 1 << 20);
+  error = sink.read_file("/data/homebrew/CUSA12345/param.sfo", &got_param, 1 << 20);
   if (!error.empty() || got_param != param) return fail("param.sfo 内容不对");
-  error = sink.read_file("/mnt/usb0/homebrew/CUSA12345/eboot.bin", &got_eboot, 1 << 20);
+  error = sink.read_file("/data/homebrew/CUSA12345/eboot.bin", &got_eboot, 1 << 20);
   if (!error.empty() || got_eboot != eboot) return fail("eboot.bin 内容不对");
 
   sink.reset();
@@ -760,11 +760,11 @@ int game_root_test() {
                      {})
                 .front());
   MemorySink sink;
-  const std::string old_file = "/mnt/usb0/homebrew/PPSA70000/PPSA70000-app0/eboot.bin";
+  const std::string old_file = "/data/homebrew/PPSA70000/PPSA70000-app0/eboot.bin";
   const std::string old_marker =
       "{\"entries\":[{\"crc32\":1,\"name\":\"PPSA70000-app0/eboot.bin\",\"size\":5000}],\"plugin\":\"fake\",\"title_id\":\"PPSA70000\"}";
   sink.store(old_file, eboot.data(), eboot.size());
-  sink.store("/mnt/usb0/homebrew/PPSA70000/.panplay-done.json", reinterpret_cast<const std::uint8_t*>(old_marker.data()),
+  sink.store("/data/homebrew/PPSA70000/.panplay-done.json", reinterpret_cast<const std::uint8_t*>(old_marker.data()),
              old_marker.size());
   InstallRequest request;
   request.source_dir = "/apps/panplay/Wrapped PPSA70000";
@@ -773,7 +773,7 @@ int game_root_test() {
   if (result.status != "installed") return fail("外面包了目录的游戏没装上: " + result.message);
   if (result.files_total != 4) return fail("游戏目录外的文件不该算进去");
   if (result.message.find("1 个文件没有装") == std::string::npos) return fail("没有提示跳过了游戏目录外的文件");
-  const std::string root = "/mnt/usb0/homebrew/PPSA70000/";
+  const std::string root = "/data/homebrew/PPSA70000/";
   if (sink.files[root + "sce_sys/param.json"].bytes != param) return fail("sce_sys 没有放在游戏目录第一层");
   if (sink.files[root + "eboot.bin"].bytes != eboot) return fail("eboot.bin 没有放在游戏目录第一层");
   if (sink.files[root + "sce_module/lib.prx"].bytes != prx) return fail("子目录没有跟着游戏根目录一起上移");
@@ -828,7 +828,7 @@ int game_root_test() {
   CountingSink counted(console);
   InstallRequest layered_request;
   layered_request.source_dir = dir;
-  const std::string out = "/mnt/usb0/homebrew/PPSA71000/";
+  const std::string out = "/data/homebrew/PPSA71000/";
   const auto expect = [&](const std::string& name, const char* text, const std::string& why) {
     return console.files[out + name].bytes == bytes(text) ? 0 : fail(why + "（" + name + "）");
   };
@@ -844,11 +844,11 @@ int game_root_test() {
   auto shelf = library(true, false);
   InstallResult stacked = install_game(*shelf, counted, layered_request);
   if (stacked.status != "installed") return fail("主游戏加补丁没装上: " + stacked.message);
-  if (install_outdated(counted, "/mnt/usb0/homebrew", dir, scan_library(*shelf, "/apps/panplay", &scan_error).front().sets)) {
+  if (install_outdated(counted, "/data/homebrew", dir, scan_library(*shelf, "/apps/panplay", &scan_error).front().sets)) {
     return fail("刚装好就说有更新");
   }
   shelf = library(true, true);
-  if (!install_outdated(counted, "/mnt/usb0/homebrew", dir, scan_library(*shelf, "/apps/panplay", &scan_error).front().sets)) {
+  if (!install_outdated(counted, "/data/homebrew", dir, scan_library(*shelf, "/apps/panplay", &scan_error).front().sets)) {
     return fail("网盘里多了补丁没有显示有更新");
   }
   counted.reset();
@@ -886,8 +886,8 @@ int game_root_test() {
   const std::string skip2 = set_in("补丁2 v1.05");
   const std::string skip10 = set_in("补丁10 v1.10");
   if (skip2.empty() || skip10.empty()) return fail("找不到补丁对应的压缩包组");
-  if (!install_outdated(counted, "/mnt/usb0/homebrew", dir, sets)) return fail("没跳过补丁时应该显示有更新");
-  if (install_outdated(counted, "/mnt/usb0/homebrew", dir, sets, {skip2})) return fail("跳过的补丁不该算更新");
+  if (!install_outdated(counted, "/data/homebrew", dir, sets)) return fail("没跳过补丁时应该显示有更新");
+  if (install_outdated(counted, "/data/homebrew", dir, sets, {skip2})) return fail("跳过的补丁不该算更新");
   layered_request.skip_sets = {skip2};
   counted.reset();
   if (install_game(*shelf, counted, layered_request).status != "already") return fail("跳过新补丁后应该显示已安装");
@@ -901,7 +901,7 @@ int game_root_test() {
   }
   if (int code = expect("sce_sys/param.json", "param-1.00", "跳过的补丁还留在游戏里"); code != 0) return code;
   if (int code = expect("eboot.bin", "eboot-fix", "跳过补丁后固件补丁没有叠上去"); code != 0) return code;
-  const auto layers = installed_sets(counted, "/mnt/usb0/homebrew", dir);
+  const auto layers = installed_sets(counted, "/data/homebrew", dir);
   if (layers.size() != 2 || std::find(layers.begin(), layers.end(), skip10) != layers.end()) {
     return fail("完成标记里记的层不对");
   }
@@ -981,7 +981,7 @@ int package_and_duplicate_test() {
   if (installed.status != "installed" || installed.files_total != 3) {
     return fail("内容一样的同名文件不该算重复: " + installed.message);
   }
-  const std::string root = "/mnt/usb0/homebrew/CUSA20001/";
+  const std::string root = "/data/homebrew/CUSA20001/";
   if (sink.files[root + "data/a.bin"].bytes != a || sink.files[root + "data/b.bin"].bytes != b ||
       sink.files[root + "2468c.com.txt"].bytes != ad) {
     return fail("去重后的文件内容不对");
@@ -1022,7 +1022,7 @@ int many_files_test() {
   if (drive.stream_opens > 2) return fail("顺序解压打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
   if (sink.writers_opened() != 3000) return fail("每个文件应该只开一次写入流");
   if (sink.appends() > 3000 / 100 + 5) return fail("进度日志追加了 " + std::to_string(sink.appends()) + " 次，没有攒批");
-  const auto& sample = memory.files["/mnt/usb0/homebrew/CUSA30000/file2999.bin"];
+  const auto& sample = memory.files["/data/homebrew/CUSA30000/file2999.bin"];
   if (sample.bytes != inputs.back().data) return fail("最后一个文件内容不对");
   return 0;
 }
@@ -1044,8 +1044,8 @@ int zip64_split_test() {
   request.source_dir = "/apps/panplay/Raw PPSA40000";
   const InstallResult result = install_game(drive, sink, request);
   if (result.status != "installed") return fail("ZIP64 加数据描述符的切分包没有装上: " + result.message);
-  if (sink.files["/mnt/usb0/homebrew/PPSA40000/eboot.bin"].bytes != first) return fail("ZIP64 包里的大文件内容不对");
-  if (sink.files["/mnt/usb0/homebrew/PPSA40000/sce_sys/param.json"].bytes != second) return fail("ZIP64 包里的压缩文件内容不对");
+  if (sink.files["/data/homebrew/PPSA40000/eboot.bin"].bytes != first) return fail("ZIP64 包里的大文件内容不对");
+  if (sink.files["/data/homebrew/PPSA40000/sce_sys/param.json"].bytes != second) return fail("ZIP64 包里的压缩文件内容不对");
   return 0;
 }
 
@@ -1158,7 +1158,7 @@ int large_file_test() {
   const InstallResult result = install_game(drive, sink, request);
   const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
   if (result.status != "installed") return fail("超过 4 GB 的文件没有装上: " + result.message);
-  if (sink.files["/mnt/usb0/homebrew/PPSA50000/image0.dat"].size != kSize) return fail("超过 4 GB 的文件大小不对");
+  if (sink.files["/data/homebrew/PPSA50000/image0.dat"].size != kSize) return fail("超过 4 GB 的文件大小不对");
   if (drive.stream_opens != 1) return fail("5 GB 文件打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
   std::cout << "  超过 4 GB 的单文件：" << (kSize >> 20) << " MB，" << seconds << " 秒，网盘随机读 " << drive.read_at_calls
             << " 次，读取流 " << drive.stream_opens << " 次\n";
@@ -1332,7 +1332,7 @@ int run_install_pipeline_self_test() {
     auto local = make_local_sink(local_root.u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Single CUSA00001";
-    request.dest_prefix = "/mnt/usb0/homebrew";
+    request.dest_prefix = "/data/homebrew";
     bool saw_reading_before_total = false;
     bool saw_total = false;
     request.on_progress = [&](const InstallResult& snapshot) {
@@ -1343,7 +1343,7 @@ int run_install_pipeline_self_test() {
     if (!saw_reading_before_total || !saw_total) return fail("安装过程没有先报告正在读取压缩包");
     if (installed.status != "installed") return fail(installed.message);
     std::vector<std::uint8_t> got;
-    error = local->read_file("/mnt/usb0/homebrew/CUSA00001/hello.txt", &got, 100);
+    error = local->read_file("/data/homebrew/CUSA00001/hello.txt", &got, 100);
     if (!error.empty() || got != hello) return fail("单卷 ZIP 解压内容不对");
     InstallResult again = install_game(drive, *local, request);
     if (again.status != "already") return fail("单卷安装后没有显示已安装");
@@ -1378,11 +1378,11 @@ int run_install_pipeline_self_test() {
     auto local = make_local_sink((root / "rar").u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Rar CUSA77777";
-    request.dest_prefix = "/mnt/usb0/homebrew";
+    request.dest_prefix = "/data/homebrew";
     const InstallResult installed = install_game(drive, *local, request);
     if (installed.status != "installed") return fail(installed.message);
     std::vector<std::uint8_t> got;
-    error = local->read_file("/mnt/usb0/homebrew/CUSA77777/note.txt", &got, 100);
+    error = local->read_file("/data/homebrew/CUSA77777/note.txt", &got, 100);
     const std::vector<std::uint8_t> expect{'r', 'a', 'r', '-', 'o', 'k'};
     if (!error.empty() || got != expect) return fail("RAR 解压内容不对");
     const InstallResult again = install_game(drive, *local, request);
@@ -1393,11 +1393,11 @@ int run_install_pipeline_self_test() {
     auto local = make_local_sink((root / "rar-split").u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Split CUSA66666";
-    request.dest_prefix = "/mnt/usb0/homebrew";
+    request.dest_prefix = "/data/homebrew";
     const InstallResult installed = install_game(drive, *local, request);
     if (installed.status != "installed") return fail("跨卷文件的 RAR 没装好: " + installed.message);
     std::vector<std::uint8_t> got;
-    error = local->read_file("/mnt/usb0/homebrew/CUSA66666/big.bin", &got, 1 << 20);
+    error = local->read_file("/data/homebrew/CUSA66666/big.bin", &got, 1 << 20);
     if (!error.empty() || got != split_data) return fail("跨卷文件内容不对");
   }
 
@@ -1406,7 +1406,7 @@ int run_install_pipeline_self_test() {
     auto local = make_local_sink((root / ("rar-split-resume-" + std::to_string(stop))).u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Split CUSA66666";
-    request.dest_prefix = "/mnt/usb0/homebrew";
+    request.dest_prefix = "/data/homebrew";
     request.stop_after_output_bytes = stop;
     const InstallResult first = install_game(drive, *local, request);
     if (first.status != "interrupted") return fail("跨卷 RAR 没有在中途停下: " + first.status + " " + first.message);
@@ -1414,9 +1414,9 @@ int run_install_pipeline_self_test() {
     const InstallResult resumed = install_game(drive, *local, request);
     if (resumed.status != "installed") return fail("跨卷 RAR 继续安装失败: " + resumed.message);
     std::vector<std::uint8_t> got;
-    error = local->read_file("/mnt/usb0/homebrew/CUSA66666/big.bin", &got, 1 << 20);
+    error = local->read_file("/data/homebrew/CUSA66666/big.bin", &got, 1 << 20);
     if (!error.empty() || got != split_data) return fail("继续安装后跨卷文件内容不对");
-    error = local->read_file("/mnt/usb0/homebrew/CUSA66666/c.bin", &got, 1 << 20);
+    error = local->read_file("/data/homebrew/CUSA66666/c.bin", &got, 1 << 20);
     if (!error.empty() || got != split_tail) return fail("继续安装后跨卷文件后面的文件不对");
   }
 
@@ -1428,7 +1428,7 @@ int run_install_pipeline_self_test() {
     const InstallResult cut = install_game(drive, *local, request);
     if (cut.status != "error") return fail("少了最后一卷的 RAR 不该装成功: " + cut.status + " " + cut.message);
     std::vector<std::uint8_t> marker;
-    if (local->read_file("/mnt/usb0/homebrew/CUSA66667/.panplay-done.json", &marker, 1 << 20).empty()) {
+    if (local->read_file("/data/homebrew/CUSA66667/.panplay-done.json", &marker, 1 << 20).empty()) {
       return fail("少了最后一卷的 RAR 写了安装完成标记");
     }
   }
@@ -1438,7 +1438,7 @@ int run_install_pipeline_self_test() {
     auto local = make_local_sink(local_root.u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Wrapped PPSA88888";
-    request.dest_prefix = "/mnt/usb0/homebrew";
+    request.dest_prefix = "/data/homebrew";
     std::int64_t last_bytes = -1;
     std::int64_t bytes_total = 0;
     bool bytes_backwards = false;
@@ -1453,16 +1453,16 @@ int run_install_pipeline_self_test() {
     }
     if (bytes_total <= 0 || last_bytes != bytes_total || bytes_backwards) return fail("按字节的安装进度不对");
     std::vector<std::uint8_t> got;
-    error = local->read_file("/mnt/usb0/homebrew/PPSA88888/eboot.bin", &got, 100);
+    error = local->read_file("/data/homebrew/PPSA88888/eboot.bin", &got, 100);
     if (!error.empty() || got != fixed_eboot) return fail("补丁里的 eboot.bin 没有覆盖游戏本体的");
-    const auto game_dir = local_root / "mnt" / "usb0" / "homebrew" / "PPSA88888";
+    const auto game_dir = local_root / "data" / "homebrew" / "PPSA88888";
     if (!std::filesystem::exists(game_dir / "sce_sys" / "param.json")) return fail("RAR 的 sce_sys 不在第一层");
     if (!std::filesystem::exists(game_dir / "sce_sys" / "about" / "right.sprx")) return fail("补丁的 sce_sys 没有合进游戏目录");
     if (std::filesystem::exists(game_dir / "Wrap") || std::filesystem::exists(game_dir / "PPSA88888-app0") ||
         std::filesystem::exists(game_dir / "readme.txt")) {
       return fail("RAR 外层目录被装进去了");
     }
-    if (std::filesystem::exists(local_root / "mnt" / "usb0" / "homebrew" / ".panplay-staging")) {
+    if (std::filesystem::exists(local_root / "data" / "homebrew" / ".panplay-staging")) {
       return fail("装完后暂存区没有清干净");
     }
     const InstallResult again = install_game(drive, *local, request);
@@ -1478,9 +1478,9 @@ int run_install_pipeline_self_test() {
       return fail("RAR 游戏出了补丁没有只装补丁: " + patched.message);
     }
     if (counted.writes_ending("/param.json") != 1) return fail("只装补丁时又解压了 RAR 本体");
-    error = local->read_file("/mnt/usb0/homebrew/PPSA88888/eboot.bin", &got, 100);
+    error = local->read_file("/data/homebrew/PPSA88888/eboot.bin", &got, 100);
     if (!error.empty() || got != fixed_eboot) return fail("叠上正式补丁后固件补丁没有留在最上面");
-    error = local->read_file("/mnt/usb0/homebrew/PPSA88888/sce_sys/param.json", &got, 100);
+    error = local->read_file("/data/homebrew/PPSA88888/sce_sys/param.json", &got, 100);
     if (!error.empty() || got != patched_param) return fail("正式补丁的 param.json 没有装上");
     if (install_game(drive, *local, request).status != "already") return fail("RAR 游戏叠完补丁后没有显示已安装");
   }

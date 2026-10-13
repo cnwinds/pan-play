@@ -65,7 +65,7 @@ let dockOpen = false;
 let detail = null;
 const tiles = new Map();
 
-// 局域网访问时服务器要口令；同时等口令的请求共用一次输入。
+// 开了访问口令时，别的设备要先输口令；同时等口令的请求共用一次输入。
 let unlocking = null;
 
 function unlock() {
@@ -1384,11 +1384,59 @@ async function loadSettings() {
   for (const radio of form.querySelectorAll('input[name="target"]')) {
     radio.closest(".choice-card").hidden = !targets.includes(radio.value);
   }
-  form.elements.local_dir.placeholder = targets.includes("ftp") ? "D:\\PS5 游戏" : "/mnt/usb0/homebrew";
+  form.elements.local_dir.placeholder = targets.includes("ftp") ? "D:\\PS5 游戏" : "/data/homebrew";
   for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) form.elements[name].value = settings[name] || "";
   renderTarget(settings.target);
-  await loadCatalogStatus();
+  await Promise.all([loadAccess(), loadCatalogStatus()]);
 }
+
+/* 局域网访问 */
+
+const accessForm = $("#access-form");
+const accessNote = $("#access-note");
+
+function renderAccessCode() {
+  $("#access-code").hidden = !accessForm.elements.require_code.checked;
+}
+
+function renderAccess(access) {
+  const lan = accessForm.elements.lan;
+  lan.checked = access.lan;
+  // 从别的设备关掉局域网访问会把自己关在外面，只许在运行盘游的电脑上关。
+  lan.disabled = access.lan_required || (access.lan && !access.local);
+  $("#access-lan-hint").textContent = access.lan_required
+    ? "主机上只能从其他设备打开盘游，所以一直开着"
+    : lan.disabled ? "只能在运行盘游的电脑上关闭" : "同一网络里的设备可以打开盘游";
+  accessForm.elements.require_code.checked = access.require_code;
+  accessForm.elements.code.value = access.code || "";
+  const url = $("#access-url");
+  url.hidden = !access.url;
+  url.textContent = access.url ? `其他设备打开 ${access.url}` : "";
+  renderAccessCode();
+}
+
+async function loadAccess() {
+  accessNote.textContent = "";
+  renderAccess(await api("/api/access"));
+}
+
+accessForm.elements.require_code.addEventListener("change", renderAccessCode);
+
+accessForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  accessNote.classList.remove("error");
+  try {
+    renderAccess(await api("/api/access", {
+      lan: accessForm.elements.lan.checked,
+      require_code: accessForm.elements.require_code.checked,
+      code: accessForm.elements.code.value.trim(),
+    }));
+    accessNote.textContent = "已保存。";
+  } catch (error) {
+    accessNote.classList.add("error");
+    accessNote.textContent = error.message;
+  }
+});
 
 for (const radio of form.querySelectorAll('input[name="target"]')) {
   radio.addEventListener("change", () => renderTarget(radio.value));

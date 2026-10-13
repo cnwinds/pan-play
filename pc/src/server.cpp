@@ -18,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -164,9 +165,13 @@ std::string ui_file(const std::string& name) {
   return bytes;
 }
 
-// 局域网模式：别的设备也能打开界面，所以要访问口令。口令存在数据目录，通过后发一个会话 Cookie。
+// 局域网访问：总是监听所有网卡，不允许局域网访问时只接本机的连接，所以设置页改了立刻生效。
+// 开了口令后，别的设备要先输口令换一个会话 Cookie；口令存在数据目录。本机打开不用口令。
 struct LanAccess {
-  bool enabled = false;
+  std::atomic<bool> enabled{true};
+  std::atomic<bool> require_code{false};
+  bool required = false;
+  int port = 0;
   std::string code;
   std::mutex mu;
   std::set<std::string> sessions;
@@ -200,6 +205,14 @@ std::string load_or_create_access_code() {
   std::ofstream out(std::filesystem::u8path(path), std::ios::trunc);
   out << code << "\n";
   return code;
+}
+
+std::string save_access_code(const std::string& code) {
+  std::error_code ec;
+  std::filesystem::create_directories(panplay::app_data_dir(), ec);
+  std::ofstream out(std::filesystem::u8path(access_code_path()), std::ios::trunc);
+  out << code << "\n";
+  return out ? "" : "无法保存访问口令";
 }
 
 bool same_text(const std::string& a, const std::string& b) {
@@ -944,23 +957,42 @@ std::string header_value(const std::string& header, const std::string& name) {
   return "";
 }
 
-bool is_loopback_host(std::string host) {
+// Host 头里的主机名，去掉端口，小写；IPv6 保留方括号。
+std::string host_name(std::string host) {
   if (host.rfind("http://", 0) == 0) host = host.substr(7);
+  if (!host.empty() && host.front() == '[') {
+    const std::size_t end = host.find(']');
+    return end == std::string::npos ? "" : ascii_lower(host.substr(0, end + 1));
+  }
   const std::size_t colon = host.rfind(':');
-  if (colon != std::string::npos && host.find(']') == std::string::npos) host = host.substr(0, colon);
-  return host == "127.0.0.1" || host == "localhost";
+  if (colon != std::string::npos) host = host.substr(0, colon);
+  return ascii_lower(host);
 }
 
-// 本机模式只服务本机页面：Host 挡 DNS 重绑定。局域网模式靠口令换来的 Cookie，重绑定来的页面拿不到它。
+bool is_loopback_host(const std::string& host) {
+  const std::string name = host_name(host);
+  return name == "127.0.0.1" || name == "localhost" || name == "[::1]";
+}
+
+// 只认按 IP、localhost、局域网机器名（不带点）或 .local 名打开的页面。
+// DNS 重绑定得用攻击者自己的域名，在这里就被挡掉，所以不开口令也不怕外网网页借浏览器来操作。
+bool is_home_host(const std::string& host) {
+  const std::string name = host_name(host);
+  if (name.empty()) return false;
+  if (name.front() == '[') return true;
+  in_addr ipv4{};
+  if (inet_pton(AF_INET, name.c_str(), &ipv4) == 1) return true;
+  if (name.find('.') == std::string::npos) return true;
+  return name.size() > 6 && name.compare(name.size() - 6, 6, ".local") == 0;
+}
+
 // POST 要求 JSON 让浏览器跨站请求必须预检，而这里不响应预检；带了 Origin 时还要和 Host 对得上。
 bool trusted_request(const std::string& header, const std::string& method) {
   const std::string host = header_value(header, "Host");
-  if (!lan.enabled && !is_loopback_host(host)) return false;
+  if (!is_home_host(host)) return false;
   if (method != "POST") return true;
   const std::string origin = header_value(header, "Origin");
-  if (!origin.empty()) {
-    if (lan.enabled ? origin != "http://" + host : !is_loopback_host(origin)) return false;
-  }
+  if (!origin.empty() && ascii_lower(origin) != "http://" + ascii_lower(host)) return false;
   return header_value(header, "Content-Type").rfind("application/json", 0) == 0;
 }
 
@@ -979,16 +1011,35 @@ std::string cookie_value(const std::string& header, const std::string& name) {
   return "";
 }
 
-bool unlocked(const std::string& header) {
-  if (!lan.enabled) return true;
+// 本机打开（连接来自本机且按 localhost 打开）不用口令。
+bool local_request(bool local_peer, const std::string& header) {
+  return local_peer && is_loopback_host(header_value(header, "Host"));
+}
+
+bool unlocked(bool local_peer, const std::string& header) {
+  if (!lan.require_code || local_request(local_peer, header)) return true;
   const std::string token = cookie_value(header, "panplay_session");
   std::lock_guard<std::mutex> lock(lan.mu);
   return !token.empty() && lan.sessions.count(token) != 0;
 }
 
+std::string current_code() {
+  std::lock_guard<std::mutex> lock(lan.mu);
+  return lan.code;
+}
+
+std::string new_session_cookie() {
+  const std::string token = random_token();
+  {
+    std::lock_guard<std::mutex> lock(lan.mu);
+    lan.sessions.insert(token);
+  }
+  return "Set-Cookie: panplay_session=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000\r\n";
+}
+
 // 口令核对一次只做一个，错了停一秒，挡住并发猜口令。
 void handle_unlock(SOCKET client, const std::string& body) {
-  if (!lan.enabled) {
+  if (!lan.require_code) {
     reply_json(client, 200, "{}");
     return;
   }
@@ -996,22 +1047,83 @@ void handle_unlock(SOCKET client, const std::string& body) {
   static std::mutex attempts;
   {
     std::lock_guard<std::mutex> one_at_a_time(attempts);
-    if (!same_text(json.str("code"), lan.code)) {
+    if (!same_text(json.str("code"), current_code())) {
       std::this_thread::sleep_for(std::chrono::seconds(1));
       reply_json(client, 403, json_error("口令不对"));
       return;
     }
   }
-  const std::string token = random_token();
-  {
-    std::lock_guard<std::mutex> lock(lan.mu);
-    lan.sessions.insert(token);
-  }
-  reply(client, 200, "application/json; charset=utf-8", "{}",
-        "Set-Cookie: panplay_session=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000\r\n");
+  reply(client, 200, "application/json; charset=utf-8", "{}", new_session_cookie());
 }
 
-void handle_client(SOCKET client) {
+std::string lan_address();
+
+std::string lan_url() {
+  if (!lan.enabled) return "";
+  const std::string address = lan_address();
+  return address.empty() ? "" : "http://" + address + ":" + std::to_string(lan.port);
+}
+
+std::string access_json(bool local_peer, const std::string& header) {
+  return std::string("{\"lan\":") + (lan.enabled ? "true" : "false") +
+         ",\"lan_required\":" + (lan.required ? "true" : "false") +
+         ",\"require_code\":" + (lan.require_code ? "true" : "false") +
+         ",\"code\":\"" + panplay::json_escape(current_code()) + "\"" +
+         ",\"local\":" + (local_request(local_peer, header) ? "true" : "false") +
+         ",\"url\":\"" + panplay::json_escape(lan_url()) + "\"}";
+}
+
+// 改局域网访问 / 口令。口令换了或刚开口令时，旧会话全部作废，发起修改的这台设备直接拿新会话。
+void handle_access(SOCKET client, bool local_peer, const std::string& header, const std::string& body) {
+  std::string error;
+  const panplay::Json json = panplay::Json::parse(body, &error);
+  if (!error.empty() || json.type != panplay::Json::Type::object) {
+    reply_json(client, 400, json_error("请求格式不对"));
+    return;
+  }
+  static std::mutex one_change;
+  std::lock_guard<std::mutex> one_at_a_time(one_change);
+  const bool want_lan = lan.required || json.boolean_or("lan", lan.enabled);
+  const bool want_code = json.boolean_or("require_code", lan.require_code);
+  std::string code = json.get("code") ? trimmed(json.str("code")) : current_code();
+  if (code.size() < 4 || code.size() > 32 ||
+      std::any_of(code.begin(), code.end(), [](unsigned char c) { return c <= ' '; })) {
+    reply_json(client, 400, json_error("口令要 4 到 32 个字符，不能有空格"));
+    return;
+  }
+  if (!want_lan && !local_request(local_peer, header)) {
+    reply_json(client, 400, json_error("关闭局域网访问后这台设备就打不开盘游了，请在运行盘游的电脑上关"));
+    return;
+  }
+  const bool code_changed = code != current_code();
+  if (code_changed) {
+    error = save_access_code(code);
+    if (!error.empty()) {
+      reply_json(client, 500, json_error(error));
+      return;
+    }
+  }
+  AppSettings settings = load_settings();
+  settings.lan_access = want_lan;
+  settings.require_code = want_code;
+  error = save_settings(settings);
+  if (!error.empty()) {
+    reply_json(client, 500, json_error(error));
+    return;
+  }
+  const bool reset_sessions = code_changed || (want_code && !lan.require_code);
+  {
+    std::lock_guard<std::mutex> lock(lan.mu);
+    lan.code = code;
+    if (reset_sessions) lan.sessions.clear();
+  }
+  lan.enabled = want_lan;
+  lan.require_code = want_code;
+  reply(client, 200, "application/json; charset=utf-8", access_json(local_peer, header),
+        reset_sessions ? new_session_cookie() : "");
+}
+
+void handle_client(SOCKET client, bool local_peer) {
   std::string data;
   char buffer[4096];
   while (data.find("\r\n\r\n") == std::string::npos && data.size() < 65536) {
@@ -1037,8 +1149,12 @@ void handle_client(SOCKET client) {
 
   const std::string method = request_method(header);
   const std::string target = request_target(header);
+  if (!local_peer && !lan.enabled) {
+    reply_json(client, 403, json_error("局域网访问已关闭，请在运行盘游的电脑上打开设置里的局域网访问"));
+    return;
+  }
   if (!trusted_request(header, method)) {
-    reply_json(client, 403, json_error("只接受本机页面的请求"));
+    reply_json(client, 403, json_error("请用 IP 地址或本机名打开盘游"));
     return;
   }
 
@@ -1058,8 +1174,16 @@ void handle_client(SOCKET client) {
     handle_unlock(client, body);
     return;
   }
-  if (!unlocked(header)) {
+  if (!unlocked(local_peer, header)) {
     reply_json(client, 401, "{\"error\":\"需要访问口令\",\"locked\":true}");
+    return;
+  }
+  if (method == "GET" && target == "/api/access") {
+    reply_json(client, 200, access_json(local_peer, header));
+    return;
+  }
+  if (method == "POST" && target == "/api/access") {
+    handle_access(client, local_peer, header, body);
     return;
   }
   if (method == "GET" && target.rfind("/api/cover/", 0) == 0) {
@@ -1411,36 +1535,44 @@ int run_server(const ServerOptions& options) {
     std::cerr << net_error << "\n";
     return 1;
   }
-  lan.enabled = options.lan;
-  if (lan.enabled) lan.code = load_or_create_access_code();
-  const char* bind_host = lan.enabled ? "0.0.0.0" : "127.0.0.1";
+  {
+    const AppSettings settings = load_settings();
+    lan.required = options.lan_required;
+    lan.enabled = lan.required || options.lan.value_or(settings.lan_access);
+    lan.require_code = settings.require_code;
+    lan.port = port;
+    lan.code = load_or_create_access_code();
+  }
   SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   panplay::set_listen_exclusive(listener);
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(static_cast<std::uint16_t>(port));
-  inet_pton(AF_INET, bind_host, &address.sin_addr);
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
   if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(listener, 8) != 0) {
-    std::cerr << "无法在 " << bind_host << ":" << port << " 监听\n";
+    std::cerr << "无法在端口 " << port << " 监听\n";
     return 1;
   }
-  std::string url = "http://127.0.0.1:" + std::to_string(port);
-  if (lan.enabled) {
-    const std::string here = lan_address();
-    if (!here.empty()) url = "http://" + here + ":" + std::to_string(port);
-    std::cout << "盘游界面 " << url << "\n访问口令 " << lan.code << "（" << access_code_path() << "）" << std::endl;
-  } else {
-    std::cout << "盘游界面 " << url << "\n按 Ctrl+C 结束" << std::endl;
-  }
-  if (options.on_ready) options.on_ready(url, lan.code);
+  const std::string local_url = "http://127.0.0.1:" + std::to_string(port);
+  const std::string other_url = lan_url();
+  const std::string code = lan.require_code ? lan.code : "";
+  std::cout << "盘游界面 " << local_url << "\n";
+  if (!other_url.empty()) std::cout << "局域网里打开 " << other_url << "\n";
+  if (!lan.enabled) std::cout << "局域网访问已关闭，可在设置里打开\n";
+  if (!code.empty()) std::cout << "访问口令 " << code << "（" << access_code_path() << "）\n";
+  std::cout << "按 Ctrl+C 结束" << std::endl;
+  if (options.on_ready) options.on_ready(local_url, other_url, code);
   load_queue();
   while (true) {
-    SOCKET client = accept(listener, nullptr, nullptr);
+    sockaddr_in peer{};
+    panplay::socklen peer_length = sizeof(peer);
+    SOCKET client = accept(listener, reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (client == INVALID_SOCKET) break;
+    const bool local_peer = peer.sin_family == AF_INET && (ntohl(peer.sin_addr.s_addr) >> 24) == 127;
     panplay::set_socket_timeout(client, 30000);
-    std::thread([client] {
+    std::thread([client, local_peer] {
       try {
-        handle_client(client);
+        handle_client(client, local_peer);
       } catch (const std::exception&) {
         try {
           reply_json(client, 500, json_error("服务器内部错误"));
