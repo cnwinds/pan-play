@@ -36,7 +36,6 @@ const catalogNote = $("#catalog-note");
 const catalogReload = $("#catalog-reload");
 
 const signedOutHint = "登录后才能看到网盘里的游戏。";
-const missingKeyHint = "先到设置里填好网盘插件的参数并保存。";
 const regionText = { UP: "美服", EP: "欧服", JP: "日服", HP: "港服", KP: "韩服", IP: "国际服" };
 const storeLocaleText = { "zh-hans-hk": "港服商店（简体）", "zh-hant-hk": "港服商店（繁体）", "en-us": "美服商店" };
 const metaStateNote = {
@@ -374,8 +373,8 @@ async function loadGames() {
       loginText.textContent = signedOutHint;
       return;
     }
-    if (loggedIn) lede.textContent = loginErrorText(error.message);
-    else loginText.textContent = loginErrorText(error.message);
+    if (loggedIn) lede.textContent = error.message;
+    else loginText.textContent = error.message;
   }
 }
 
@@ -1221,11 +1220,6 @@ function loginFlowActive() {
   return !qrWrap.hidden || loginTimer !== 0;
 }
 
-function loginErrorText(message) {
-  if (message === "缺少 PANPLAY_BAIDU_APP_KEY" || message === "缺少 PANPLAY_BAIDU_SECRET_KEY") return missingKeyHint;
-  return message;
-}
-
 function setLoggedIn(on) {
   loggedIn = on;
   loginBox.hidden = on && !loginFlowActive();
@@ -1246,10 +1240,15 @@ function finishLogin() {
   loadGames();
 }
 
+// 一次轮询会在服务端挂到半分钟，换了二维码后，旧二维码那次轮询的结果直接丢掉。
+let loginRun = 0;
+
 async function pollLogin() {
   loginTimer = 0;
+  const run = loginRun;
   try {
     const poll = await api("/api/login/poll", {});
+    if (run !== loginRun) return;
     if (poll.done) {
       finishLogin();
       return;
@@ -1257,19 +1256,21 @@ async function pollLogin() {
     if (poll.expired || poll.error) {
       stopLoginPoll();
       qrWrap.hidden = true;
-      loginText.textContent = loginErrorText(poll.error || "二维码过期了，再显示一次。");
+      loginText.textContent = poll.error || "二维码过期了，再显示一次。";
       return;
     }
-    loginText.textContent = "在手机上确认后，这里会自动进入游戏库。";
-    loginTimer = window.setTimeout(pollLogin, Math.max(5, poll.retry_after || 5) * 1000);
+    if (poll.scanned) loginText.textContent = "已扫码，在手机上点确认登录后，这里会自动进入游戏库。";
+    loginTimer = window.setTimeout(pollLogin, Math.max(1, poll.retry_after || 1) * 1000);
   } catch (error) {
+    if (run !== loginRun) return;
     stopLoginPoll();
-    loginText.textContent = loginErrorText(error.message);
+    loginText.textContent = error.message;
   }
 }
 
 async function startLogin() {
   stopLoginPoll();
+  loginRun += 1;
   loginButton.disabled = true;
   loginText.textContent = "正在向百度获取二维码…";
   let challenge;
@@ -1290,13 +1291,13 @@ async function startLogin() {
     qrWrap.hidden = false;
   }
   userCode.textContent = challenge.user_code ? "用户码 " + challenge.user_code : "";
-  loginText.textContent = "用百度 App、百度网盘或微信扫码。";
+  loginText.textContent = "用百度网盘 App 扫码登录。";
   loginButton.textContent = "换一张二维码";
-  loginTimer = window.setTimeout(pollLogin, Math.max(5, challenge.interval || 5) * 1000);
+  loginTimer = window.setTimeout(pollLogin, Math.max(1, challenge.interval || 1) * 1000);
 }
 
 loginButton.addEventListener("click", () => {
-  startLogin().catch((error) => { loginText.textContent = loginErrorText(error.message); });
+  startLogin().catch((error) => { loginText.textContent = error.message; });
 });
 
 /* 设置 */
@@ -1387,6 +1388,7 @@ function renderDrive(id) {
   const draft = driveDrafts.get(id);
   const box = $("#drive-fields");
   box.replaceChildren();
+  box.hidden = draft.fields.length === 0;
   for (const field of draft.fields) {
     const label = el("label", "field", field.label);
     const input = el("input");
@@ -1638,7 +1640,7 @@ async function boot() {
     await loadGames();
   } catch (error) {
     setLoggedIn(false);
-    loginText.textContent = loginErrorText(error.message);
+    loginText.textContent = error.message;
   } finally {
     loginButton.disabled = false;
   }

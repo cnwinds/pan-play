@@ -106,8 +106,7 @@ void print_usage() {
             << "  panplay install <游戏目录> --to <本机目录或 ftp://主机:端口>\n"
             << "  panplay read <fsid> <offset> <length>\n"
             << "  panplay store-meta <conceptId>\n"
-            << "  panplay http-get <地址>\n"
-            << "\n密钥在界面的设置页保存。开发时环境变量 PANPLAY_BAIDU_APP_KEY 和 PANPLAY_BAIDU_SECRET_KEY 仍可覆盖。\n";
+            << "  panplay http-get <地址>\n";
 }
 
 int self_test() {
@@ -148,12 +147,17 @@ int login() {
     std::cerr << challenge.error << "\n";
     return 1;
   }
-  std::cout << "用百度 App、百度网盘或微信扫描:\n" << challenge.qrcode_url << "\n";
+  std::cout << "在浏览器打开下面的二维码，用百度网盘 App 扫码:\n" << challenge.qrcode_url << "\n";
   if (!challenge.user_code.empty()) std::cout << "用户码: " << challenge.user_code << "\n";
-  const int rounds = challenge.expires_in > 0 ? challenge.expires_in / challenge.interval_seconds : 60;
-  for (int i = 0; i < rounds; ++i) {
-    std::this_thread::sleep_for(std::chrono::seconds(challenge.interval_seconds));
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(challenge.expires_in > 0 ? challenge.expires_in : 300);
+  bool scanned = false;
+  while (std::chrono::steady_clock::now() < deadline) {
     panplay::LoginPoll poll = drive->poll_login(challenge);
+    if (poll.scanned && !scanned) {
+      std::cout << "已扫码，请在手机上确认登录\n";
+      scanned = true;
+    }
     if (poll.done) {
       std::cout << "登录成功\n";
       return 0;
@@ -166,6 +170,7 @@ int login() {
       std::cerr << poll.error << "\n";
       return 1;
     }
+    std::this_thread::sleep_for(std::chrono::seconds(std::max(1, poll.retry_after_seconds)));
   }
   std::cerr << "等待扫码超时\n";
   return 1;

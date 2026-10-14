@@ -78,6 +78,38 @@ class WinHttpStream final : public HttpStream {
     return narrow(std::wstring(value, size / sizeof(wchar_t)));
   }
 
+  std::vector<std::pair<std::string, std::string>> headers() const override {
+    std::vector<std::pair<std::string, std::string>> out;
+    HINTERNET request = request_.load();
+    if (request == nullptr) return out;
+    DWORD size = 0;
+    WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, WINHTTP_NO_OUTPUT_BUFFER,
+                        &size, WINHTTP_NO_HEADER_INDEX);
+    if (size == 0) return out;
+    std::wstring raw(size / sizeof(wchar_t), L'\0');
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, raw.data(), &size,
+                             WINHTTP_NO_HEADER_INDEX)) {
+      return out;
+    }
+    raw.resize(size / sizeof(wchar_t));
+    const std::string text = narrow(raw);
+    // 第一行是状态行。
+    std::size_t start = text.find("\r\n");
+    while (start != std::string::npos) {
+      start += 2;
+      const std::size_t end = text.find("\r\n", start);
+      const std::string line = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+      start = end;
+      const std::size_t colon = line.find(':');
+      if (colon == std::string::npos) continue;
+      std::string name = line.substr(0, colon);
+      for (char& ch : name) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      const std::size_t first = line.find_first_not_of(" \t", colon + 1);
+      out.emplace_back(std::move(name), first == std::string::npos ? "" : line.substr(first));
+    }
+    return out;
+  }
+
   std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) override {
     HINTERNET request = request_.load();
     if (request == nullptr) {
@@ -158,6 +190,10 @@ std::unique_ptr<HttpStream> HttpClient::open(const HttpRequest& request, std::st
   WinHttpSetTimeouts(handle, 10000, 10000, 20000, timeout);
   DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
   WinHttpSetOption(handle, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof(redirect));
+  // 和 PS5 上的实现一样不自动收发 cookie，需要时由调用方自己带。
+  DWORD features = WINHTTP_DISABLE_COOKIES;
+  if (!request.follow_redirects) features |= WINHTTP_DISABLE_REDIRECTS;
+  WinHttpSetOption(handle, WINHTTP_OPTION_DISABLE_FEATURE, &features, sizeof(features));
 
   std::wstring header_block;
   for (const auto& header : request.headers) {

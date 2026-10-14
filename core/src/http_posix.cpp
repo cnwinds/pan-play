@@ -494,6 +494,7 @@ class PosixStream final : public HttpStream {
   std::int64_t content_length() const override { return head_.chunked ? -1 : head_.content_length; }
   std::string final_url() const override { return final_url_; }
   std::string header(const std::string& name) const override { return head_.get(name); }
+  std::vector<std::pair<std::string, std::string>> headers() const override { return head_.headers; }
 
   std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) override {
     if (aborted_.load()) {
@@ -662,7 +663,7 @@ std::unique_ptr<HttpStream> HttpClient::open(const HttpRequest& request, std::st
       return nullptr;
     }
     const std::string location = head.get("Location");
-    if (is_redirect(head.status) && !location.empty()) {
+    if (request.follow_redirects && is_redirect(head.status) && !location.empty()) {
       const std::string next = resolve_location(url, location);
       // 和 WinHTTP 的默认策略一样：不从 https 跳到 http，原样返回跳转响应。
       if (!(url.tls && next.rfind("http://", 0) == 0)) {

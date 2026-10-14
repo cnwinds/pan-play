@@ -51,6 +51,8 @@ struct LoginChallenge {
 struct LoginPoll {
   bool done = false;
   bool expired = false;
+  // 手机已扫码，还没点确认。
+  bool scanned = false;
   int retry_after_seconds = 0;
   std::string error;
 };
@@ -83,8 +85,6 @@ class DrivePlugin {
 };
 
 struct BaiduConfig {
-  std::string app_key;
-  std::string secret_key;
   std::string session_path;
 };
 

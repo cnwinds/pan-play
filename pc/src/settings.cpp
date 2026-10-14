@@ -21,11 +21,6 @@ constexpr const char* kDefaultTarget = "ftp";
 #endif
 constexpr const char* kConsoleDir = "/data/homebrew";
 
-std::string env_or_empty(const char* name) {
-  const char* value = std::getenv(name);
-  return value ? value : "";
-}
-
 std::filesystem::path app_dir() { return panplay::app_data_dir(); }
 
 panplay::Json read_json(const std::filesystem::path& path) {
@@ -42,8 +37,12 @@ void read_current(const panplay::Json& json, AppSettings* settings) {
     for (const auto& [id, node] : drives->object) {
       DriveSettings& drive = settings->drives[id];
       if (!node.str("library_path").empty()) drive.library_path = node.str("library_path");
-      if (const panplay::Json* values = node.get("values")) {
-        for (const auto& [key, value] : values->object) drive.values[key] = value.text;
+      const panplay::DriveKind* kind = panplay::find_drive_kind(id);
+      const panplay::Json* values = node.get("values");
+      if (kind == nullptr || values == nullptr) continue;
+      // 插件不再声明的参数（比如百度以前的 AppKey、SecretKey）不读进来，下次保存时就从文件里去掉了。
+      for (const auto& field : kind->fields) {
+        if (values->get(field.key) != nullptr) drive.values[field.key] = values->str(field.key);
       }
     }
   }
@@ -59,8 +58,6 @@ void read_current(const panplay::Json& json, AppSettings* settings) {
 // 版本 1 只有百度一个插件；存放位置是一个地址加主机目录，本机目录也会再套一层主机目录。
 void read_legacy(const panplay::Json& json, AppSettings* settings) {
   DriveSettings& baidu = settings->drives["baidu"];
-  baidu.values["app_key"] = json.str("app_key");
-  baidu.values["secret_key"] = json.str("secret_key");
   if (!json.str("library_path").empty()) baidu.library_path = json.str("library_path");
   const std::string dest = json.str("dest");
   // 旧版配置不写 prefix 时用的是当时的默认目录。
@@ -313,16 +310,6 @@ AppSettings load_settings() {
   const panplay::Json json = read_json(settings_file_path());
   if (json.num("version") >= 2) read_current(json, &settings);
   else read_legacy(json, &settings);
-
-  DriveSettings& baidu = settings.drives["baidu"];
-  const panplay::Json old_keys = read_json(std::filesystem::path("session") / "baidu-app.json");
-  for (const char* key : {"app_key", "secret_key"}) {
-    if (baidu.values[key].empty()) baidu.values[key] = old_keys.str(key);
-  }
-  const std::string env_key = env_or_empty("PANPLAY_BAIDU_APP_KEY");
-  const std::string env_secret = env_or_empty("PANPLAY_BAIDU_SECRET_KEY");
-  if (!env_key.empty()) baidu.values["app_key"] = env_key;
-  if (!env_secret.empty()) baidu.values["secret_key"] = env_secret;
 
   if (panplay::find_drive_kind(settings.drive) == nullptr) settings.drive = panplay::drive_kinds().front().id;
   const auto modes = target_modes();

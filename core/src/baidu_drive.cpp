@@ -11,11 +11,13 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 
@@ -26,9 +28,25 @@ std::int64_t now_seconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+std::string now_ms_text() {
+  return std::to_string(
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
 // 下载地址约 8 小时失效，提前换。
 constexpr std::int64_t kDlinkLifetimeSeconds = 6 * 3600;
 constexpr int kListPageSize = 1000;
+
+const std::string kPassport = "https://passport.baidu.com";
+const std::string kPanHome = "https://pan.baidu.com/disk/home";
+const std::string kBrowserUa =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
+const std::string kPanUa = "pan.baidu.com";
+constexpr int kQrLifetimeSeconds = 300;
+// passport 的长轮询最多挂 30 秒左右才回 errno=1。超时要比它长，不然手机确认的消息可能送到一半被我们断开。
+constexpr int kLongPollTimeoutMs = 40000;
+// 百度返回 -6 表示登录态失效。
+constexpr int kErrnoNotLoggedIn = -6;
 
 bool write_file_atomic(const std::string& path, const std::string& text) {
   const std::filesystem::path target = std::filesystem::u8path(path);
@@ -65,6 +83,130 @@ std::int64_t range_start(const std::string& content_range) {
   return value;
 }
 
+std::string lower(std::string value) {
+  for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return value;
+}
+
+std::string trim(const std::string& value) {
+  const auto begin = value.find_first_not_of(" \t");
+  if (begin == std::string::npos) return "";
+  return value.substr(begin, value.find_last_not_of(" \t") - begin + 1);
+}
+
+std::string url_host(const std::string& url) {
+  const auto scheme = url.find("://");
+  const std::size_t start = scheme == std::string::npos ? 0 : scheme + 3;
+  const auto end = url.find_first_of(":/?#", start);
+  return lower(url.substr(start, end == std::string::npos ? std::string::npos : end - start));
+}
+
+std::string response_header(const HttpResponse& response, const std::string& name) {
+  for (const auto& header : response.headers) {
+    if (header.first == name) return header.second;
+  }
+  return {};
+}
+
+// 把 Location 头（可能是相对地址）换成完整地址。
+std::string absolute_url(const std::string& base, const std::string& location) {
+  if (location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0) return location;
+  const auto scheme_end = base.find("://");
+  const std::string scheme = scheme_end == std::string::npos ? "https" : base.substr(0, scheme_end);
+  if (location.rfind("//", 0) == 0) return scheme + ":" + location;
+  const auto path_start = base.find('/', scheme_end == std::string::npos ? 0 : scheme_end + 3);
+  const std::string origin = base.substr(0, path_start);
+  if (!location.empty() && location.front() == '/') return origin + location;
+  std::string dir = path_start == std::string::npos ? "/" : base.substr(path_start, base.find('?', path_start) - path_start);
+  return origin + dir.substr(0, dir.rfind('/') + 1) + location;
+}
+
+// passport 的接口回 JSONP：callback({...})，也可能直接是 JSON。
+Json parse_jsonp(const std::string& text) {
+  const auto open = text.find_first_of("({");
+  if (open == std::string::npos) return {};
+  if (text[open] == '{') return Json::parse(text.substr(open), nullptr);
+  const auto close = text.rfind(')');
+  if (close == std::string::npos || close <= open) return {};
+  return Json::parse(text.substr(open + 1, close - open - 1), nullptr);
+}
+
+std::string random_gid() {
+  std::random_device device;
+  std::mt19937 engine(device());
+  std::uniform_int_distribution<int> digit(0, 15);
+  static const char* hex = "0123456789ABCDEF";
+  std::string gid;
+  for (const int group : {8, 4, 4, 4, 12}) {
+    if (!gid.empty()) gid += '-';
+    for (int i = 0; i < group; ++i) gid += hex[digit(engine)];
+  }
+  return gid;
+}
+
+// 登录过程要跨 passport.baidu.com 和 pan.baidu.com 收集 cookie，两边各有一个 STOKEN，按域名分开存。
+class CookieJar {
+ public:
+  void absorb(const HttpResponse& response, const std::string& url) {
+    const std::string host = url_host(url);
+    for (const auto& [name, line] : response.headers) {
+      if (name != "set-cookie") continue;
+      std::stringstream parts(line);
+      std::string pair;
+      std::getline(parts, pair, ';');
+      const auto eq = pair.find('=');
+      if (eq == std::string::npos) continue;
+      Cookie cookie{trim(pair.substr(0, eq)), trim(pair.substr(eq + 1)), host};
+      std::string attr;
+      while (std::getline(parts, attr, ';')) {
+        attr = trim(attr);
+        if (lower(attr.substr(0, 7)) != "domain=") continue;
+        cookie.domain = lower(attr.substr(7));
+        if (!cookie.domain.empty() && cookie.domain.front() == '.') cookie.domain.erase(0, 1);
+      }
+      cookies_.erase(std::remove_if(cookies_.begin(), cookies_.end(),
+                                    [&](const Cookie& c) { return c.name == cookie.name && c.domain == cookie.domain; }),
+                     cookies_.end());
+      if (!cookie.value.empty() && lower(cookie.value) != "deleted") cookies_.push_back(std::move(cookie));
+    }
+  }
+
+  std::string header(const std::string& url) const {
+    const std::string host = url_host(url);
+    std::string out;
+    for (const Cookie& cookie : cookies_) {
+      if (!matches(host, cookie.domain)) continue;
+      if (!out.empty()) out += "; ";
+      out += cookie.name + "=" + cookie.value;
+    }
+    return out;
+  }
+
+  // 对 host 生效的同名 cookie 里取域名最具体的那个。
+  std::string get(const std::string& name, const std::string& host) const {
+    const Cookie* best = nullptr;
+    for (const Cookie& cookie : cookies_) {
+      if (cookie.name != name || !matches(host, cookie.domain)) continue;
+      if (best == nullptr || cookie.domain.size() > best->domain.size()) best = &cookie;
+    }
+    return best == nullptr ? "" : best->value;
+  }
+
+ private:
+  struct Cookie {
+    std::string name;
+    std::string value;
+    std::string domain;
+  };
+
+  static bool matches(const std::string& host, const std::string& domain) {
+    return host == domain ||
+           (host.size() > domain.size() && host.compare(host.size() - domain.size() - 1, std::string::npos, "." + domain) == 0);
+  }
+
+  std::vector<Cookie> cookies_;
+};
+
 class BaiduStream final : public ByteStream {
  public:
   BaiduStream(std::unique_ptr<HttpStream> http, std::int64_t expected) : http_(std::move(http)), left_(expected) {}
@@ -85,6 +227,8 @@ class BaiduStream final : public ByteStream {
   std::int64_t left_;
 };
 
+// 登录走百度网盘网页版的扫码流程，拿到 BDUSS（和 STOKEN）后，列目录、取下载地址都带这组 cookie，
+// 不需要开放平台的应用和密钥。
 class BaiduDrive final : public DrivePlugin {
  public:
   explicit BaiduDrive(BaiduConfig config) : config_(std::move(config)) { load_session_locked(); }
@@ -94,81 +238,84 @@ class BaiduDrive final : public DrivePlugin {
 
   LoginChallenge start_login() override {
     LoginChallenge challenge;
-    if (config_.app_key.empty()) {
-      challenge.error = "请先打开设置，填写 AppKey 和 SecretKey 并保存。";
-      return challenge;
-    }
-    const std::string url = "https://openapi.baidu.com/oauth/2.0/device/code?response_type=device_code&client_id=" +
-                            url_encode(config_.app_key) + "&scope=" + url_encode("basic,netdisk");
-    HttpResponse response = client_.send({url});
+    const std::string gid = random_gid();
+    const std::string t = now_ms_text();
+    HttpResponse response = client_.send({kPassport + "/v2/api/getqrcode?lp=pc&qrloginfrom=pc&gid=" + gid +
+                                              "&apiver=v3&tt=" + t + "&tpl=netdisk&_=" + t,
+                                          "GET",
+                                          "",
+                                          {{"User-Agent", kBrowserUa}, {"Referer", "https://pan.baidu.com/"}}});
     if (!response.error.empty()) {
       challenge.error = response.error;
       return challenge;
     }
-    std::string parse_error;
-    Json json = Json::parse(response.body, &parse_error);
-    if (!parse_error.empty()) {
-      challenge.error = parse_error;
+    const Json json = parse_jsonp(response.body);
+    const std::string sign = json.str("sign");
+    std::string image = json.str("imgurl");
+    if (sign.empty() || image.empty()) {
+      challenge.error = "百度没有返回登录二维码";
       return challenge;
     }
-    if (const Json* err = json.get("error")) {
-      if (err->type == Json::Type::string) challenge.error = err->text;
-    }
-    challenge.device_code = json.str("device_code");
-    challenge.user_code = json.str("user_code");
-    challenge.verification_url = json.str("verification_url");
-    challenge.qrcode_url = json.str("qrcode_url");
-    challenge.expires_in = static_cast<int>(json.num("expires_in"));
-    challenge.interval_seconds = static_cast<int>(json.num("interval"));
-    if (challenge.interval_seconds < 5) challenge.interval_seconds = 5;
-    if (challenge.device_code.empty() && challenge.error.empty()) challenge.error = "百度没有返回设备码";
+    if (const auto scheme = image.find("://"); scheme != std::string::npos) image = image.substr(scheme + 3);
+    challenge.qrcode_url = "https://" + image;
+    // 轮询时要用到 sign、gid 和过期时间，一起放进 device_code，服务重启后也能接着等。
+    challenge.device_code = sign + ":" + gid + ":" + std::to_string(now_seconds() + kQrLifetimeSeconds);
+    challenge.expires_in = kQrLifetimeSeconds;
+    challenge.interval_seconds = 1;
     return challenge;
   }
 
+  // 一次长轮询最多挂 30 秒左右，有扫码或确认的动静会立刻返回。
   LoginPoll poll_login(const LoginChallenge& challenge) override {
     LoginPoll poll;
-    if (config_.secret_key.empty()) {
-      poll.error = "请先打开设置，填写 AppKey 和 SecretKey 并保存。";
+    poll.retry_after_seconds = 1;
+    const auto first = challenge.device_code.find(':');
+    const auto second = first == std::string::npos ? std::string::npos : challenge.device_code.find(':', first + 1);
+    if (second == std::string::npos) {
+      poll.error = "登录二维码无效，请重新获取";
       return poll;
     }
-    const std::string url = "https://openapi.baidu.com/oauth/2.0/token?grant_type=device_token&code=" +
-                            url_encode(challenge.device_code) + "&client_id=" + url_encode(config_.app_key) +
-                            "&client_secret=" + url_encode(config_.secret_key);
-    HttpResponse response = client_.send({url});
-    if (!response.error.empty()) {
-      poll.error = response.error;
-      return poll;
+    const std::string sign = challenge.device_code.substr(0, first);
+    const std::string gid = challenge.device_code.substr(first + 1, second - first - 1);
+    std::int64_t deadline = 0;
+    try {
+      deadline = std::stoll(challenge.device_code.substr(second + 1));
+    } catch (const std::exception&) {
     }
-    std::string parse_error;
-    Json json = Json::parse(response.body, &parse_error);
-    if (!parse_error.empty()) {
-      poll.error = parse_error;
-      return poll;
-    }
-    const std::string error = json.str("error");
-    if (error == "authorization_pending") {
-      poll.retry_after_seconds = std::max(challenge.interval_seconds, 5);
-      return poll;
-    }
-    if (error == "slow_down") {
-      poll.retry_after_seconds = std::max(challenge.interval_seconds + 5, 10);
-      return poll;
-    }
-    if (error == "expired_token" || error == "authorization_expired") {
+    if (now_seconds() > deadline) {
       poll.expired = true;
       poll.error = "二维码已过期";
       return poll;
     }
-    if (!error.empty()) {
-      poll.error = error;
+
+    const std::string t = now_ms_text();
+    HttpRequest request{kPassport + "/channel/unicast?channel_id=" + sign + "&tpl=netdisk&gid=" + gid +
+                            "&apiver=v3&tt=" + t + "&_=" + t,
+                        "GET",
+                        "",
+                        {{"User-Agent", kBrowserUa}, {"Referer", "https://pan.baidu.com/"}}};
+    request.timeout_ms = kLongPollTimeoutMs;
+    const HttpResponse response = client_.send(request);
+    if (!response.error.empty()) return poll;
+    const Json json = parse_jsonp(response.body);
+    const std::string channel = json.str("channel_v");
+    if (json.num("errno") != 0 || channel.empty()) return poll;
+    const Json state = Json::parse(channel, nullptr);
+    const int status = static_cast<int>(state.num("status"));
+    if (status == 1) {
+      poll.scanned = true;
       return poll;
     }
+    if (status == 2) {
+      poll.error = "已在手机上取消登录";
+      return poll;
+    }
+    const std::string ticket = state.str("v");
+    if (status != 0 || ticket.empty()) return poll;
+
     Session fresh;
-    fresh.access_token = json.str("access_token");
-    fresh.refresh_token = json.str("refresh_token");
-    fresh.expires_at = now_seconds() + static_cast<std::int64_t>(json.num("expires_in")) - 60;
-    if (fresh.access_token.empty()) {
-      poll.error = "百度没有返回访问令牌";
+    if (std::string error = exchange_ticket(ticket, &fresh); !error.empty()) {
+      poll.error = error;
       return poll;
     }
     std::lock_guard<std::mutex> lock(mu_);
@@ -179,7 +326,10 @@ class BaiduDrive final : public DrivePlugin {
     return poll;
   }
 
-  bool session_valid() override { return !access_token().empty(); }
+  bool session_valid() override {
+    std::lock_guard<std::mutex> lock(mu_);
+    return !session_.bduss.empty();
+  }
 
   void logout() override {
     std::lock_guard<std::mutex> lock(mu_);
@@ -190,17 +340,16 @@ class BaiduDrive final : public DrivePlugin {
 
   std::vector<DriveEntry> list(const std::string& path, std::string* error) override {
     std::vector<DriveEntry> entries;
-    const std::string token = access_token();
-    if (token.empty()) {
+    const std::string cookie = pan_cookie();
+    if (cookie.empty()) {
       if (error) *error = "百度未登录";
       return entries;
     }
     const std::string dir = path.empty() ? "/" : path;
     for (int start = 0;; start += kListPageSize) {
-      const std::string url = "https://pan.baidu.com/rest/2.0/xpan/file?method=list&access_token=" + url_encode(token) +
-                              "&dir=" + url_encode(dir) + "&start=" + std::to_string(start) +
-                              "&limit=" + std::to_string(kListPageSize);
-      HttpResponse response = client_.send({url, "GET", "", {{"User-Agent", "pan.baidu.com"}}});
+      const std::string url = "https://pan.baidu.com/rest/2.0/xpan/file?method=list&dir=" + url_encode(dir) +
+                              "&start=" + std::to_string(start) + "&limit=" + std::to_string(kListPageSize);
+      HttpResponse response = client_.send({url, "GET", "", {{"User-Agent", kPanUa}, {"Cookie", cookie}}});
       if (!response.error.empty()) {
         if (error) *error = response.error;
         return {};
@@ -211,8 +360,9 @@ class BaiduDrive final : public DrivePlugin {
         if (error) *error = parse_error;
         return {};
       }
-      if (json.num("errno") != 0) {
-        if (error) *error = "百度列目录失败 errno=" + std::to_string(static_cast<int>(json.num("errno")));
+      const int code = static_cast<int>(json.num("errno"));
+      if (code != 0) {
+        if (error) *error = code == kErrnoNotLoggedIn ? signed_out() : "百度列目录失败 errno=" + std::to_string(code);
         return {};
       }
       const Json* list = json.get("list");
@@ -251,7 +401,7 @@ class BaiduDrive final : public DrivePlugin {
         result.error = error;
         return result;
       }
-      HttpResponse body = client_.send({url, "GET", "", {{"User-Agent", "pan.baidu.com"}, {"Range", range}}});
+      HttpResponse body = client_.send({url, "GET", "", download_headers(resolved, range)});
       result.status = body.status;
       if (!body.error.empty()) {
         if (resolved && attempt == 0) continue;
@@ -293,7 +443,7 @@ class BaiduDrive final : public DrivePlugin {
         *error = link_error;
         return nullptr;
       }
-      HttpRequest request{url, "GET", "", {{"User-Agent", "pan.baidu.com"}, {"Range", range}}};
+      HttpRequest request{url, "GET", "", download_headers(resolved, range)};
       request.abort = abort;
       auto http = client_.open(request, error);
       if (!http) {
@@ -321,9 +471,8 @@ class BaiduDrive final : public DrivePlugin {
   }
 
   struct Session {
-    std::string access_token;
-    std::string refresh_token;
-    std::int64_t expires_at = 0;
+    std::string bduss;
+    std::string stoken;
   };
 
   struct Dlink {
@@ -333,24 +482,87 @@ class BaiduDrive final : public DrivePlugin {
     std::int64_t fetched_at = 0;
   };
 
+  // 跟着跳转一路走，把每一跳的 Set-Cookie 都收进 jar。
+  HttpResponse visit(CookieJar& jar, std::string url) {
+    HttpResponse response;
+    for (int hop = 0; hop <= 8; ++hop) {
+      HttpRequest request{url, "GET", "", {{"User-Agent", kBrowserUa}, {"Referer", "https://pan.baidu.com/"}}};
+      if (const std::string cookie = jar.header(url); !cookie.empty()) request.headers.emplace_back("Cookie", cookie);
+      request.follow_redirects = false;
+      response = client_.send(request);
+      if (!response.error.empty()) return response;
+      jar.absorb(response, url);
+      const std::string location = response_header(response, "location");
+      if (response.status < 300 || response.status >= 400 || location.empty()) {
+        response.final_url = url;
+        return response;
+      }
+      url = absolute_url(url, location);
+    }
+    response.error = "跳转次数过多";
+    return response;
+  }
+
+  // 手机确认后拿到的一次性凭据换成网盘域下的 BDUSS 和 STOKEN，再用列目录确认这组 cookie 真能用。
+  std::string exchange_ticket(const std::string& ticket, Session* out) {
+    CookieJar jar;
+    const std::string t = now_ms_text();
+    const HttpResponse login =
+        visit(jar, kPassport + "/v3/login/main/qrbdusslogin?v=" + t + "&bduss=" + url_encode(ticket) +
+                       "&u=" + url_encode(kPanHome) + "&loginVersion=v4&qrcode=1&tpl=netdisk&apiver=v3&tt=" + t +
+                       "&time=" + std::to_string(now_seconds()) + "&alg=v3");
+    if (!login.error.empty()) return login.error;
+    out->bduss = jar.get("BDUSS", "pan.baidu.com");
+    if (out->bduss.empty()) return "换取百度登录态失败，请重新扫码";
+
+    visit(jar, kPassport + "/v3/login/api/auth/?return_type=5&tpl=netdisk&u=" + url_encode(kPanHome));
+    out->stoken = jar.get("STOKEN", "pan.baidu.com");
+    if (out->stoken.empty()) {
+      visit(jar, kPanHome);
+      out->stoken = jar.get("STOKEN", "pan.baidu.com");
+    }
+
+    const HttpResponse check = client_.send({"https://pan.baidu.com/rest/2.0/xpan/file?method=list&dir=%2F&start=0&limit=1",
+                                             "GET",
+                                             "",
+                                             {{"User-Agent", kPanUa}, {"Cookie", cookie_of(*out)}}});
+    if (!check.error.empty()) return check.error;
+    std::string parse_error;
+    const Json listed = Json::parse(check.body, &parse_error);
+    if (!parse_error.empty() || listed.get("errno") == nullptr || listed.num("errno") != 0) {
+      return "已拿到登录态，但网盘校验没有通过，请重新扫码";
+    }
+    return "";
+  }
+
+  static std::string cookie_of(const Session& session) {
+    if (session.bduss.empty()) return "";
+    return "BDUSS=" + session.bduss + (session.stoken.empty() ? "" : "; STOKEN=" + session.stoken);
+  }
+
+  std::string pan_cookie() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return cookie_of(session_);
+  }
+
+  // 百度说登录态失效了：清掉会话，界面会回到扫码登录。
+  std::string signed_out() {
+    logout();
+    return "百度未登录";
+  }
+
+  // 下载地址要带登录 cookie 才给跳转；跳到的下载节点地址本身就带签名，不再带 cookie。
+  std::vector<std::pair<std::string, std::string>> download_headers(bool resolved, const std::string& range) {
+    std::vector<std::pair<std::string, std::string>> headers{{"User-Agent", kPanUa}, {"Range", range}};
+    if (!resolved) headers.emplace_back("Cookie", pan_cookie());
+    return headers;
+  }
+
   void remember_resolved(const std::string& file_id, const std::string& requested, const std::string& final_url) {
     if (final_url.empty() || final_url == requested || final_url.rfind("https://", 0) != 0) return;
     std::lock_guard<std::mutex> lock(mu_);
     const auto it = dlinks_.find(file_id);
     if (it != dlinks_.end() && it->second.url == requested) it->second.resolved = final_url;
-  }
-
-  // 刷新令牌要走网络，期间不占 mu_，别的线程还能用缓存的下载地址；刷新本身由 refresh_mu_ 排队。
-  std::string access_token() {
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      if (session_.access_token.empty()) return {};
-      if (session_.expires_at > now_seconds()) return session_.access_token;
-    }
-    std::lock_guard<std::mutex> refreshing(refresh_mu_);
-    if (!refresh()) return {};
-    std::lock_guard<std::mutex> lock(mu_);
-    return session_.access_token;
   }
 
   std::string download_url(const std::string& file_id, bool force, std::string* url, bool* resolved) {
@@ -364,57 +576,26 @@ class BaiduDrive final : public DrivePlugin {
         return "";
       }
     }
-    const std::string token = access_token();
-    if (token.empty()) return "百度未登录";
-    const std::string meta_url = "https://pan.baidu.com/rest/2.0/xpan/multimedia?method=filemetas&access_token=" +
-                                 url_encode(token) + "&fsids=" + url_encode("[" + file_id + "]") + "&dlink=1";
-    HttpResponse meta = client_.send({meta_url, "GET", "", {{"User-Agent", "pan.baidu.com"}}});
+    const std::string cookie = pan_cookie();
+    if (cookie.empty()) return "百度未登录";
+    const std::string meta_url = "https://pan.baidu.com/api/filemetas?dlink=1&web=1&clienttype=0&fsids=" +
+                                 url_encode("[" + file_id + "]");
+    HttpResponse meta = client_.send({meta_url, "GET", "", {{"User-Agent", kPanUa}, {"Cookie", cookie}}});
     if (!meta.error.empty()) return meta.error;
     std::string parse_error;
     Json json = Json::parse(meta.body, &parse_error);
     if (!parse_error.empty()) return parse_error;
-    const Json* list = json.get("list");
-    if (!list || list->type != Json::Type::array || list->array.empty()) return "没有拿到下载地址";
-    std::string dlink = list->array.front().str("dlink");
+    const int code = static_cast<int>(json.num("errno"));
+    if (code == kErrnoNotLoggedIn) return signed_out();
+    if (code != 0) return "没有拿到下载地址 errno=" + std::to_string(code);
+    const Json* info = json.get("info");
+    if (!info || info->type != Json::Type::array || info->array.empty()) return "没有拿到下载地址";
+    const std::string dlink = info->array.front().str("dlink");
     if (dlink.empty()) return "下载地址为空";
-    if (dlink.find("access_token=") == std::string::npos) {
-      dlink += (dlink.find('?') == std::string::npos ? "?" : "&");
-      dlink += "access_token=" + url_encode(token);
-    }
     std::lock_guard<std::mutex> lock(mu_);
     dlinks_[file_id] = Dlink{dlink, "", now_seconds()};
     *url = dlink;
     return "";
-  }
-
-  // 百度的 refresh_token 只能用一次。别的进程或旧实例可能已经换过，先看会话文件里是不是有更新的。
-  // 调用方持有 refresh_mu_，不持有 mu_。
-  bool refresh() {
-    std::string refresh_token;
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      if (session_.expires_at > now_seconds()) return true;
-      const Session saved = session_;
-      load_session_locked();
-      if (session_.refresh_token != saved.refresh_token && session_.expires_at > now_seconds()) return true;
-      if (session_.refresh_token.empty() || config_.secret_key.empty()) return false;
-      refresh_token = session_.refresh_token;
-    }
-    const std::string url = "https://openapi.baidu.com/oauth/2.0/token?grant_type=refresh_token&refresh_token=" +
-                            url_encode(refresh_token) + "&client_id=" + url_encode(config_.app_key) +
-                            "&client_secret=" + url_encode(config_.secret_key);
-    HttpResponse response = client_.send({url});
-    if (!response.error.empty()) return false;
-    Json json = Json::parse(response.body, nullptr);
-    const std::string token = json.str("access_token");
-    if (token.empty()) return false;
-    std::lock_guard<std::mutex> lock(mu_);
-    session_.access_token = token;
-    if (!json.str("refresh_token").empty()) session_.refresh_token = json.str("refresh_token");
-    session_.expires_at = now_seconds() + static_cast<std::int64_t>(json.num("expires_in")) - 60;
-    dlinks_.clear();
-    save_session_locked();
-    return true;
   }
 
   void load_session_locked() {
@@ -423,22 +604,18 @@ class BaiduDrive final : public DrivePlugin {
     std::stringstream buffer;
     buffer << in.rdbuf();
     Json json = Json::parse(buffer.str(), nullptr);
-    if (json.str("access_token").empty()) return;
-    session_.access_token = json.str("access_token");
-    session_.refresh_token = json.str("refresh_token");
-    session_.expires_at = static_cast<std::int64_t>(json.num("expires_at"));
+    session_.bduss = json.str("bduss");
+    session_.stoken = json.str("stoken");
   }
 
   void save_session_locked() const {
-    write_file_atomic(config_.session_path, "{\"access_token\":\"" + json_escape(session_.access_token) +
-                                                "\",\"refresh_token\":\"" + json_escape(session_.refresh_token) +
-                                                "\",\"expires_at\":" + std::to_string(session_.expires_at) + "}");
+    write_file_atomic(config_.session_path, "{\"bduss\":\"" + json_escape(session_.bduss) + "\",\"stoken\":\"" +
+                                                json_escape(session_.stoken) + "\"}");
   }
 
   BaiduConfig config_;
   HttpClient client_;
   std::mutex mu_;
-  std::mutex refresh_mu_;
   Session session_;
   std::map<std::string, Dlink> dlinks_;
 };

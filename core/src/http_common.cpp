@@ -25,6 +25,7 @@ HttpResponse HttpClient::send(const HttpRequest& request) {
   if (!stream) return response;
   response.status = stream->status();
   response.final_url = stream->final_url();
+  response.headers = stream->headers();
   std::uint8_t buffer[65536];
   for (;;) {
     std::string error;

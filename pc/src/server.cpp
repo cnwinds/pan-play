@@ -1347,7 +1347,7 @@ void handle_client(SOCKET client, bool local_peer) {
     }
     reply_json(client, 200,
                std::string("{\"done\":") + (poll.done ? "true" : "false") + ",\"expired\":" + (poll.expired ? "true" : "false") +
-                   ",\"error\":\"" + panplay::json_escape(poll.error) + "\",\"retry_after\":" + std::to_string(retry) + "}");
+                   ",\"scanned\":" + (poll.scanned ? "true" : "false") + ",\"error\":\"" + panplay::json_escape(poll.error) + "\",\"retry_after\":" + std::to_string(retry) + "}");
     return;
   }
   if (method == "POST" && target == "/api/game") {
