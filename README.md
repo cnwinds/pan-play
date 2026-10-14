@@ -122,6 +122,6 @@ $PS5_PAYLOAD_SDK/bin/prospero-cmake -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYP
 
 推送后 GitHub Actions（`.github/workflows/build.yml`）会编出 Linux 版并跑自测，再编出 PS5 的 `panplay.elf` 和 Windows 的 `panplay.exe`（MSYS2 MinGW 静态链接、界面打包在里面，单个文件就能运行），都在运行记录的 Artifacts 里下载。
 
-发布新版本：在 `main` 上打 `v` 开头的标签并推送（如 `git tag v0.1.0 && git push origin v0.1.0`），三个平台都编过后，自动建 GitHub Release，挂上 Windows 的 exe、PS5 的 elf 和 `SHA256SUMS.txt`。
+发布新版本：在 `main` 上打 `v` 开头的标签并推送（如 `git tag v0.1.0 && git push origin v0.1.0`），三个平台都编过后，自动建 GitHub Release，挂上 Windows 的 exe、PS5 的 elf 和 `SHA256SUMS.txt`。完整步骤（定版本号、整理提交、验证、出错怎么办）见 [发布流程](docs/agents/release.md)。
 
 百度登录走网盘网页版的扫码流程：passport 出二维码，手机确认后换成 `BDUSS` / `STOKEN` cookie，列目录和取下载地址都带这组 cookie。会话在数据目录的 `baidu-session.json`，相当于网盘账号的登录态，别发给别人。
