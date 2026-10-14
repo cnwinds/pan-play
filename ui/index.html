@@ -59,11 +59,28 @@
           <h1 id="library-title">游戏库 <span class="count num" id="game-count"></span></h1>
           <p class="lede" id="lede">正在读取网盘里的游戏…</p>
         </div>
-        <div class="filters" role="group" aria-label="筛选">
-          <button type="button" class="filter" data-filter="all" aria-pressed="true">全部</button>
-          <button type="button" class="filter" data-filter="installed" aria-pressed="false">已安装</button>
-          <button type="button" class="filter" data-filter="continue" aria-pressed="false">未装完</button>
-          <button type="button" class="filter" data-filter="todo" aria-pressed="false">未安装</button>
+        <div class="library-tools">
+          <div class="filters" role="group" aria-label="筛选">
+            <button type="button" class="filter" data-filter="all" aria-pressed="true">全部</button>
+            <button type="button" class="filter" data-filter="installed" aria-pressed="false">已安装</button>
+            <button type="button" class="filter" data-filter="continue" aria-pressed="false">未装完</button>
+            <button type="button" class="filter" data-filter="todo" aria-pressed="false">未安装</button>
+          </div>
+          <div class="refine" role="group" aria-label="按商店资料筛选和排序">
+            <button type="button" class="chip-toggle" data-refine="cn" aria-pressed="false"
+                    title="只看 PlayStation 商店标了中文字幕或中文语音的游戏">有中文</button>
+            <button type="button" class="chip-toggle" data-refine="multi" aria-pressed="false"
+                    title="只看支持两人及以上同屏游玩的游戏">多人同屏</button>
+            <label class="sort">
+              <span class="visually-hidden">排序方式</span>
+              <select id="sort">
+                <option value="">默认顺序</option>
+                <option value="rating">评分最高</option>
+                <option value="release">发售日期（新→旧）</option>
+                <option value="name">按名称</option>
+              </select>
+            </label>
+          </div>
         </div>
       </header>
       <div class="shelf" id="shelf"></div>

@@ -346,6 +346,65 @@ button:disabled { cursor: default; }
   color: var(--text);
 }
 
+.library-tools,
+.refine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.library-tools { gap: 0.75rem 1rem; }
+
+.chip-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  height: 32px;
+  padding: 0 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.85rem;
+  transition: border-color 0.14s, color 0.14s, background-color 0.14s;
+}
+
+.chip-toggle:hover { border-color: var(--faint); color: var(--text); }
+
+.chip-toggle[aria-pressed="true"] {
+  border-color: rgba(77, 139, 255, 0.55);
+  background: rgba(77, 139, 255, 0.12);
+  color: var(--signal-hi);
+}
+
+.chip-toggle[aria-pressed="true"]::before {
+  content: "";
+  width: 8px;
+  height: 4px;
+  margin-top: -3px;
+  border-left: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg);
+}
+
+.sort select {
+  height: 32px;
+  padding: 0 2rem 0 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--deck) no-repeat right 0.7rem center / 10px 6px
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23919db3' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+  appearance: none;
+  cursor: pointer;
+}
+
+.sort select:hover { border-color: var(--faint); }
+.sort select:focus-visible { border-color: var(--signal); outline: none; }
+
 .shelf {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(164px, 1fr));
@@ -511,6 +570,23 @@ button:disabled { cursor: default; }
   font-size: 0.72rem;
   letter-spacing: 0.04em;
   color: var(--muted);
+}
+
+.tile-cn {
+  padding: 0 0.25rem;
+  border: 1px solid rgba(95, 211, 160, 0.45);
+  border-radius: 4px;
+  color: var(--mint);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.tile-rating {
+  margin-left: auto;
+  color: #f5c451;
+  font-family: var(--num);
+  font-size: 0.76rem;
+  white-space: nowrap;
 }
 
 /* 详情抽屉 */
@@ -847,6 +923,87 @@ body.drawer-open { overflow: hidden; }
   color: #c3cbd9;
   white-space: pre-line;
   max-width: 60ch;
+  line-height: 1.7;
+}
+
+.desc.clamped {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 8;
+  overflow: hidden;
+}
+
+.desc-more {
+  margin-top: 0.4rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--signal-hi);
+  font-size: 0.85rem;
+}
+
+.desc-more:hover { color: var(--text); }
+.desc-more[hidden] { display: none; }
+
+/* 商店评分和各星级占比 */
+.rating-box {
+  display: flex;
+  align-items: center;
+  gap: 1.1rem;
+  margin-top: 1.1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--deck);
+}
+
+.rating-box[hidden] { display: none; }
+
+.rating-score {
+  min-width: 4.5rem;
+  text-align: center;
+}
+
+.rating-score strong {
+  display: block;
+  color: #f5c451;
+  font-family: var(--num);
+  font-size: 1.7rem;
+  line-height: 1.1;
+}
+
+.rating-score span { color: var(--faint); font-size: 0.74rem; }
+
+.rating-bars {
+  flex: 1;
+  display: grid;
+  gap: 3px;
+}
+
+.rating-bars div {
+  display: grid;
+  grid-template-columns: 1.7rem 1fr 2.6rem;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--muted);
+  font-family: var(--num);
+  font-size: 0.74rem;
+}
+
+.rating-bars span:last-child { text-align: right; }
+
+.rating-bars i {
+  display: block;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--line);
+}
+
+.rating-bars b {
+  display: block;
+  height: 100%;
+  background: #f5c451;
 }
 
 .specs {

@@ -11,6 +11,8 @@ const gameCount = $("#game-count");
 const lede = $("#lede");
 const search = $("#search");
 const filterButtons = document.querySelectorAll(".filter");
+const refineButtons = document.querySelectorAll("[data-refine]");
+const sortSelect = $("#sort");
 const loginBox = $("#login-box");
 const loginText = $("#login-text");
 const loginButton = $("#start-login");
@@ -44,8 +46,18 @@ const metaStateNote = {
   offline: "商店暂时连不上，稍后会自动重试。",
 };
 
+const langNames = {
+  zh: "中文", ch: "中文", en: "英语", ja: "日语", ko: "韩语", fr: "法语", de: "德语", es: "西班牙语", it: "意大利语",
+  pt: "葡萄牙语", ru: "俄语", ar: "阿拉伯语", pl: "波兰语", nl: "荷兰语", th: "泰语", tr: "土耳其语", sv: "瑞典语",
+  da: "丹麦语", fi: "芬兰语", no: "挪威语", cs: "捷克语", hu: "匈牙利语", el: "希腊语", id: "印尼语", vi: "越南语", uk: "乌克兰语",
+};
+const classificationText = { GAME_BUNDLE: "捆绑包", PREMIUM_EDITION: "高级版", ADD_ON_PACK: "附加内容", DEMO: "试玩版" };
+
 let games = [];
 let filter = "all";
+// 按商店资料筛选：cn 只看有中文的，multi 只看多人同屏的；sortBy 为空时按游戏库目录顺序。
+const refine = { cn: false, multi: false };
+let sortBy = "";
 let query = "";
 let searchTimer = 0;
 // 游戏库按页从服务器取：loaded 是已经取到的位置，total 是符合当前筛选的总数，counts 是整个游戏库的数量。
@@ -240,6 +252,7 @@ function renderCounts() {
   shelfEmpty.hidden = loaded > 0;
   if (!counts.all) shelfEmpty.textContent = "游戏库目录里还没有游戏文件夹。";
   else if (query) shelfEmpty.textContent = `没有找到“${search.value.trim()}”。`;
+  else if (refine.cn || refine.multi) shelfEmpty.textContent = "没有符合筛选的游戏。商店资料还在补全时，稍后会多一些。";
   else if (filter === "installed") shelfEmpty.textContent = "还没有装到主机上的游戏。";
   else if (filter === "continue") shelfEmpty.textContent = "没有装到一半的游戏。";
   else shelfEmpty.textContent = "这里没有游戏了。";
@@ -270,6 +283,9 @@ async function fetchShelf({ reset = false, fresh = false } = {}) {
   const params = new URLSearchParams({ offset: reset ? 0 : loaded, limit });
   if (filter !== "all") params.set("filter", filter);
   if (query) params.set("q", query);
+  if (refine.cn) params.set("cn", "1");
+  if (refine.multi) params.set("multi", "1");
+  if (sortBy) params.set("sort", sortBy);
   if (fresh) params.set("fresh", "1");
   try {
     const data = await api("/api/games?" + params);
@@ -333,6 +349,16 @@ function buildTile(game) {
   const platform = platformText(game);
   if (platform) sub.append(el("span", "plat", platform));
   if (game.title_id) sub.append(el("span", "num", game.title_id));
+  if (game.has_cn_sub || game.has_cn_voice) {
+    const cn = el("span", "tile-cn", "中");
+    cn.title = game.has_cn_voice ? "有中文语音" : "有中文字幕";
+    sub.append(cn);
+  }
+  if (game.rating != null) {
+    const rating = el("span", "tile-rating num", "★ " + Number(game.rating).toFixed(1));
+    rating.title = `PlayStation 商店评分 ${game.rating}（${game.rating_count} 人评分）`;
+    sub.append(rating);
+  }
   tile.append(art, el("span", "tile-name", displayName(game)), sub);
   tile.addEventListener("click", () => openDetail(game, tile));
   tiles.set(game.path, { tile, art });
@@ -378,7 +404,10 @@ async function loadGames() {
   }
 }
 
-const sharedMetaFields = ["display_name", "name_source", "store_locale", "catalog_name", "cover_url", "meta_state"];
+const sharedMetaFields = [
+  "display_name", "name_source", "store_locale", "catalog_name", "cover_url", "meta_state",
+  "rating", "rating_count", "has_cn_sub", "has_cn_voice", "players",
+];
 
 function shareMeta(source) {
   const sameGame = (game) => (source.title_id ? game.title_id === source.title_id : game.name === source.name);
@@ -409,7 +438,8 @@ async function pollMeta() {
       const game = pending[index];
       if (!game || game.name !== item.name) return;
       const changed = item.meta_state !== game.meta_state || item.display_name !== game.display_name ||
-        item.cover_url !== game.cover_url;
+        item.cover_url !== game.cover_url || item.rating !== game.rating ||
+        item.has_cn_sub !== game.has_cn_sub || item.has_cn_voice !== game.has_cn_voice;
       Object.assign(game, item);
       if (!changed) return;
       refreshTile(game);
@@ -718,6 +748,55 @@ function detailFacts(game) {
   return facts;
 }
 
+function langLabels(codes) {
+  const names = codes.map((code) => langNames[code.toLowerCase().split("-")[0]] || code);
+  return [...new Set(names)].join("、");
+}
+
+// 详情里的商店规格，没有的项不显示。
+function storeSpecs(game) {
+  const rows = [["发行商", game.publisher], ["类型", game.genres], ["发售日期", game.release_date]];
+  if (game.store_platforms?.length) rows.push(["平台", game.store_platforms.join(" / ")]);
+  if (game.edition) {
+    const kind = game.classification && game.classification !== "FULL_GAME"
+      ? `（${classificationText[game.classification] || game.classification}）` : "";
+    rows.push(["版本", game.edition + kind]);
+  }
+  if (game.screen_langs?.length) rows.push(["字幕语言", langLabels(game.screen_langs)]);
+  if (game.spoken_langs?.length) rows.push(["语音语言", langLabels(game.spoken_langs)]);
+  if (game.players) rows.push(["本地玩家", game.players > 1 ? `1–${game.players} 人` : "单人"]);
+  const online = [
+    { REQUIRED: "需联网", OPTIONAL: "可联机" }[game.online_play] || "",
+    game.ps_plus_required ? "联机需 PS Plus" : "",
+    game.in_game_purchases ? "含内购" : "",
+  ].filter(Boolean);
+  if (online.length) rows.push(["联机与付费", online.join(" · ")]);
+  return rows.filter(([, value]) => value);
+}
+
+function paintRating(box, game) {
+  box.hidden = game.rating == null;
+  if (box.hidden) return;
+  const score = el("div", "rating-score");
+  score.append(el("strong", "", Number(game.rating).toFixed(2)),
+    el("span", "", `${(game.rating_count || 0).toLocaleString("zh-CN")} 人评分`));
+  const parts = [score];
+  if (Array.isArray(game.rating_dist) && game.rating_dist.length === 5) {
+    const bars = el("div", "rating-bars");
+    game.rating_dist.forEach((pct, index) => {
+      const row = el("div");
+      const track = el("i");
+      const fill = el("b");
+      fill.style.width = `${pct}%`;
+      track.append(fill);
+      row.append(el("span", "", `${5 - index}★`), track, el("span", "", `${pct}%`));
+      bars.append(row);
+    });
+    parts.push(bars);
+  }
+  box.replaceChildren(...parts);
+}
+
 function nameSourceText(game) {
   if (game.name_source === "user") return "手动修改";
   if (game.name_source === "store") return storeLocaleText[game.store_locale] || "商店";
@@ -903,9 +982,17 @@ function openDetail(game, opener) {
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
+  const descMore = el("button", "desc-more");
+  descMore.type = "button";
+  let descOpen = false;
+  descMore.addEventListener("click", () => {
+    descOpen = !descOpen;
+    paint();
+  });
+  const rating = el("div", "rating-box");
   const specs = el("dl", "specs");
   const metaNote = el("p", "meta-note");
-  about.append(desc, specs, metaNote);
+  about.append(desc, descMore, rating, specs, metaNote);
 
   const naming = el("details", "naming");
   const summary = el("summary", "", "名称与资料");
@@ -1011,14 +1098,18 @@ function openDetail(game, opener) {
 
     desc.textContent = game.description || "";
     desc.hidden = !game.description;
-    const rows = [["发行商", game.publisher], ["类型", game.genres], ["发售日期", game.release_date]];
-    specs.replaceChildren(...rows.filter(([, value]) => value).flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]));
+    const longDesc = (game.description || "").length > 160;
+    desc.classList.toggle("clamped", longDesc && !descOpen);
+    descMore.hidden = !longDesc;
+    descMore.textContent = descOpen ? "收起" : "展开全部";
+    paintRating(rating, game);
+    specs.replaceChildren(...storeSpecs(game).flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]));
     specs.hidden = specs.childElementCount === 0;
     metaNote.textContent = game.catalog_matched === false && !metaStateNote[game.meta_state]
       ? "资料库里没有这款游戏，仍然可以按目录名安装。"
       : metaStateNote[game.meta_state] || "";
     metaNote.hidden = !metaNote.textContent;
-    about.hidden = desc.hidden && specs.hidden && metaNote.hidden;
+    about.hidden = desc.hidden && rating.hidden && specs.hidden && metaNote.hidden;
 
     const originRows = [["名称来源", nameSourceText(game)]];
     const english = (game.catalog_name || "").trim();
@@ -1624,6 +1715,20 @@ for (const button of filterButtons) {
     reloadShelf();
   });
 }
+
+for (const button of refineButtons) {
+  button.addEventListener("click", () => {
+    const key = button.dataset.refine;
+    refine[key] = !refine[key];
+    button.setAttribute("aria-pressed", String(refine[key]));
+    reloadShelf();
+  });
+}
+
+sortSelect.addEventListener("change", () => {
+  sortBy = sortSelect.value;
+  reloadShelf();
+});
 
 /* 启动 */
 

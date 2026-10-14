@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <exception>
@@ -354,8 +355,45 @@ std::string name_key(const std::string& name, const std::string& title_id) { ret
 
 // 展示名：手动改名 > 商店名称 > PlayStation-Titles 英文名 > 目录名（由页面兜底）。
 // search_text 不为空时写入展示名和英文名，供游戏库搜索用。
+std::string json_string_array(const std::vector<std::string>& items) {
+  std::string out = "[";
+  for (const auto& item : items) {
+    if (out.size() > 1) out += ",";
+    out += "\"" + panplay::json_escape(item) + "\"";
+  }
+  return out + "]";
+}
+
+std::string store_meta_fields(const panplay::StoreMeta& meta, bool detail) {
+  const bool rated = meta.found && meta.rating_count > 0;
+  char rating[32];
+  std::snprintf(rating, sizeof(rating), "%.2f", meta.rating);
+  std::string json = std::string(",\"rating\":") + (rated ? rating : "null") +
+                     ",\"rating_count\":" + std::to_string(rated ? meta.rating_count : 0) +
+                     ",\"has_cn_sub\":" + (meta.found && meta.has_cn_sub() ? "true" : "false") +
+                     ",\"has_cn_voice\":" + (meta.found && meta.has_cn_voice() ? "true" : "false") +
+                     ",\"players\":" + (meta.found && meta.players > 0 ? std::to_string(meta.players) : "null");
+  if (!detail) return json;
+  std::string dist = "null";
+  if (rated && meta.rating_dist.size() == 5) {
+    dist = "[";
+    for (const int pct : meta.rating_dist) dist += (dist.size() > 1 ? "," : "") + std::to_string(pct);
+    dist += "]";
+  }
+  json += ",\"publisher\":\"" + panplay::json_escape(meta.publisher) + "\",\"genres\":\"" +
+          panplay::json_escape(meta.genres) + "\",\"release_date\":\"" + panplay::json_escape(meta.release_date) +
+          "\",\"description\":\"" + panplay::json_escape(meta.description) + "\",\"rating_dist\":" + dist +
+          ",\"screen_langs\":" + json_string_array(meta.screen_langs) + ",\"spoken_langs\":" +
+          json_string_array(meta.spoken_langs) + ",\"store_platforms\":" + json_string_array(meta.platforms) +
+          ",\"online_play\":\"" + panplay::json_escape(meta.online_play) + "\",\"ps_plus_required\":" +
+          (meta.ps_plus_required ? "true" : "false") + ",\"in_game_purchases\":" +
+          (meta.in_game_purchases ? "true" : "false") + ",\"classification\":\"" +
+          panplay::json_escape(meta.classification) + "\",\"edition\":\"" + panplay::json_escape(meta.edition) + "\"";
+  return json;
+}
+
 std::string game_meta_fields(const std::string& name, const std::string& title_id, const NameOverrides& overrides,
-                             bool detail, std::string* search_text = nullptr) {
+                             bool detail, std::string* search_text = nullptr, panplay::StoreMeta* meta_out = nullptr) {
   panplay::CatalogMatch match;
   if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
   const std::int64_t concept_id = match.found ? match.entry.concept_id : 0;
@@ -363,6 +401,7 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
   panplay::StoreMeta meta;
   std::string meta_state = "none";
   if (concept_id > 0 && store_meta != nullptr) meta_state = panplay::store_meta_state_name(store_meta->lookup(concept_id, &meta));
+  if (meta_out != nullptr) *meta_out = meta;
 
   std::string display_name;
   std::string name_source;
@@ -393,12 +432,7 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
                      panplay::json_escape(match.entry.publisher_id) + "\",\"platform\":\"" +
                      panplay::json_escape(match.entry.platform) + "\",\"catalog_matched\":" +
                      (match.found ? "true" : "false") + ",\"catalog_match_by\":\"" + panplay::json_escape(match.match_by) + "\"";
-  if (detail) {
-    json += ",\"publisher\":\"" + panplay::json_escape(meta.publisher) + "\",\"genres\":\"" +
-            panplay::json_escape(meta.genres) + "\",\"release_date\":\"" + panplay::json_escape(meta.release_date) +
-            "\",\"description\":\"" + panplay::json_escape(meta.description) + "\"";
-  }
-  return json;
+  return json + store_meta_fields(meta, detail);
 }
 
 std::string meta_json(const std::string& name, const NameOverrides& overrides, bool detail) {
@@ -538,6 +572,7 @@ std::string ascii_lower(std::string text) {
 }
 
 // 一页游戏。filter 是 all/installed/continue（装到一半）/todo（没装过），q 匹配目录名、Title ID、展示名和英文名。
+// cn=1 只留商店标了中文字幕或语音的，multi=1 只留支持两人以上的；sort 是 rating/release/name，不传按目录顺序。
 // total 是符合筛选的总数，all/installed 是整个游戏库的数量。
 std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   const bool fresh = query_param(query, "fresh") == "1";
@@ -547,14 +582,22 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   long limit = std::strtol(query_param(query, "limit").c_str(), nullptr, 10);
   if (limit <= 0 || limit > 500) limit = 500;
 
+  const std::string sort = query_param(query, "sort");
+  const bool chinese_only = query_param(query, "cn") == "1";
+  const bool multi_only = query_param(query, "multi") == "1";
+
   std::string error;
   const auto listing = shelf_listing(drive, fresh, &error);
   if (!listing) return json_error(error);
   ShelfPlacement placement = listing->placement;
   placement.queued = queue_states();
   const NameOverrides overrides = load_name_overrides();
-  std::string items;
-  std::size_t matched = 0;
+  struct Row {
+    std::string json;
+    std::string name;
+    panplay::StoreMeta meta;
+  };
+  std::vector<Row> rows;
   std::size_t installed = 0;
   for (const auto& folder : listing->folders) {
     std::string state = "need-settings";
@@ -571,16 +614,45 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     if (filter == "todo" && (on_console || state == "continue")) continue;
     if (filter == "continue" && state != "continue") continue;
     std::string search_text;
-    const std::string meta = game_meta_fields(folder.name, folder.title_id, overrides, false, &search_text);
+    panplay::StoreMeta store;
+    const std::string meta = game_meta_fields(folder.name, folder.title_id, overrides, false, &search_text, &store);
     if (!needle.empty() &&
         ascii_lower(folder.name + "\n" + folder.title_id + "\n" + search_text).find(needle) == std::string::npos) {
       continue;
     }
-    const std::size_t index = matched++;
-    if (index < offset || index >= offset + static_cast<std::size_t>(limit)) continue;
-    if (!items.empty()) items += ",";
-    items += folder_json(folder.name, folder.path, folder.title_id, state, meta);
+    if (chinese_only && !(store.found && (store.has_cn_sub() || store.has_cn_voice()))) continue;
+    if (multi_only && !(store.found && store.players >= 2)) continue;
+    const std::string shown = search_text.substr(0, search_text.find('\n'));
+    rows.push_back({folder_json(folder.name, folder.path, folder.title_id, state, meta), shown.empty() ? folder.name : shown,
+                    std::move(store)});
   }
+
+  // 没评分、没发售日的排在最后；同分时保持游戏库目录的顺序。
+  if (sort == "rating") {
+    std::stable_sort(rows.begin(), rows.end(), [](const Row& left, const Row& right) {
+      const bool l = left.meta.rating_count > 0;
+      const bool r = right.meta.rating_count > 0;
+      if (l != r) return l;
+      if (left.meta.rating != right.meta.rating) return left.meta.rating > right.meta.rating;
+      return left.meta.rating_count > right.meta.rating_count;
+    });
+  } else if (sort == "release") {
+    std::stable_sort(rows.begin(), rows.end(), [](const Row& left, const Row& right) {
+      if (left.meta.release_date.empty() != right.meta.release_date.empty()) return right.meta.release_date.empty();
+      return left.meta.release_date > right.meta.release_date;
+    });
+  } else if (sort == "name") {
+    std::stable_sort(rows.begin(), rows.end(), [](const Row& left, const Row& right) {
+      return panplay::natural_compare(ascii_lower(left.name), ascii_lower(right.name)) < 0;
+    });
+  }
+
+  std::string items;
+  for (std::size_t index = offset; index < rows.size() && index < offset + static_cast<std::size_t>(limit); ++index) {
+    if (!items.empty()) items += ",";
+    items += rows[index].json;
+  }
+  const std::size_t matched = rows.size();
   return "{\"games\":[" + items + "],\"offset\":" + std::to_string(offset) + ",\"total\":" + std::to_string(matched) +
          ",\"all\":" + std::to_string(listing->folders.size()) + ",\"installed\":" + std::to_string(installed) +
          ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + "}";

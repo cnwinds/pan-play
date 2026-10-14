@@ -3,6 +3,8 @@
 #include "panplay/json.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -45,6 +47,29 @@ bool is_language_note(const std::string& inner) {
   return false;
 }
 
+void append_utf8(std::string& out, unsigned long cp) {
+  if (cp < 0x80) {
+    out += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    out += static_cast<char>(0xC0 | (cp >> 6));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    out += static_cast<char>(0xE0 | (cp >> 12));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x110000) {
+    out += static_cast<char>(0xF0 | (cp >> 18));
+    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  }
+}
+
+std::string lower_ascii(std::string text) {
+  for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return text;
+}
+
 std::string strip_markup(const std::string& text) {
   std::string out;
   out.reserve(text.size());
@@ -52,14 +77,18 @@ std::string strip_markup(const std::string& text) {
     if (text[i] == '<') {
       const auto close = text.find('>', i);
       if (close == std::string::npos) break;
-      const std::string tag = text.substr(i + 1, close - i - 1);
-      if (starts_with(tag, "br") || starts_with(tag, "BR") || starts_with(tag, "/p")) out += '\n';
+      const std::string tag = lower_ascii(text.substr(i + 1, close - i - 1));
+      const std::string tag_name = tag.substr(0, tag.find_first_of(" /\t", tag.empty() || tag[0] != '/' ? 0 : 1));
+      if (tag_name == "br") out += '\n';
+      else if (tag_name == "/p") out += "\n\n";
+      else if (tag_name == "li") out += "• ";
+      else if (tag_name == "/li") out += '\n';
       i = close + 1;
       continue;
     }
     if (text[i] == '&') {
       static const std::pair<const char*, const char*> entities[] = {
-          {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&#39;", "'"}, {"&nbsp;", " "}};
+          {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&#39;", "'"}, {"&apos;", "'"}, {"&nbsp;", " "}};
       bool replaced = false;
       for (const auto& [from, to] : entities) {
         if (text.compare(i, std::char_traits<char>::length(from), from) == 0) {
@@ -70,10 +99,30 @@ std::string strip_markup(const std::string& text) {
         }
       }
       if (replaced) continue;
+      const auto semi = text.find(';', i);
+      if (semi != std::string::npos && semi - i <= 9 && i + 2 < semi && text[i + 1] == '#') {
+        const bool hex = text[i + 2] == 'x' || text[i + 2] == 'X';
+        const std::string digits = text.substr(i + (hex ? 3 : 2), semi - i - (hex ? 3 : 2));
+        char* end = nullptr;
+        const unsigned long cp = std::strtoul(digits.c_str(), &end, hex ? 16 : 10);
+        if (!digits.empty() && end != nullptr && *end == '\0' && cp > 0) {
+          append_utf8(out, cp);
+          i = semi + 1;
+          continue;
+        }
+      }
     }
     out += text[i++];
   }
-  return trim(out);
+  std::string collapsed;
+  collapsed.reserve(out.size());
+  int newlines = 0;
+  for (char ch : out) {
+    if (ch == '\r') continue;
+    newlines = ch == '\n' ? newlines + 1 : 0;
+    if (newlines <= 2) collapsed += ch;
+  }
+  return trim(collapsed);
 }
 
 using Cache = std::map<std::string, Json>;
@@ -139,7 +188,7 @@ std::string pick_description(const Json* node) {
   if (node == nullptr) return "";
   const Json* items = node->get("descriptions");
   if (items == nullptr) return "";
-  for (const char* type : {"SHORT", "LONG"}) {
+  for (const char* type : {"LONG", "SHORT"}) {
     for (const Json& item : items->array) {
       if (item.str("type") == type && !item.str("value").empty()) return strip_markup(item.str("value"));
     }
@@ -158,6 +207,118 @@ std::string release_of(const Json* node) {
   const Json* release = node->get("releaseDate");
   if (release == nullptr) return "";
   return release->str("value").substr(0, 10);
+}
+
+// 商店数据里的数字有时写成字符串，布尔有时写成 "true"。
+std::string scalar_text(const Json* node) {
+  if (node == nullptr) return "";
+  if (node->type == Json::Type::string || node->type == Json::Type::number) return node->text;
+  if (node->type == Json::Type::boolean) return node->boolean ? "true" : "false";
+  return "";
+}
+
+double number_of(const Json* node) {
+  const std::string text = scalar_text(node);
+  return text.empty() ? 0 : std::strtod(text.c_str(), nullptr);
+}
+
+const Json* field_of(const Cache& cache, const Json* node, const std::string& field) {
+  if (node == nullptr) return nullptr;
+  const Json* value = node->get(field);
+  if (value == nullptr) return nullptr;
+  if (value->type == Json::Type::object && value->get("__ref") != nullptr) {
+    const auto it = cache.find(value->str("__ref"));
+    return it == cache.end() ? nullptr : &it->second;
+  }
+  return value;
+}
+
+// 先看商品再看概念，取第一个有内容的。
+const Json* first_field(const Cache& cache, const Json* product, const Json* concept_node, const std::string& field) {
+  for (const Json* node : {product, concept_node}) {
+    const Json* value = field_of(cache, node, field);
+    if (value == nullptr || value->type == Json::Type::null) continue;
+    if (value->type == Json::Type::array && value->array.empty()) continue;
+    if (value->type == Json::Type::string && value->text.empty()) continue;
+    return value;
+  }
+  return nullptr;
+}
+
+std::vector<std::string> string_list(const Json* node) {
+  std::vector<std::string> out;
+  if (node == nullptr) return out;
+  for (const Json& item : node->array) {
+    const std::string text = scalar_text(&item);
+    if (!text.empty() && std::find(out.begin(), out.end(), text) == out.end()) out.push_back(text);
+  }
+  return out;
+}
+
+void parse_rating(const Json* star, StoreMeta* meta) {
+  if (star == nullptr) return;
+  const double count = number_of(star->get("totalRatingsCount"));
+  if (count <= 0) return;
+  meta->rating = number_of(star->get("averageRating"));
+  meta->rating_count = static_cast<std::int64_t>(count);
+  const Json* dist = star->get("ratingsDistribution");
+  if (dist == nullptr || dist->array.empty()) return;
+  std::map<int, int> percent;
+  for (const Json& item : dist->array) {
+    percent[static_cast<int>(number_of(item.get("rating")))] =
+        static_cast<int>(number_of(item.get("percentageRaw")) + 0.5);
+  }
+  for (int stars = 5; stars >= 1; --stars) meta->rating_dist.push_back(percent[stars]);
+}
+
+// 人数、联机、会员和内购写在兼容性提示里，商品的覆盖概念的。
+void parse_notices(const Json* concept_node, const Json* product, StoreMeta* meta) {
+  std::map<std::string, std::string> notices;
+  for (const Json* node : {concept_node, product}) {
+    if (node == nullptr) continue;
+    const Json* by_platform = node->get("compatibilityNoticesByPlatform");
+    const Json* common = by_platform == nullptr ? nullptr : by_platform->get("Common");
+    if (common == nullptr) continue;
+    for (const Json& item : common->array) notices[item.str("type")] = scalar_text(item.get("value"));
+  }
+  const int players = std::atoi(notices["NO_OF_PLAYERS"].c_str());
+  meta->players = players > 0 ? players : 0;
+  meta->online_play = notices["ONLINE_PLAY_MODE"];
+  meta->ps_plus_required = notices["PS_PLUS_REQUIRED"] == "true";
+  const std::string purchases = notices["IN_GAME_PURCHASES"];
+  meta->in_game_purchases = !purchases.empty() && purchases != "NONE" && purchases != "false";
+}
+
+bool any_chinese(const std::vector<std::string>& langs) {
+  for (const std::string& code : langs) {
+    const std::string lower = lower_ascii(code);
+    if (starts_with(lower, "zh") || starts_with(lower, "ch")) return true;
+  }
+  return false;
+}
+
+std::string json_strings(const std::vector<std::string>& items) {
+  std::string out = "[";
+  for (const std::string& item : items) {
+    if (out.size() > 1) out += ",";
+    out += "\"" + json_escape(item) + "\"";
+  }
+  return out + "]";
+}
+
+std::string json_ints(const std::vector<int>& items) {
+  std::string out = "[";
+  for (const int item : items) {
+    if (out.size() > 1) out += ",";
+    out += std::to_string(item);
+  }
+  return out + "]";
+}
+
+std::string format_rating(double rating) {
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%.2f", rating);
+  return buffer;
 }
 
 std::string read_text(const std::filesystem::path& path) {
@@ -247,8 +408,20 @@ StoreMeta parse_concept_page(const std::string& html, std::int64_t concept_id) {
   if (meta.release_date.empty()) meta.release_date = release_of(product);
   meta.description = pick_description(concept_node);
   if (meta.description.empty()) meta.description = pick_description(product);
+
+  parse_rating(first_field(cache, product, concept_node, "starRating"), &meta);
+  meta.screen_langs = string_list(first_field(cache, product, concept_node, "screenLanguages"));
+  meta.spoken_langs = string_list(first_field(cache, product, concept_node, "spokenLanguages"));
+  meta.platforms = string_list(first_field(cache, product, concept_node, "platforms"));
+  parse_notices(concept_node, product, &meta);
+  meta.classification = scalar_text(first_field(cache, product, concept_node, "storeDisplayClassification"));
+  if (const Json* edition = first_field(cache, product, concept_node, "edition")) meta.edition = edition->str("name");
+  meta.meta_ver = kStoreMetaVersion;
   return meta;
 }
+
+bool StoreMeta::has_cn_sub() const { return any_chinese(screen_langs); }
+bool StoreMeta::has_cn_voice() const { return any_chinese(spoken_langs); }
 
 bool fetch_store_meta(std::int64_t concept_id, const HttpFetch& fetch, StoreMeta* out, std::string* error,
                       const std::function<void()>& before_request) {
@@ -272,6 +445,7 @@ bool fetch_store_meta(std::int64_t concept_id, const HttpFetch& fetch, StoreMeta
       break;
     }
   }
+  meta.meta_ver = kStoreMetaVersion;
   meta.fetched_at = unix_now();
   *out = meta;
   return true;
@@ -316,8 +490,11 @@ StoreMetaState StoreMetaCache::lookup(std::int64_t concept_id, StoreMeta* out) {
     if (out) *out = meta;
     const bool stale = unix_now() - meta.fetched_at > (meta.found ? kFoundTtlSeconds : kMissingTtlSeconds);
     const bool cover_missing = meta.found && !meta.has_cover && !meta.cover_url.empty();
-    if (!backing_off && !busy() && (stale || cover_missing)) enqueue_locked(concept_id);
-    if (busy()) return StoreMetaState::pending;
+    const bool outdated = meta.found && meta.meta_ver < kStoreMetaVersion;
+    if (!backing_off && !busy() && (stale || cover_missing || outdated)) enqueue_locked(concept_id);
+    // 已有资料在后台更新时照常显示；用户点了重新获取才算补齐中。
+    const bool user_refresh = forced_.count(concept_id) != 0 || forced_running_.count(concept_id) != 0;
+    if (busy() && (!meta.found || user_refresh)) return StoreMetaState::pending;
     return meta.found ? StoreMetaState::ready : StoreMetaState::missing;
   }
   if (busy()) return StoreMetaState::pending;
@@ -379,16 +556,22 @@ void StoreMetaCache::throttle() {
 void StoreMetaCache::process(std::int64_t concept_id) {
   const std::filesystem::path cover_path = cover_file(concept_id);
   StoreMeta meta;
+  StoreMeta previous;
   bool full = true;
+  // upgrade：资料没过期，只是缺新版本的字段，重抓页面但保留封面和旧资料。
+  bool upgrade = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
     const bool forced = forced_.erase(concept_id) > 0;
+    if (forced) forced_running_.insert(concept_id);
     const auto it = entries_.find(concept_id);
     if (!forced && it != entries_.end() && it->second.found) {
       const bool stale = unix_now() - it->second.fetched_at > kFoundTtlSeconds;
       if (!stale) {
         meta = it->second;
-        full = false;
+        previous = it->second;
+        full = it->second.meta_ver < kStoreMetaVersion;
+        upgrade = full;
       }
     }
   }
@@ -400,12 +583,17 @@ void StoreMetaCache::process(std::int64_t concept_id) {
       std::lock_guard<std::mutex> lock(mu_);
       retry_after_[concept_id] = std::chrono::steady_clock::now() + kOfflineRetry;
       in_flight_.erase(concept_id);
+      forced_running_.erase(concept_id);
       return;
+    }
+    if (upgrade && !meta.found) {
+      meta = previous;
+      meta.meta_ver = kStoreMetaVersion;
     }
   }
 
   bool cover_offline = false;
-  if (meta.found && !meta.cover_url.empty() && (full || !std::filesystem::exists(cover_path))) {
+  if (meta.found && !meta.cover_url.empty() && ((full && !upgrade) || !std::filesystem::exists(cover_path))) {
     throttle();
     const std::string url = meta.cover_url + (meta.cover_url.find('?') == std::string::npos ? "?w=440" : "&w=440");
     const HttpResponse image = fetch_(store_request(url));
@@ -431,6 +619,7 @@ void StoreMetaCache::process(std::int64_t concept_id) {
   if (cover_offline) retry_after_[concept_id] = std::chrono::steady_clock::now() + kOfflineRetry;
   else retry_after_.erase(concept_id);
   in_flight_.erase(concept_id);
+  forced_running_.erase(concept_id);
   save_locked();
 }
 
@@ -454,6 +643,21 @@ void StoreMetaCache::load() {
     meta.genres = node.str("genres");
     meta.release_date = node.str("release_date");
     meta.description = node.str("description");
+    meta.rating = node.num("rating");
+    meta.rating_count = static_cast<std::int64_t>(node.num("rating_count"));
+    if (const Json* dist = node.get("rating_dist")) {
+      for (const Json& item : dist->array) meta.rating_dist.push_back(static_cast<int>(item.number));
+    }
+    meta.screen_langs = string_list(node.get("screen_langs"));
+    meta.spoken_langs = string_list(node.get("spoken_langs"));
+    meta.platforms = string_list(node.get("platforms"));
+    meta.players = static_cast<int>(node.num("players"));
+    meta.online_play = node.str("online_play");
+    meta.ps_plus_required = node.boolean_or("ps_plus_required", false);
+    meta.in_game_purchases = node.boolean_or("in_game_purchases", false);
+    meta.classification = node.str("classification");
+    meta.edition = node.str("edition");
+    meta.meta_ver = static_cast<int>(node.num("meta_ver"));
     meta.fetched_at = static_cast<std::int64_t>(node.num("fetched_at"));
     meta.has_cover = meta.found && std::filesystem::exists(cover_file(meta.concept_id));
     if (drop_coverless && meta.found && !meta.has_cover) meta.fetched_at = 0;
@@ -462,7 +666,7 @@ void StoreMetaCache::load() {
 }
 
 void StoreMetaCache::save_locked() {
-  std::string json = "{\"version\":2,\"concepts\":{";
+  std::string json = "{\"version\":3,\"concepts\":{";
   bool first = true;
   for (const auto& [id, meta] : entries_) {
     if (!first) json += ",";
@@ -471,8 +675,16 @@ void StoreMetaCache::save_locked() {
             json_escape(meta.locale) + "\",\"name\":\"" + json_escape(meta.name) + "\",\"cover_url\":\"" +
             json_escape(meta.cover_url) + "\",\"publisher\":\"" + json_escape(meta.publisher) + "\",\"genres\":\"" +
             json_escape(meta.genres) + "\",\"release_date\":\"" + json_escape(meta.release_date) +
-            "\",\"description\":\"" + json_escape(meta.description) + "\",\"fetched_at\":" +
-            std::to_string(meta.fetched_at) + "}";
+            "\",\"description\":\"" + json_escape(meta.description) + "\",\"rating\":" + format_rating(meta.rating) +
+            ",\"rating_count\":" + std::to_string(meta.rating_count) + ",\"rating_dist\":" + json_ints(meta.rating_dist) +
+            ",\"screen_langs\":" + json_strings(meta.screen_langs) + ",\"spoken_langs\":" +
+            json_strings(meta.spoken_langs) + ",\"platforms\":" + json_strings(meta.platforms) +
+            ",\"players\":" + std::to_string(meta.players) + ",\"online_play\":\"" + json_escape(meta.online_play) +
+            "\",\"ps_plus_required\":" + (meta.ps_plus_required ? "true" : "false") +
+            ",\"in_game_purchases\":" + (meta.in_game_purchases ? "true" : "false") + ",\"classification\":\"" +
+            json_escape(meta.classification) + "\",\"edition\":\"" + json_escape(meta.edition) +
+            "\",\"meta_ver\":" + std::to_string(meta.meta_ver) + ",\"fetched_at\":" + std::to_string(meta.fetched_at) +
+            "}";
   }
   json += "}}";
   const std::filesystem::path path = dir_ / "store-meta.json";
@@ -507,8 +719,17 @@ int run_store_meta_cli(const std::string& concept_id) {
   std::size_t cut = std::min<std::size_t>(meta.description.size(), 300);
   while (cut > 0 && cut < meta.description.size() && (static_cast<unsigned char>(meta.description[cut]) & 0xC0) == 0x80) --cut;
   std::cout << "地区     " << meta.locale << "\n名称     " << meta.name << "\n发行商   " << meta.publisher << "\n类型     "
-            << meta.genres << "\n发售日   " << meta.release_date << "\n封面     " << meta.cover_url << "\n简介     "
-            << meta.description.substr(0, cut) << "\n";
+            << meta.genres << "\n发售日   " << meta.release_date << "\n封面     " << meta.cover_url << "\n";
+  const auto join = [](const std::vector<std::string>& items) {
+    std::string out;
+    for (const auto& item : items) out += (out.empty() ? "" : ",") + item;
+    return out;
+  };
+  if (meta.rating_count > 0) std::cout << "评分     " << format_rating(meta.rating) << "（" << meta.rating_count << " 人）\n";
+  std::cout << "字幕     " << join(meta.screen_langs) << "\n语音     " << join(meta.spoken_langs) << "\n平台     "
+            << join(meta.platforms) << "\n人数     " << meta.players << "\n联机     " << meta.online_play
+            << (meta.ps_plus_required ? " 需 PS Plus" : "") << (meta.in_game_purchases ? " 含内购" : "") << "\n版本     "
+            << meta.edition << " " << meta.classification << "\n简介     " << meta.description.substr(0, cut) << "\n";
   return 0;
 }
 

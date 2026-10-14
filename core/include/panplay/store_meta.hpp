@@ -13,8 +13,12 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace panplay {
+
+// 商店资料解析出的字段集合每变一次加一，缓存里旧版本的记录会在后台重抓补全，封面不重下。
+constexpr int kStoreMetaVersion = 3;
 
 struct StoreMeta {
   std::int64_t concept_id = 0;
@@ -27,7 +31,25 @@ struct StoreMeta {
   std::string genres;
   std::string release_date;
   std::string description;
+  // 商店评分，rating_count 为 0 表示没人评过；rating_dist 依次是 5 星到 1 星的百分比。
+  double rating = 0;
+  std::int64_t rating_count = 0;
+  std::vector<int> rating_dist;
+  // 语言代码，如 zh-Hans、en。
+  std::vector<std::string> screen_langs;
+  std::vector<std::string> spoken_langs;
+  std::vector<std::string> platforms;
+  int players = 0;
+  std::string online_play;  // REQUIRED / OPTIONAL / 空
+  bool ps_plus_required = false;
+  bool in_game_purchases = false;
+  std::string classification;  // FULL_GAME、GAME_BUNDLE、PREMIUM_EDITION…
+  std::string edition;
+  int meta_ver = 0;
   std::int64_t fetched_at = 0;
+
+  bool has_cn_sub() const;
+  bool has_cn_voice() const;
 };
 
 enum class StoreMetaState { pending, ready, missing, offline };
@@ -75,6 +97,7 @@ class StoreMetaCache {
   std::set<std::int64_t> queued_;
   std::set<std::int64_t> in_flight_;
   std::set<std::int64_t> forced_;
+  std::set<std::int64_t> forced_running_;
   bool stop_ = false;
   std::thread worker_;
 };

@@ -1,9 +1,12 @@
 #include "panplay/store_meta.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
+#include <vector>
 
 namespace panplay {
 namespace {
@@ -28,9 +31,19 @@ std::string sample_page(std::int64_t concept_id, const std::string& concept_name
                              "{\"type\":\"IMAGE\",\"role\":\"MASTER\",\"url\":\"" + image + "\"}]}}}") +
          env_script("b", "{\"cache\":{\"" + key +
                              "\":{\"publisherName\":\"盘游工作室\",\"localizedGenres\":[{\"value\":\"动作\"},{\"value\":\"冒险\"}],"
-                             "\"releaseDate\":{\"value\":\"2024-05-01T00:00:00Z\"},\"descriptions\":[{\"type\":\"LONG\","
-                             "\"value\":\"第一行<br>第二行 &amp; 更多\"}]},\"Product:HP0001-PPSA00001_00-X\":{\"name\":"
-                             "\"测试游戏 (简体中文, 英语)\"}}}") +
+                             "\"releaseDate\":{\"value\":\"2024-05-01T00:00:00Z\"},\"descriptions\":[{\"type\":\"SHORT\","
+                             "\"value\":\"短简介\"},{\"type\":\"LONG\",\"value\":\"第一行<br>第二行 &amp; 更多\"}],"
+                             "\"compatibilityNoticesByPlatform\":{\"Common\":[{\"type\":\"NO_OF_PLAYERS\",\"value\":\"2\"},"
+                             "{\"type\":\"PS_PLUS_REQUIRED\",\"value\":\"true\"}]}},"
+                             "\"Product:HP0001-PPSA00001_00-X\":{\"name\":\"测试游戏 (简体中文, 英语)\","
+                             "\"starRating\":{\"averageRating\":4.53,\"totalRatingsCount\":1200,\"ratingsDistribution\":["
+                             "{\"rating\":5,\"percentageRaw\":70},{\"rating\":4,\"percentageRaw\":20},{\"rating\":3,"
+                             "\"percentageRaw\":5},{\"rating\":2,\"percentageRaw\":3},{\"rating\":1,\"percentageRaw\":2}]},"
+                             "\"screenLanguages\":[\"en\",\"zh-Hans\"],\"spokenLanguages\":[\"en\",\"ja\"],\"platforms\":[\"PS5\"],"
+                             "\"compatibilityNoticesByPlatform\":{\"Common\":[{\"type\":\"NO_OF_PLAYERS\",\"value\":\"4\"},"
+                             "{\"type\":\"ONLINE_PLAY_MODE\",\"value\":\"OPTIONAL\"},{\"type\":\"IN_GAME_PURCHASES\","
+                             "\"value\":\"OPTIONAL\"}]},\"storeDisplayClassification\":\"FULL_GAME\",\"edition\":{\"name\":"
+                             "\"标准版\"}}}}") +
          "</body></html>";
 }
 
@@ -57,7 +70,15 @@ int check_parse() {
   if (meta.cover_url != "https://img.test/m.png") return fail("封面应优先用 MASTER: " + meta.cover_url);
   if (meta.publisher != "盘游工作室" || meta.genres != "动作 / 冒险") return fail("发行商或类型不对");
   if (meta.release_date != "2024-05-01") return fail("发售日不对: " + meta.release_date);
-  if (meta.description != "第一行\n第二行 & 更多") return fail("简介没有去掉标记: " + meta.description);
+  if (meta.description != "第一行\n第二行 & 更多") return fail("简介应优先用长简介并去掉标记: " + meta.description);
+  if (meta.rating_count != 1200 || meta.rating < 4.52 || meta.rating > 4.54) return fail("评分不对");
+  if (meta.rating_dist != std::vector<int>{70, 20, 5, 3, 2}) return fail("评分分布不对");
+  if (!meta.has_cn_sub() || meta.has_cn_voice()) return fail("中文字幕或语音判断不对");
+  if (meta.platforms != std::vector<std::string>{"PS5"}) return fail("平台不对");
+  if (meta.players != 4) return fail("人数应以商品为准: " + std::to_string(meta.players));
+  if (meta.online_play != "OPTIONAL" || !meta.ps_plus_required || !meta.in_game_purchases) return fail("联机与付费不对");
+  if (meta.classification != "FULL_GAME" || meta.edition != "标准版") return fail("版本不对");
+  if (meta.meta_ver != kStoreMetaVersion) return fail("解析结果应带当前版本号");
 
   const StoreMeta product_only = parse_concept_page(sample_page(42, ""), 42);
   if (product_only.name != "测试游戏") return fail("概念没有名称时应回退到默认商品名: " + product_only.name);
@@ -164,12 +185,85 @@ int check_cache() {
   return result;
 }
 
+// 旧版本缓存里的记录在后台补抓新字段：期间照常显示，不重下封面，抓不到时保留旧资料。
+int check_upgrade() {
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / ("panplay-store-meta-upgrade-" + std::to_string(std::rand()));
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir / "covers");
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch()).count();
+  const auto entry = [&](const char* name) {
+    return std::string("{\"found\":true,\"locale\":\"zh-hans-hk\",\"name\":\"") + name +
+           "\",\"cover_url\":\"https://img.test/m.png\",\"publisher\":\"\",\"genres\":\"\",\"release_date\":\"\","
+           "\"description\":\"旧简介\",\"fetched_at\":" + std::to_string(now) + "}";
+  };
+  {
+    std::ofstream out(dir / "store-meta.json", std::ios::binary);
+    out << "{\"version\":2,\"concepts\":{\"7\":" << entry("旧名七") << ",\"8\":" << entry("旧名八") << "}}";
+    std::ofstream(dir / "covers" / "7.img", std::ios::binary) << "old";
+    std::ofstream(dir / "covers" / "8.img", std::ios::binary) << "old";
+  }
+
+  std::map<std::string, HttpResponse> routes;
+  routes["https://store.playstation.com/zh-hans-hk/concept/7"] = {200, sample_page(7, "新名七"), ""};
+  for (const char* locale : {"zh-hans-hk", "zh-hant-hk", "en-us"}) {
+    routes[std::string("https://store.playstation.com/") + locale + "/concept/8"] = {200, empty_page(), ""};
+  }
+  std::vector<std::string> requested;
+  const HttpFetch fake = [&](const HttpRequest& request) {
+    requested.push_back(request.url);
+    const auto it = routes.find(request.url);
+    if (it == routes.end()) return HttpResponse{0, "", "unexpected " + request.url};
+    return it->second;
+  };
+
+  int result = 0;
+  {
+    StoreMetaCache cache(dir, fake, 0);
+    StoreMeta meta;
+    if (cache.lookup(7, &meta) != StoreMetaState::ready || meta.name != "旧名七") result = fail("补抓期间应照常显示旧资料");
+    cache.lookup(8, nullptr);
+    while (cache.run_once()) {
+    }
+    if (!result && (cache.lookup(7, &meta) != StoreMetaState::ready || meta.rating_count != 1200 || !meta.has_cover)) {
+      result = fail("补抓后应有评分且保留封面");
+    }
+    if (!result) {
+      for (const auto& url : requested) {
+        if (url.find("img.test") != std::string::npos) result = fail("补抓不应重下封面");
+      }
+    }
+    if (!result && (cache.lookup(8, &meta) != StoreMetaState::ready || meta.name != "旧名八" ||
+                    meta.meta_ver != kStoreMetaVersion)) {
+      result = fail("补抓没取到时应保留旧资料");
+    }
+    const std::size_t before = requested.size();
+    if (!result && (cache.run_once() || requested.size() != before)) result = fail("补抓过的不应再抓");
+  }
+  if (!result) {
+    StoreMetaCache reopened(dir, fake, 0);
+    StoreMeta meta;
+    reopened.lookup(7, &meta);
+    if (meta.rating_dist != std::vector<int>{70, 20, 5, 3, 2} || meta.screen_langs.size() != 2 || meta.players != 4 ||
+        meta.edition != "标准版" || !meta.ps_plus_required) {
+      result = fail("新字段没有持久化");
+    } else if (reopened.run_once()) {
+      result = fail("重开后不应再补抓");
+    }
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  return result;
+}
+
 }  // namespace
 
 int run_store_meta_self_test() {
   if (const int code = check_names()) return code;
   if (const int code = check_parse()) return code;
-  return check_cache();
+  if (const int code = check_cache()) return code;
+  return check_upgrade();
 }
 
 }  // namespace panplay
