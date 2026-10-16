@@ -309,7 +309,7 @@ AppSettings load_settings() {
   AppSettings settings;
   const panplay::Json json = read_json(settings_file_path());
   if (json.num("version") >= 2) read_current(json, &settings);
-  else read_legacy(json, &settings);
+  else if (json.type == panplay::Json::Type::object) read_legacy(json, &settings);
 
   if (panplay::find_drive_kind(settings.drive) == nullptr) settings.drive = panplay::drive_kinds().front().id;
   const auto modes = target_modes();

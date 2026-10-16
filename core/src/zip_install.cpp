@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -938,6 +939,13 @@ bool parse_destination(const std::string& text, Destination* destination, std::s
 
 std::unique_ptr<InstallSink> open_destination(const Destination& destination, std::string* error) {
   if (destination.ftp) return make_ftp_sink(destination.endpoint, error);
+  const std::filesystem::path root = std::filesystem::u8path(destination.local_root);
+  std::error_code ec;
+  std::filesystem::create_directories(root, ec);
+  if (!std::filesystem::is_directory(root, ec)) {
+    *error = "存放目录 " + destination.local_root + " 不存在且无法创建，请在设置里换一个目录";
+    return nullptr;
+  }
   return make_local_sink(destination.local_root);
 }
 

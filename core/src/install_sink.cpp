@@ -45,7 +45,8 @@ class LocalWriter final : public FileWriter {
 class LocalSink : public InstallSink {
  public:
   explicit LocalSink(std::filesystem::path root) : root_(std::filesystem::absolute(std::move(root))) {
-    std::filesystem::create_directories(root_);
+    std::error_code ec;
+    std::filesystem::create_directories(root_, ec);
   }
 
   std::unique_ptr<FileWriter> open_writer(const std::string& path, std::int64_t, std::string* error) override {
