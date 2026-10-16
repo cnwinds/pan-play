@@ -8,7 +8,9 @@
 
 **你需要**：一台已破解、能运行 payload 的 PS5。网盘里直接放游戏压缩包（ZIP / RAR / 7z，支持分卷）；压缩包里装的是游戏目录（带 `sce_sys` 的那种），不是 `.pkg` 安装包。
 
-游戏库游戏详情
+![游戏库](docs/images/library.jpg)
+
+![游戏详情](docs/images/detail.jpg)
 
 ## 开始使用
 
