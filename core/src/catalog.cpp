@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "panplay/app_paths.hpp"
+#include "panplay/trace.hpp"
 
 #if defined(PANPLAY_EMBED_CATALOG)
 #include <zlib.h>
@@ -126,7 +127,10 @@ std::string GameCatalog::default_path() {
 }
 
 bool GameCatalog::load_default(std::string* error) {
-  if (load_file(default_path(), error)) return true;
+  const std::string path = default_path();
+  trace("读取资料库文件 " + path);
+  if (load_file(path, error)) return true;
+  trace("资料库文件不可用（" + (error ? *error : std::string()) + "），改用内置资料库");
   return load_builtin(nullptr);
 }
 
@@ -142,9 +146,11 @@ bool GameCatalog::load_builtin(std::string* error) {
 #if defined(PANPLAY_EMBED_CATALOG)
   std::string text;
   if (!gunzip(kCatalogGz, sizeof(kCatalogGz), &text)) {
+    trace("内置资料库解压失败");
     if (error) *error = "内置资料库解压失败";
     return false;
   }
+  trace("内置资料库解压完 " + std::to_string(text.size()) + " 字节，开始解析，" + memory_summary());
   std::unique_lock<std::shared_mutex> lock(mu_);
   if (!load_text_unlocked(text, error)) return false;
   meta_.path = "（内置）";
@@ -163,6 +169,7 @@ bool GameCatalog::load_file(const std::string& path, std::string* error) {
 
 bool GameCatalog::load_file_unlocked(const std::string& path, std::string* error) {
   const std::string text = read_text_file(std::filesystem::u8path(path));
+  if (!text.empty()) trace("资料库文件 " + std::to_string(text.size()) + " 字节，开始解析");
   if (text.empty()) {
     by_title_id_.clear();
     loaded_ = false;

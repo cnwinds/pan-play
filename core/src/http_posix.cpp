@@ -2,6 +2,7 @@
 
 #include "panplay/http.hpp"
 #include "panplay/socket_util.hpp"
+#include "panplay/trace.hpp"
 
 #include <fcntl.h>
 #include <netdb.h>
@@ -123,19 +124,25 @@ TlsShared& tls_shared() {
     mbedtls_ctr_drbg_init(&tls->drbg);
     mbedtls_x509_crt_init(&tls->ca);
     mbedtls_ssl_config_init(&tls->conf);
+    trace("TLS 初始化：PSA");
     if (psa_crypto_init() != PSA_SUCCESS) {
       tls->error = "TLS 初始化失败（PSA）";
+      trace(tls->error);
       return tls;
     }
+    trace("TLS 初始化：随机数");
     static const unsigned char personal[] = "panplay";
     if (int code = mbedtls_ctr_drbg_seed(&tls->drbg, mbedtls_entropy_func, &tls->entropy, personal, sizeof(personal) - 1);
         code != 0) {
       tls->error = "TLS 随机数初始化失败: " + tls_error_text(code);
+      trace(tls->error);
       return tls;
     }
     int loaded = -1;
 #if defined(PANPLAY_EMBEDDED_CA)
+    trace("TLS 初始化：解析根证书");
     loaded = mbedtls_x509_crt_parse(&tls->ca, kCaBundle, sizeof(kCaBundle));
+    trace("TLS 初始化：根证书解析结果 " + std::to_string(loaded));
 #else
     for (const char* path : {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"}) {
       loaded = mbedtls_x509_crt_parse_file(&tls->ca, path);
@@ -155,6 +162,7 @@ TlsShared& tls_shared() {
     mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     mbedtls_ssl_conf_ca_chain(&tls->conf, &tls->ca, nullptr);
     mbedtls_ssl_conf_rng(&tls->conf, mbedtls_ctr_drbg_random, &tls->drbg);
+    trace("TLS 初始化完成");
     return tls;
   }();
   return *shared;
@@ -352,8 +360,11 @@ std::unique_ptr<Connection> open_connection(const Url& url, int receive_timeout_
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* found = nullptr;
+  const auto open_start = std::chrono::steady_clock::now();
+  trace("连接 " + url.host + ":" + std::to_string(url.port) + "：解析域名");
   if (getaddrinfo(url.host.c_str(), std::to_string(url.port).c_str(), &hints, &found) != 0 || found == nullptr) {
     *error = "无法解析域名 " + url.host;
+    trace(*error);
     return nullptr;
   }
   auto conn = std::make_unique<Connection>();
@@ -376,6 +387,7 @@ std::unique_ptr<Connection> open_connection(const Url& url, int receive_timeout_
   freeaddrinfo(found);
   if (conn->fd == INVALID_SOCKET) {
     *error = abort.is_aborted() ? kAborted : "连接 " + url.host + " 失败";
+    trace(*error);
     return nullptr;
   }
   const int one = 1;
@@ -388,13 +400,17 @@ std::unique_ptr<Connection> open_connection(const Url& url, int receive_timeout_
   receive.tv_sec = receive_timeout_ms / 1000;
   receive.tv_usec = (receive_timeout_ms % 1000) * 1000;
   setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &receive, sizeof(receive));
-  if (!url.tls) return conn;
+  if (!url.tls) {
+    trace("连接 " + url.host + " 已建立，耗时 " + std::to_string(ms_since(open_start)) + " ms");
+    return conn;
+  }
 
   TlsShared& tls = tls_shared();
   if (!tls.error.empty()) {
     *error = tls.error;
     return nullptr;
   }
+  trace("连接 " + url.host + "：TLS 握手");
   if (int code = mbedtls_ssl_setup(&conn->ssl, &tls.conf); code != 0) {
     *error = "TLS 建立失败: " + tls_error_text(code);
     return nullptr;
@@ -412,8 +428,10 @@ std::unique_ptr<Connection> open_connection(const Url& url, int receive_timeout_
     } else {
       *error = "TLS 握手失败: " + tls_error_text(code);
     }
+    trace("连接 " + url.host + "：" + *error);
     return nullptr;
   }
+  trace("连接 " + url.host + " 已建立（TLS），耗时 " + std::to_string(ms_since(open_start)) + " ms");
   return conn;
 }
 

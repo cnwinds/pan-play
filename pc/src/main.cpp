@@ -8,6 +8,7 @@
 #include "panplay/prefetch.hpp"
 #include "panplay/sink.hpp"
 #include "panplay/store_meta.hpp"
+#include "panplay/trace.hpp"
 
 #include "server.hpp"
 #include "settings.hpp"
@@ -67,18 +68,23 @@ void notify(const std::string& text) {
   sceNotificationSend(kSystemUser, true, payload.c_str());
 }
 
-// 启动后把输出改写到数据目录的 panplay.log。加载器（websrv、elfldr）把输出接到管道或套接字上，
-// 对面不再读时写满就会卡住正在打印的线程。
+// 一启动就把输出改写到数据目录的 panplay.log。加载器（websrv、elfldr）把输出接到管道或套接字上，
+// 对面不再读时写满就会卡住正在打印的线程。追加写：再次启动不会冲掉上次崩溃前的记录，超过 2 MB 时换新文件。
 void redirect_output_to_log() {
   std::cout.flush();
   std::cerr.flush();
   std::fflush(nullptr);
-  const std::string path = (panplay::app_data_dir() / "panplay.log").string();
-  const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  const std::filesystem::path path = panplay::app_data_dir() / "panplay.log";
+  std::error_code ec;
+  if (std::filesystem::file_size(path, ec) > (2u << 20) && !ec) {
+    std::filesystem::rename(path, panplay::app_data_dir() / "panplay.old.log", ec);
+  }
+  const int fd = open(path.string().c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
   if (fd < 0) return;
   dup2(fd, STDOUT_FILENO);
   dup2(fd, STDERR_FILENO);
   close(fd);
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
 }
 #endif
 
@@ -347,24 +353,42 @@ int main(int argc, char** argv) {
     argv = utf8_argv.data();
   }
 #if defined(PANPLAY_PS5)
+  redirect_output_to_log();
+  panplay::enable_trace();
+  panplay::install_crash_trace();
+  panplay::trace("==== 盘游启动 pid " + std::to_string(getpid()) + "，参数 " + std::to_string(argc) + " 个，编译于 " +
+                 __DATE__ + " " + __TIME__ + "，" + panplay::memory_summary());
+  panplay::start_trace_heartbeat();
   // 载荷由 ELF 加载器启动，通常不带参数：直接开局域网界面。
   if (argc < 2) {
     ServerOptions options;
     options.lan_required = true;
     std::string running_url;
     std::string running_code;
+    panplay::trace("检查端口 " + std::to_string(options.port) + " 上是否已有盘游");
     if (running_instance(options.port, &running_url, &running_code)) {
+      panplay::trace("已有盘游在运行 " + running_url + "，本次退出");
       notify("盘游已经在运行 " + running_url + (running_code.empty() ? "" : " 口令 " + running_code));
       return 0;
     }
+    panplay::trace("没有已在运行的盘游，开始启动服务");
     options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
+      panplay::trace("服务就绪，弹出启动通知 " + url);
       notify("盘游已启动 " + url + (code.empty() ? "" : " 口令 " + code));
-      redirect_output_to_log();
     };
-    options.on_quit = [] { notify("盘游已退出"); };
+    options.on_quit = [] {
+      panplay::trace("用户在设置页退出盘游");
+      notify("盘游已退出");
+    };
     const int code = run_server(options);
+    panplay::trace("run_server 返回 " + std::to_string(code));
     if (code != 0) notify("盘游没能启动：端口 " + std::to_string(options.port) + " 可能已被占用");
     return code;
+  }
+#else
+  if (std::getenv("PANPLAY_TRACE") != nullptr) {
+    panplay::enable_trace();
+    panplay::install_crash_trace();
   }
 #endif
 #if defined(_WIN32)
