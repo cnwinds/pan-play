@@ -12,6 +12,8 @@ struct ServerOptions {
   bool lan_required = false;
   // 开始监听后调用：本机地址、局域网地址（不允许局域网访问或找不到网卡时为空）、访问口令（不要口令时为空）。
   std::function<void(const std::string& local_url, const std::string& lan_url, const std::string& code)> on_ready;
+  // 界面里点了退出、进程结束前调用。
+  std::function<void()> on_quit;
 };
 
 int run_server(const ServerOptions& options);

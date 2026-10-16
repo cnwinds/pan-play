@@ -180,6 +180,8 @@ struct LanAccess {
 
 LanAccess lan;
 
+std::function<void()> on_quit;
+
 std::string random_digits(std::size_t count) {
   std::random_device device;
   std::string out;
@@ -1333,6 +1335,16 @@ void handle_client(SOCKET client, bool local_peer) {
     reply_json(client, 200, catalog_status_json());
     return;
   }
+  // 队列一直存在磁盘上，直接结束进程也不丢：正在装的游戏下次启动接着装。
+  if (method == "POST" && target == "/api/quit") {
+    reply_json(client, 200, "{}");
+    std::thread([] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      if (on_quit) on_quit();
+      std::_Exit(0);
+    }).detach();
+    return;
+  }
   if (method == "GET" && target == "/api/settings") {
     reply_json(client, 200, settings_json(load_settings()));
     return;
@@ -1590,6 +1602,7 @@ std::string lan_address() {
 
 int run_server(const ServerOptions& options) {
   const int port = options.port;
+  on_quit = options.on_quit;
   {
     std::string catalog_error;
     if (panplay::GameCatalog::instance().load_default(&catalog_error)) {

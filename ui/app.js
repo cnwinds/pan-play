@@ -1644,6 +1644,30 @@ catalogReload.addEventListener("click", async () => {
   }
 });
 
+$("#quit").addEventListener("click", async () => {
+  const button = $("#quit");
+  const note = $("#quit-note");
+  const ask = queueBusy()
+    ? "退出盘游？正在进行的安装会停下，下次启动盘游时接着装。"
+    : "退出盘游？退出后要重新启动盘游才能打开这个页面。";
+  if (!window.confirm(ask)) return;
+  button.disabled = true;
+  note.textContent = "";
+  try {
+    await api("/api/quit", {});
+  } catch (error) {
+    note.textContent = error.message;
+    button.disabled = false;
+    return;
+  }
+  stopQueueWatch();
+  window.clearTimeout(metaTimer);
+  window.clearTimeout(loginTimer);
+  closeDetail();
+  dock.hidden = true;
+  $("#quit-box").hidden = false;
+});
+
 /* 导航与筛选 */
 
 const settingsTabs = [...document.querySelectorAll(".settings-tab")];

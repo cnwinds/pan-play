@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1b2440"/><stop offset="1" stop-color="#0b101c"/></linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.5"><stop offset="0" stop-color="#5b6dff" stop-opacity=".28"/><stop offset="1" stop-color="#5b6dff" stop-opacity="0"/></radialGradient>
+    <linearGradient id="pink" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff7ab6"/><stop offset="1" stop-color="#e5307a"/></linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#46e6ff"/><stop offset="1" stop-color="#3b6dff"/></linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd85a"/><stop offset="1" stop-color="#ff7a2b"/></linearGradient>
+    <linearGradient id="lime" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#b4f56a"/><stop offset="1" stop-color="#22c98d"/></linearGradient>
+    <linearGradient id="cloud" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#b46bff"/><stop offset="1" stop-color="#46e6ff"/></linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <rect width="512" height="512" fill="url(#glow)"/>
+  <svg x="86" y="34" width="340" height="340" viewBox="0 0 64 64">
+    <path d="M17 52h31a10.5 10.5 0 0 0 1.6-20.9A16 16 0 0 0 19.3 25.4 13.4 13.4 0 0 0 17 52z" fill="#1d2640" stroke="url(#cloud)" stroke-width="3" stroke-linejoin="round"/>
+    <circle cx="33" cy="28" r="5.4" fill="url(#pink)"/><path d="M33 25.4l2.5 4.3h-5z" fill="#fff" fill-opacity=".92"/>
+    <circle cx="41.5" cy="36.5" r="5.4" fill="url(#cyan)"/><circle cx="41.5" cy="36.5" r="2.2" fill="none" stroke="#fff" stroke-opacity=".92" stroke-width="1.5"/>
+    <circle cx="33" cy="45" r="5.4" fill="url(#amber)"/><path d="M31.2 43.2l3.6 3.6M34.8 43.2l-3.6 3.6" fill="none" stroke="#fff" stroke-opacity=".92" stroke-width="1.5" stroke-linecap="round"/>
+    <circle cx="24.5" cy="36.5" r="5.4" fill="url(#lime)"/><rect x="22.6" y="34.6" width="3.8" height="3.8" rx=".7" fill="none" stroke="#fff" stroke-opacity=".92" stroke-width="1.4"/>
+    <path d="M55 4.5l1.7 4.6 4.6 1.7-4.6 1.7L55 17.1l-1.7-4.6-4.6-1.7 4.6-1.7z" fill="#ffe066"/>
+  </svg>
+  <text x="256" y="438" text-anchor="middle" font-family="Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="92" font-weight="700" fill="#f2f5ff" letter-spacing="10">&#x76D8;&#x6E38;</text>
+</svg>

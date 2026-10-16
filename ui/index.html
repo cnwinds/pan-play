@@ -93,6 +93,7 @@
   <main id="settings-view" class="view settings" hidden>
     <h1>设置</h1>
     <div class="settings-layout">
+    <div class="settings-side">
     <div class="settings-tabs" role="tablist" aria-label="设置分类" aria-orientation="vertical">
       <button type="button" class="settings-tab" role="tab" id="tab-drive" data-panel="drive"
               aria-controls="panel-drive" aria-selected="true">
@@ -118,6 +119,11 @@
         <span class="tab-text"><strong>游戏资料库</strong><span class="tab-status" id="status-catalog">读取中…</span></span>
         <span class="tab-dot" id="dot-catalog" aria-hidden="true"></span>
       </button>
+    </div>
+    <div class="settings-quit">
+      <button type="button" class="btn quiet small" id="quit">退出盘游</button>
+      <p class="note error" id="quit-note" role="status"></p>
+    </div>
     </div>
 
     <form id="settings-form" class="settings-panel">
@@ -274,6 +280,13 @@
       <button type="submit" class="btn primary">进入</button>
       <p class="note error" id="unlock-note" role="status"></p>
     </form>
+  </section>
+
+  <section class="unlock" id="quit-box" hidden aria-labelledby="quit-title">
+    <div class="login-card">
+      <h1 id="quit-title">盘游已退出</h1>
+      <p class="login-text">没装完的游戏下次启动盘游时会接着装。PS5 上从 Homebrew Launcher 重新打开盘游，电脑上重新运行 panplay.exe。</p>
+    </div>
   </section>
 
   <div class="drawer-root" id="detail-overlay" hidden>

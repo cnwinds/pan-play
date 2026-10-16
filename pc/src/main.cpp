@@ -28,6 +28,10 @@
 #endif
 
 #if defined(PANPLAY_PS5)
+#include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
+
 extern "C" int sceNotificationSend(int user_id, bool is_logged, const char* payload);
 #endif
 
@@ -61,6 +65,37 @@ void notify(const std::string& text) {
       "\"message\":{\"body\":\"" + panplay::json_escape(text) + "\"}}},"
       "\"createdDateTime\":\"2026-01-01T00:00:00.000Z\",\"localNotificationId\":\"73726\"}";
   sceNotificationSend(kSystemUser, true, payload.c_str());
+}
+
+// 启动后把输出改写到数据目录的 panplay.log。加载器（websrv、elfldr）把输出接到管道或套接字上，
+// 对面不再读时写满就会卡住正在打印的线程。
+void redirect_output_to_log() {
+  std::cout.flush();
+  std::cerr.flush();
+  std::fflush(nullptr);
+  const std::string path = (panplay::app_data_dir() / "panplay.log").string();
+  const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return;
+  dup2(fd, STDOUT_FILENO);
+  dup2(fd, STDERR_FILENO);
+  close(fd);
+}
+#endif
+
+#if defined(PANPLAY_PS5) || defined(_WIN32)
+// 本机这个端口上已经开着盘游时，取它的局域网地址和口令（不要口令时为空）。
+// 没开着，或者占着端口的不是盘游，返回 false。
+bool running_instance(int port, std::string* lan_url, std::string* code) {
+  panplay::HttpRequest request;
+  request.url = "http://127.0.0.1:" + std::to_string(port) + "/api/access";
+  request.timeout_ms = 3000;
+  const panplay::HttpResponse response = panplay::http_send(request);
+  if (response.status != 200) return false;
+  const panplay::Json json = panplay::Json::parse(response.body, nullptr);
+  if (json.type != panplay::Json::Type::object || json.get("require_code") == nullptr) return false;
+  *lan_url = json.str("url");
+  *code = json.boolean_or("require_code", false) ? json.str("code") : "";
+  return true;
 }
 #endif
 
@@ -316,9 +351,17 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     ServerOptions options;
     options.lan_required = true;
+    std::string running_url;
+    std::string running_code;
+    if (running_instance(options.port, &running_url, &running_code)) {
+      notify("盘游已经在运行 " + running_url + (running_code.empty() ? "" : " 口令 " + running_code));
+      return 0;
+    }
     options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
       notify("盘游已启动 " + url + (code.empty() ? "" : " 口令 " + code));
+      redirect_output_to_log();
     };
+    options.on_quit = [] { notify("盘游已退出"); };
     const int code = run_server(options);
     if (code != 0) notify("盘游没能启动：端口 " + std::to_string(options.port) + " 可能已被占用");
     return code;
@@ -328,6 +371,14 @@ int main(int argc, char** argv) {
   // 双击 exe 时不带参数：直接开本机界面，并用默认浏览器打开。窗口一关程序就退出，所以出错时停住让人看到原因。
   if (argc < 2) {
     ServerOptions options;
+    std::string running_url;
+    std::string running_code;
+    if (running_instance(options.port, &running_url, &running_code)) {
+      const std::string local_url = "http://127.0.0.1:" + std::to_string(options.port);
+      std::cout << "盘游已经在运行，已打开 " << local_url << std::endl;
+      ShellExecuteA(nullptr, "open", local_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      return 0;
+    }
     options.on_ready = [](const std::string& url, const std::string&, const std::string&) {
       ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     };

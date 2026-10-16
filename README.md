@@ -9,6 +9,7 @@
 - `core/`：网盘接口、扫描、ZIP/RAR 安装和 dummy FTP
 - `pc/`：命令行和本机界面服务
 - `ui/`：封面墙、详情和设置页
+- `ps5/`：PS5 上 Homebrew Launcher 用的图标（`icon.svg` 是源文件）和启动脚本 `homebrew.js`
 - `data/`：本地游戏资料库 `panplay-catalog.json`（Title ID → 名称、封面等）
 - `scripts/build-catalog.py`：从 PlayStation-Titles 生成或更新资料库
 - `third_party/unrar/`：随仓库带上的 UnRAR，用来解 RAR5
@@ -59,7 +60,8 @@
 
 ## 这一版能做的事
 
-- Windows 上直接双击 `panplay.exe`：等同 `panplay serve`，并自动用浏览器打开界面。端口被占用（比如已经开着一个盘游）时窗口会停住说明原因。
+- Windows 上直接双击 `panplay.exe`：等同 `panplay serve`，并自动用浏览器打开界面。已经开着一个盘游时直接用浏览器打开它；端口被别的程序占用时窗口会停住说明原因。
+- 设置页分类下面的「退出盘游」结束程序。安装队列存在磁盘上，没装完的游戏下次启动时接着装。
 - `panplay serve`：在 `http://127.0.0.1:8734` 打开界面。首页用百度网盘 App 扫码登录；设置页填写游戏库目录和存放位置，只保存在这台电脑。
 - 局域网访问：默认开着、不要口令，同一网络里的手机、平板直接打开 `http://<电脑 IP>:8734`（地址在启动输出和设置页里）。设置页「局域网访问」可以关掉局域网访问（只能在运行盘游的电脑上关），或开启访问口令：开了以后其他设备第一次打开要输口令，本机不用；口令可在设置页修改，存放在数据目录的 `access-code.txt`。只在家里内网用的话默认就够了，有更高的安全要求再自己开口令。
 - `panplay serve 8734 --local` / `--lan`：只对这次启动强制只许本机 / 允许局域网访问，不改设置。
@@ -118,10 +120,31 @@ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 $PS5_PAYLOAD_SDK/bin/prospero-cmake -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-ps5
 ```
 
-载荷不带参数启动时在 8734 端口开界面，主机右上角通知里给出地址（开了访问口令时还有口令）。PS5 上只能从其他设备打开界面，所以局域网访问一直开着、不能关；访问口令默认关，可在设置页开启。数据在 `/data/panplay`，游戏装到「主机目录」设置的本机路径（默认 `/data/homebrew`）。
+载荷不带参数启动时在 8734 端口开界面，主机右上角通知里给出地址（开了访问口令时还有口令）。已经开着一个盘游时不再启动第二个，通知里给出正在运行的那个的地址。启动后的输出写到 `/data/panplay/panplay.log`：加载器把输出接在管道或套接字上，对面不读时写满会卡住程序。PS5 上只能从其他设备打开界面，所以局域网访问一直开着、不能关；访问口令默认关，可在设置页开启。数据在 `/data/panplay`，游戏装到「主机目录」设置的本机路径（默认 `/data/homebrew`）。
 
-推送后 GitHub Actions（`.github/workflows/build.yml`）会编出 Linux 版并跑自测，再编出 PS5 的 `panplay.elf` 和 Windows 的 `panplay.exe`（MSYS2 MinGW 静态链接、界面打包在里面，单个文件就能运行），都在运行记录的 Artifacts 里下载。
+#### 在 PS5 上点图标启动
 
-发布新版本：在 `main` 上打 `v` 开头的标签并推送（如 `git tag v0.1.0 && git push origin v0.1.0`），三个平台都编过后，自动建 GitHub Release，挂上 Windows 的 exe、PS5 的 elf 和 `SHA256SUMS.txt`。完整步骤（定版本号、整理提交、验证、出错怎么办）见 [发布流程](docs/agents/release.md)。
+用 [websrv](https://github.com/ps5-payload-dev/websrv) 的 Homebrew Launcher：
+
+1. 主机破解后运行 websrv（每次开机都要重新运行；etaHEN 等工具可以设成开机自动加载）。websrv 第一次运行时会在主机桌面装上 Homebrew Launcher 的图标。
+2. 解压 Release 里的 `panplay-<版本>-ps5-homebrew.zip`，得到 `Panplay` 文件夹：
+
+   ```text
+   Panplay/
+   ├── eboot.elf        就是 panplay.elf
+   ├── homebrew.js      让 websrv 用后台方式启动
+   └── sce_sys/icon0.png
+   ```
+
+   用 FTP 放进主机的 `/data/homebrew/`，或者放到 U 盘的 `homebrew/` 目录里插上主机（websrv 也扫 `/mnt/usb*/homebrew`）。
+3. 打开 Homebrew Launcher，点盘游的图标，主机右上角会弹出访问地址。之后可以退出 Launcher 去玩游戏，盘游一直在后台运行，直到在设置页点「退出盘游」或主机重启。
+
+`homebrew.js` 让 websrv 用 daemon 方式启动盘游。不用它的话，websrv 会把盘游当前台应用运行：启动时关掉正在运行的游戏，打开游戏时盘游被结束，装到一半的游戏也就停了。更新时只要换掉 `eboot.elf`。websrv 只把带 `eboot.elf` 的文件夹列成自制程序，装在 `/data/homebrew` 里的游戏（只有 `eboot.bin`）不会出现在 Launcher 里。
+
+改了 `ps5/icon.svg` 后重新生成 `icon0.png`（512×512），比如用 Chrome：`chrome --headless=new --window-size=512,512 --screenshot=ps5/homebrew/sce_sys/icon0.png file:///<仓库路径>/ps5/icon.svg`。
+
+推送后 GitHub Actions（`.github/workflows/build.yml`）会编出 Linux 版并跑自测，再编出 PS5 的 `panplay.elf`（连同 Homebrew Launcher 用的 `panplay-homebrew.zip`）和 Windows 的 `panplay.exe`（MSYS2 MinGW 静态链接、界面打包在里面，单个文件就能运行），都在运行记录的 Artifacts 里下载。
+
+发布新版本：在 `main` 上打 `v` 开头的标签并推送（如 `git tag v0.1.0 && git push origin v0.1.0`），三个平台都编过后，自动建 GitHub Release，挂上 Windows 的 exe、PS5 的 elf、PS5 的 Homebrew Launcher 目录 zip 和 `SHA256SUMS.txt`。
 
 百度登录走网盘网页版的扫码流程：passport 出二维码，手机确认后换成 `BDUSS` / `STOKEN` cookie，列目录和取下载地址都带这组 cookie。会话在数据目录的 `baidu-session.json`，相当于网盘账号的登录态，别发给别人。
