@@ -1,150 +1,64 @@
 # 盘游 Panplay
 
-把百度网盘里的游戏分卷流式安装到主机存放目录。本期只有百度网盘插件（用百度网盘 App 扫码登录，不用申请开放平台密钥），网盘能力走统一接口。
+把百度网盘里的 PS4 / PS5 游戏直接装进 PS5：边下载边解压，中间不落一份压缩包。断了下次接着装，出了新补丁只装补丁。
 
-需求见 [docs/PRD.md](docs/PRD.md)。
+- 游戏按网盘文件夹列成封面墙，自动配上商店封面、中文名、评分和简介
+- 用百度网盘 App 扫码登录，不用申请任何密钥
+- 可以跑在电脑上通过 FTP 写进 PS5，也可以直接跑在 PS5 上；手机、平板在同一 Wi-Fi 里都能打开操作
 
-## 目录
+**你需要**：一台已破解、能运行 payload 的 PS5。网盘里直接放游戏压缩包（ZIP / RAR / 7z，支持分卷）；压缩包里装的是游戏目录（带 `sce_sys` 的那种），不是 `.pkg` 安装包。
 
-- `core/`：网盘接口、扫描、ZIP/RAR 安装和 dummy FTP
-- `pc/`：命令行和本机界面服务
-- `ui/`：封面墙、详情和设置页
-- `ps5/`：PS5 上 Homebrew Launcher 用的图标（`icon.svg` 是源文件）和启动脚本 `homebrew.js`
-- `data/`：本地游戏资料库 `panplay-catalog.json`（Title ID → 名称、封面等）
-- `scripts/build-catalog.py`：从 PlayStation-Titles 生成或更新资料库
-- `third_party/unrar/`：随仓库带上的 UnRAR，用来解 RAR5
+游戏库游戏详情
 
-## 游戏资料库
+## 开始使用
 
-游戏资料分两层，都以 `conceptId` 串起来：
+到 [Releases](https://github.com/cnwinds/pan-play/releases) 下载，两种跑法选一种。
 
-1. **Title ID → conceptId、英文名**：来自 [PlayStation-Titles](https://github.com/andshrew/PlayStation-Titles)（MIT，作者每天自动刷新）。程序自带一份 `data/panplay-catalog.json`，自动同步的新版写在数据目录，两份取较新的。用 CMake 构建时（发布版都是）这份资料库会压缩后打包进程序，旁边一个资料库文件都没有时就用它，所以发出去的 exe / elf 不用再带 `data/`；打包的这份始终算过期，第一次连上 GitHub 就会被同步下来的新版替换。
-2. **中文名、封面、类型、发行商、发售日、简介**：按 `conceptId` 读取 PlayStation 商店概念页，依次试港服简体 `zh-hans-hk`、港服繁体 `zh-hant-hk`、美服 `en-us`，结果缓存在数据目录的 `store-meta.json`，封面存到数据目录的 `covers/`。
+### 跑在 PS5 上（不用开电脑）
 
-只有目录名里能抽出 `CUSA` / `PPSA` 时才对照资料；没有 Title ID 时保持网盘文件夹原名，不按目录名猜测。展示名优先级是：手动改名 > 商店名称 > 英文名 > 目录名。手动改名保存在数据目录的 `name-overrides.json`。
+1. 主机运行 [websrv](https://github.com/ps5-payload-dev/websrv)，桌面会出现 Homebrew Launcher。
+2. 解压 `panplay-<版本>-ps5-homebrew.zip`，把得到的 `Panplay` 文件夹用 FTP 放进主机的 `/data/homebrew/`，或拷到 U 盘的 `homebrew/` 再插上主机。
+3. 在 Homebrew Launcher 里点盘游，主机右上角通知会给出访问地址，用手机或电脑浏览器打开。
 
-**数据目录**（设置、网盘会话、资料库同步副本、商店资料缓存、封面都放这里）：
+盘游在后台运行，去玩游戏不影响它安装。游戏默认装到主机的 `/data/homebrew`。
 
-| 平台 | 默认位置 |
-| --- | --- |
-| Windows | `%APPDATA%\panplay` |
-| PS5 载荷（编译时定义 `__PROSPERO__` 或 `-DPANPLAY_PS5`） | `/data/panplay` |
-| Linux / 其他 | `$XDG_DATA_HOME/panplay`，否则 `~/.local/share/panplay` |
+### 跑在 Windows 电脑上
 
-任何平台都可以用环境变量 `PANPLAY_DATA_DIR` 指定别的目录。
+PS5 上要开着 FTP 服务。
 
-商店资料只在后台按需获取：封面墙先显示英文名，补齐后自动换成中文名和封面。每秒最多一次请求；取到的资料 30 天后刷新，未收录的 7 天后再试，网络失败不写缓存。命令行可以用 `panplay store-meta <conceptId>` 直接看某个概念页的解析结果。
+1. 双击 `panplay-<版本>-windows-x64.exe`，浏览器会自动打开盘游。
+2. 在设置的「存放位置」里选「FTP 发送到主机」，填 PS5 的地址和端口。
 
-**PlayStation-Titles 同步方式（全自动，无需 API 密钥）**：`panplay serve` 启动后会在后台自动拉取最新 Title ID 数据，写入数据目录的 `panplay-catalog.json` 并热重载，**不会阻塞** `/api/games` 等 HTTP 请求。上游停更或访问不了时，可以用环境变量 `PANPLAY_CATALOG_URL` 换成镜像地址，格式与 `All_Titles.json` 相同。
+### 然后
 
-| 时机 | 行为 |
-|------|------|
-| 启动时 | 若 catalog 不存在，或文件超过 **7 天**未更新 → 后台线程自动拉取并重建 |
-| 运行中 | 每 **24 小时**检查一次；过期则后台同步，完成后热重载 |
-| 失败时 | 保留现有 catalog，stderr 输出简短中文错误；登录与安装不受影响 |
-| 只有打包的 catalog | 先用打包的这份，同时立刻后台同步 |
-| 首次无 catalog | 游戏列表仍可用（回退目录名），同步完成后下次请求自动 enriched |
+1. 用百度网盘 App 扫码登录。
+2. 在设置的「网盘」里填游戏库目录。
+3. 回到游戏库，点一款游戏，点「安装到主机」。
 
-设置页 **游戏资料库** 可查看「已同步 / 正在更新 / 上次更新时间」。`GET /api/catalog` 返回 `sync` 字段（phase、last_success 等）。
+要退出，在设置页点「退出盘游」。没装完的游戏下次启动会接着装。
 
-**手动脚本（可选）**：仍可用 `scripts/update-catalog.ps1` 或 `scripts/build-catalog.py` 离线生成资料库；生成后可在设置页点「重新加载资料库」或等下次自动周期。脚本的 `--fetch-covers` 写入的包装图标只在商店没有封面时兜底。
+## 网盘里怎么放
 
-**数据来源与许可**：
+一款游戏一个文件夹，名字里带 Title ID（`PPSA` 或 `CUSA` 加 5 位数字）。主游戏直接放在文件夹里，每个补丁单独一个子文件夹，按序号命名：
 
-| 数据 | 来源 | 说明 |
-|------|------|------|
-| Title ID、英文名、conceptId、区域 | [PlayStation-Titles](https://github.com/andshrew/PlayStation-Titles) | MIT，本地携带并定期同步 |
-| 中文名、封面、简介、类型、发行商 | PlayStation 商店概念页 | 按用户库里的 `conceptId` 逐个读取，结果只存本机 |
-
-`POST /api/catalog/reload` 可在不重启服务的情况下从磁盘重读 JSON（不联网）。
-
-## 这一版能做的事
-
-- Windows 上直接双击 `panplay.exe`：等同 `panplay serve`，并自动用浏览器打开界面。已经开着一个盘游时直接用浏览器打开它；端口被别的程序占用时窗口会停住说明原因。
-- 设置页分类下面的「退出盘游」结束程序。安装队列存在磁盘上，没装完的游戏下次启动时接着装。
-- `panplay serve`：在 `http://127.0.0.1:8734` 打开界面。首页用百度网盘 App 扫码登录；设置页填写游戏库目录和存放位置，只保存在这台电脑。
-- 局域网访问：默认开着、不要口令，同一网络里的手机、平板直接打开 `http://<电脑 IP>:8734`（地址在启动输出和设置页里）。设置页「局域网访问」可以关掉局域网访问（只能在运行盘游的电脑上关），或开启访问口令：开了以后其他设备第一次打开要输口令，本机不用；口令可在设置页修改，存放在数据目录的 `access-code.txt`。只在家里内网用的话默认就够了，有更高的安全要求再自己开口令。
-- `panplay serve 8734 --local` / `--lan`：只对这次启动强制只许本机 / 允许局域网访问，不改设置。
-- `panplay http-get <地址>`：排查网络，打印状态码、长度和跳转后的地址。
-- `panplay login` / `ls` / `scan` / `install` / `read`：同一套安装流程的命令行
-- `panplay dummy-ftp <端口> <根目录> [--zftpd]`：在 `127.0.0.1` 上模拟主机 FTP 目录。带 `--zftpd` 时学 PS5 上的 zftpd：不要密码，从头写的 STOR 中途断了会删掉半截文件
-- `panplay self-test`：检查 JSON、FTP 续写、ZIP 分卷续传、RAR 安装，以及 7z 分卷、固实、过滤器、续传和不支持方法的拒绝
-
-游戏库可以是网盘里任意目录。主游戏、补丁怎么放、叠放顺序和出了新补丁怎么只装补丁，见 [网盘游戏目录整理指南](docs/game-folder-guide.md)。能安装单卷和带分卷头的 ZIP（存储和 Deflate）、RAR，以及 7z（单个或 `.7z.001` 分卷；存储、LZMA、LZMA2，可带 BCJ / ARM64 等可执行文件过滤器和 Delta）。7z 用了 PPMd、BCJ2 或加了密码时明确拒绝，提示用默认设置重新压缩或换成 ZIP / RAR；PS5 上字典超过 128 MB 的也拒绝。7z 同样边下载边解压：固实块里不需要的文件解出来直接丢掉，不落盘。写入规则是：远端文件大小等于已提交字节才 `APPE`；对不上就重新 `STOR` 覆盖。已校验通过的文件继续时不再重写。FTP 上超过 32 MB 的文件先 `DELE` 再只用 `APPE` 写：zftpd 上从头写的 `STOR` 断了会删掉半截文件，`APPE` 不会，大文件断线后才能从主机已存下的位置续传。
-
-## 构建
-
-这台机器上用 MinGW：
-
-```powershell
-New-Item -ItemType Directory -Force -Path build | Out-Null
-$unrar = @(
-  "rar","strlist","strfn","pathfn","smallfn","global","file","filefn","filcreat",
-  "archive","arcread","unicode","system","crypt","crc","rawread","encname","resource",
-  "match","timefn","rdwrfn","consio","options","errhnd","rarvm","secpassword","rijndael",
-  "getbits","sha1","sha256","blake2s","hash","extinfo","extract","volume","list","find",
-  "unpack","headers","threadpool","rs16","cmddata","ui","largepage","filestr","scantree","dll","qopen","isnt","motw"
-) | ForEach-Object { "third_party/unrar/$_.cpp" }
-# 7z 用到的 LZMA SDK 是 C 代码，先用 gcc 编成目标文件。
-New-Item -ItemType Directory -Force -Path build\lzma | Out-Null
-$lzma = @(
-  "7zArcIn","7zBuf","7zCrc","7zCrcOpt","7zDec","7zStream","Bcj2","Bra","Bra86","BraIA64","CpuArch","Delta","LzmaDec","Lzma2Dec"
-) | ForEach-Object {
-  & "D:\tools\msys64\mingw64\bin\gcc.exe" -c -O2 "third_party/lzma/$_.c" -o "build/lzma/$_.o"
-  "build/lzma/$_.o"
-}
-$src = @(Get-ChildItem core\src\*.cpp, pc\src\*.cpp | ForEach-Object { $_.FullName }) + $unrar + $lzma
-& "D:\tools\msys64\mingw64\bin\g++.exe" -static -std=c++17 -O2 -DRARDLL -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -I core/include -I pc/src -I third_party/unrar -I third_party/lzma @src -lwinhttp -lws2_32 -lz -lole32 -luuid -ladvapi32 -lpowrprof -lshell32 -o build/panplay.exe
-.\build\panplay.exe self-test
+```
+游戏库目录/
+└── 对马岛之魂 PPSA03210/
+    ├── Ghost.part1.rar        主游戏
+    ├── Ghost.part2.rar
+    ├── 补丁01 v1.05/
+    │   └── Ghost-v1.05.rar
+    └── 补丁02 v2.10/
+        └── Ghost-v2.10.rar
 ```
 
-装了 CMake 时也可以：
+出了新补丁，再加一个子文件夹，打开游戏详情点「安装更新」即可，主游戏不会重下。
 
-```powershell
-cmake -S . -B build
-cmake --build build --config Release
-```
+7z 请用 7-Zip 默认设置压缩，加了密码或用了 PPMd、BCJ2 的装不了。更多细节见 [网盘游戏目录整理指南](docs/game-folder-guide.md)。
 
-### Linux 和 PS5
+## 其他
 
-Windows 以外的平台用自带的 HTTPS 客户端（mbedTLS），mbedTLS、zlib 和根证书包（curl.se 的 `cacert.pem`）在 CMake 配置时下载。Linux 上自测需要 PATH 里有 `rar` 和 `7z`，或者用 `PANPLAY_RAR`、`PANPLAY_7Z` 指定；Windows 上默认用 `C:\Program Files\WinRAR\Rar.exe` 和 `C:\Program Files\7-Zip\7z.exe`，7-Zip 装在别处时用 `PANPLAY_7Z` 指定（精简版 `7zr.exe` 也行，它压不了 PPMd，那一项会跳过）。
+- 局域网访问默认开着、不要口令。想限制别人打开，在设置的「局域网访问」里关掉或设口令。
+- 设置和登录状态存在 `%APPDATA%\panplay`（Windows）或 `/data/panplay`（PS5）。其中的 `baidu-session.json` 就是你的网盘登录态，不要发给别人。
+- 自己编译见 [从源码构建](docs/build.md)。
 
-```bash
-cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-linux
-```
-
-PS5 载荷用 [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk)（要 clang/lld 18 以上），产物是 `panplay.elf`，界面文件打包在里面：
-
-```bash
-export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
-$PS5_PAYLOAD_SDK/bin/prospero-cmake -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-ps5
-```
-
-载荷不带参数启动时在 8734 端口开界面，主机右上角通知里给出地址（开了访问口令时还有口令）。已经开着一个盘游时不再启动第二个，通知里给出正在运行的那个的地址。启动后的输出写到 `/data/panplay/panplay.log`：加载器把输出接在管道或套接字上，对面不读时写满会卡住程序。PS5 上只能从其他设备打开界面，所以局域网访问一直开着、不能关；访问口令默认关，可在设置页开启。数据在 `/data/panplay`，游戏装到「主机目录」设置的本机路径（默认 `/data/homebrew`）。
-
-#### 在 PS5 上点图标启动
-
-用 [websrv](https://github.com/ps5-payload-dev/websrv) 的 Homebrew Launcher：
-
-1. 主机破解后运行 websrv（每次开机都要重新运行；etaHEN 等工具可以设成开机自动加载）。websrv 第一次运行时会在主机桌面装上 Homebrew Launcher 的图标。
-2. 解压 Release 里的 `panplay-<版本>-ps5-homebrew.zip`，得到 `Panplay` 文件夹：
-
-   ```text
-   Panplay/
-   ├── eboot.elf        就是 panplay.elf
-   ├── homebrew.js      让 websrv 用后台方式启动
-   └── sce_sys/icon0.png
-   ```
-
-   用 FTP 放进主机的 `/data/homebrew/`，或者放到 U 盘的 `homebrew/` 目录里插上主机（websrv 也扫 `/mnt/usb*/homebrew`）。
-3. 打开 Homebrew Launcher，点盘游的图标，主机右上角会弹出访问地址。之后可以退出 Launcher 去玩游戏，盘游一直在后台运行，直到在设置页点「退出盘游」或主机重启。
-
-`homebrew.js` 让 websrv 用 daemon 方式启动盘游。不用它的话，websrv 会把盘游当前台应用运行：启动时关掉正在运行的游戏，打开游戏时盘游被结束，装到一半的游戏也就停了。更新时只要换掉 `eboot.elf`。websrv 只把带 `eboot.elf` 的文件夹列成自制程序，装在 `/data/homebrew` 里的游戏（只有 `eboot.bin`）不会出现在 Launcher 里。
-
-改了 `ps5/icon.svg` 后重新生成 `icon0.png`（512×512），比如用 Chrome：`chrome --headless=new --window-size=512,512 --screenshot=ps5/homebrew/sce_sys/icon0.png file:///<仓库路径>/ps5/icon.svg`。
-
-推送后 GitHub Actions（`.github/workflows/build.yml`）会编出 Linux 版并跑自测，再编出 PS5 的 `panplay.elf`（连同 Homebrew Launcher 用的 `panplay-homebrew.zip`）和 Windows 的 `panplay.exe`（MSYS2 MinGW 静态链接、界面打包在里面，单个文件就能运行），都在运行记录的 Artifacts 里下载。
-
-发布新版本：在 `main` 上打 `v` 开头的标签并推送（如 `git tag v0.1.0 && git push origin v0.1.0`），三个平台都编过后，自动建 GitHub Release，挂上 Windows 的 exe、PS5 的 elf、PS5 的 Homebrew Launcher 目录 zip 和 `SHA256SUMS.txt`。
-
-百度登录走网盘网页版的扫码流程：passport 出二维码，手机确认后换成 `BDUSS` / `STOKEN` cookie，列目录和取下载地址都带这组 cookie。会话在数据目录的 `baidu-session.json`，相当于网盘账号的登录态，别发给别人。

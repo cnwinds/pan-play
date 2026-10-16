@@ -17,7 +17,7 @@
 
 ## 3. 本地验证
 
-按 `README.md`「构建」一节在本机编出 `build/panplay.exe`，然后：
+按 `docs/build.md` 在本机编出 `build/panplay.exe`，然后：
 
 - `.\build\panplay.exe self-test` 通过。缺 WinRAR 或 7-Zip 跑不了全量时，至少把改到的模块单独编译并跑它的自检，并在发布记录里注明全量自测交给 CI。
 - 改了界面或接口的，重启本机服务（`panplay.exe serve`，默认 http://127.0.0.1:8734 ），实际点一遍改到的地方。
