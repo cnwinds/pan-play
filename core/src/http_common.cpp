@@ -1,6 +1,7 @@
 #include "panplay/http.hpp"
 
 #include <cctype>
+#include <vector>
 
 namespace panplay {
 
@@ -26,16 +27,16 @@ HttpResponse HttpClient::send(const HttpRequest& request) {
   response.status = stream->status();
   response.final_url = stream->final_url();
   response.headers = stream->headers();
-  std::uint8_t buffer[65536];
+  std::vector<std::uint8_t> buffer(65536);
   for (;;) {
     std::string error;
-    const std::size_t got = stream->read(buffer, sizeof(buffer), &error);
+    const std::size_t got = stream->read(buffer.data(), buffer.size(), &error);
     if (!error.empty()) {
       response.error = error;
       break;
     }
     if (got == 0) break;
-    response.body.append(reinterpret_cast<const char*>(buffer), got);
+    response.body.append(reinterpret_cast<const char*>(buffer.data()), got);
   }
   return response;
 }

@@ -3,16 +3,17 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
-#include <mutex>
 #include <thread>
 
 #if defined(_WIN32)
 #include <io.h>
 #else
+#include <signal.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
@@ -48,22 +49,40 @@ void write_raw(const char* data, std::size_t size) {
 #endif
 }
 
-void on_crash_signal(int sig) {
-  char text[96];
+void write_crash_line(int sig, const void* address) {
+  char text[128];
   std::size_t length = 0;
   const auto append = [&](const char* part) {
     while (*part && length < sizeof(text)) text[length++] = *part++;
   };
   append("!!! 收到信号 ");
-  char digits[12];
+  char digits[20];
   int count = 0;
   for (int value = sig < 0 ? 0 : sig; count == 0 || value > 0; value /= 10) digits[count++] = static_cast<char>('0' + value % 10);
   while (count > 0 && length < sizeof(text)) text[length++] = digits[--count];
+  if (address != nullptr) {
+    append("，地址 0x");
+    auto value = reinterpret_cast<std::uintptr_t>(address);
+    for (count = 0; count == 0 || value > 0; value >>= 4) digits[count++] = "0123456789abcdef"[value & 0xF];
+    while (count > 0 && length < sizeof(text)) text[length++] = digits[--count];
+  }
   append("，进程结束\n");
   write_raw(text, length);
+}
+
+#if defined(_WIN32)
+void on_crash_signal(int sig) {
+  write_crash_line(sig, nullptr);
   std::signal(sig, SIG_DFL);
   std::raise(sig);
 }
+#else
+// 装在备用栈上（SA_ONSTACK），线程栈溢出时也能跑；SA_RESETHAND 让第二次收到同一信号时按默认处理结束进程。
+void on_crash_signal(int sig, siginfo_t* info, void*) {
+  write_crash_line(sig, info != nullptr ? info->si_addr : nullptr);
+  std::raise(sig);
+}
+#endif
 
 void on_terminate() {
   std::string what = "没有正在处理的异常";
@@ -110,12 +129,28 @@ void trace(const std::string& message) {
 }
 
 void install_crash_trace() {
+#if defined(_WIN32)
   for (const int sig : {SIGSEGV, SIGILL, SIGFPE, SIGABRT, SIGTERM}) std::signal(sig, on_crash_signal);
-#if !defined(_WIN32)
-  for (const int sig : {SIGBUS, SIGHUP, SIGSYS}) std::signal(sig, on_crash_signal);
+#else
+  install_signal_stack();
+  struct sigaction action {};
+  action.sa_sigaction = on_crash_signal;
+  action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+  sigemptyset(&action.sa_mask);
+  for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTERM, SIGHUP, SIGSYS}) sigaction(sig, &action, nullptr);
 #endif
   std::set_terminate(on_terminate);
   std::atexit([] { trace("进程调用 exit 退出"); });
+}
+
+void install_signal_stack() {
+#if !defined(_WIN32)
+  alignas(16) thread_local char stack[64 * 1024];
+  stack_t alternate{};
+  alternate.ss_sp = stack;
+  alternate.ss_size = sizeof(stack);
+  sigaltstack(&alternate, nullptr);
+#endif
 }
 
 void start_trace_heartbeat() {

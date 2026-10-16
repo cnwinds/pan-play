@@ -29,6 +29,8 @@
 #endif
 
 #if defined(PANPLAY_PS5)
+#include "ps5_thread.hpp"
+
 #include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
@@ -358,6 +360,8 @@ int main(int argc, char** argv) {
   panplay::install_crash_trace();
   panplay::trace("==== 盘游启动 pid " + std::to_string(getpid()) + "，参数 " + std::to_string(argc) + " 个，编译于 " +
                  __DATE__ + " " + __TIME__ + "，" + panplay::memory_summary());
+  panplay::trace("线程栈：系统默认 " + std::to_string(ps5_default_thread_stack() >> 10) + " KB，盘游改用 " +
+                 std::to_string(kPs5ThreadStack >> 10) + " KB");
   panplay::start_trace_heartbeat();
   // 载荷由 ELF 加载器启动，通常不带参数：直接开局域网界面。
   if (argc < 2) {

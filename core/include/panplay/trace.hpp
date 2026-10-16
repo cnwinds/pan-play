@@ -14,6 +14,9 @@ void trace(const std::string& message);
 // 收到崩溃信号、有未捕获的异常、调用 exit 时各记一行。被 SIGKILL 杀掉时记不下，只能看最后一行停在哪。
 void install_crash_trace();
 
+// 给当前线程装信号备用栈：线程栈溢出时，崩溃信号的处理也有地方跑。每个线程要各装一次。
+void install_signal_stack();
+
 // 后台定时记一行心跳和内存占用：开头两分钟每 5 秒一次，之后每分钟一次。
 void start_trace_heartbeat();
 

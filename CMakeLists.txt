@@ -83,6 +83,8 @@ if(PS5)
   set_target_properties(panplay PROPERTIES OUTPUT_NAME panplay.elf)
   target_compile_definitions(panplay PRIVATE PANPLAY_PS5)
   target_link_libraries(panplay PRIVATE SceNotification)
+  # 新线程改用 pc/src/ps5_thread.cpp 里的大栈。
+  target_link_options(panplay PRIVATE "LINKER:--wrap=pthread_create")
 endif()
 
 if(WIN32)
