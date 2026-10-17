@@ -1700,9 +1700,9 @@ body.drawer-open { overflow: hidden; }
   font-weight: 400;
 }
 
+/* 老版 WebKit（PS5 自带浏览器）里 fieldset 当不了 grid 容器，legend 会缩成一个字宽、竖着排。
+   fieldset 保持块级，legend 浮动占满一行，间距用外边距。 */
 .choice {
-  display: grid;
-  gap: 0.5rem;
   min-width: 0;
   margin: 0;
   padding: 0;
@@ -1710,11 +1710,17 @@ body.drawer-open { overflow: hidden; }
 }
 
 .choice legend {
-  margin-bottom: 0.5rem;
+  float: left;
+  width: 100%;
+  margin-bottom: 1rem;
   padding: 0;
   font-size: 0.9rem;
   font-weight: 500;
 }
+
+.choice legend + * { clear: both; }
+
+.choice > :not(legend) + :not(legend) { margin-top: 0.5rem; }
 
 .choices {
   display: grid;
