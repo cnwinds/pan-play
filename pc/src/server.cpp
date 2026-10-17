@@ -1816,6 +1816,24 @@ std::string lan_address() {
 
 }  // namespace
 
+// 在所有网卡上监听这个端口，失败返回 INVALID_SOCKET（errno 是原因）。
+static SOCKET open_listener(int port) {
+  SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (listener == INVALID_SOCKET) return INVALID_SOCKET;
+  panplay::set_listen_exclusive(listener);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<std::uint16_t>(port));
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(listener, 8) != 0) {
+    const int code = errno;
+    closesocket(listener);
+    errno = code;
+    return INVALID_SOCKET;
+  }
+  return listener;
+}
+
 int run_server(const ServerOptions& options) {
   const int port = options.port;
   on_quit = options.on_quit;
@@ -1856,15 +1874,9 @@ int run_server(const ServerOptions& options) {
     panplay::log_error("网络初始化失败: " + net_error);
     return 1;
   }
-  SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (listener == INVALID_SOCKET) panplay::log_error("创建监听套接字失败 errno " + std::to_string(errno));
-  panplay::set_listen_exclusive(listener);
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_port = htons(static_cast<std::uint16_t>(port));
-  address.sin_addr.s_addr = htonl(INADDR_ANY);
   PANPLAY_DEBUG("监听端口 " + std::to_string(port));
-  if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(listener, 8) != 0) {
+  SOCKET listener = open_listener(port);
+  if (listener == INVALID_SOCKET) {
     panplay::log_error("无法在端口 " + std::to_string(port) + " 监听，errno " + std::to_string(errno));
     return 1;
   }
@@ -1888,8 +1900,20 @@ int run_server(const ServerOptions& options) {
     panplay::socklen peer_length = sizeof(peer);
     SOCKET client = accept(listener, reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (client == INVALID_SOCKET) {
-      panplay::log_error("accept 失败 errno " + std::to_string(errno) + "，停止服务");
-      break;
+      const int code = errno;
+      if (code == EINTR || code == ECONNABORTED) continue;
+      // 主机休眠唤醒后监听套接字会坏掉（实测 errno 163）。照 PS5 上 ftpsrv 的做法关掉重开，网络恢复前一直重试，不退出。
+      panplay::log_warn("accept 失败 errno " + std::to_string(code) + "，3 秒后重新监听");
+      closesocket(listener);
+      for (int attempt = 1;; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        listener = open_listener(port);
+        if (listener != INVALID_SOCKET) break;
+        if (attempt % 20 == 1) panplay::log_warn("重新监听端口 " + std::to_string(port) + " 失败 errno " + std::to_string(errno) + "，继续重试");
+      }
+      const std::string address_now = lan_url();
+      panplay::log_info("已重新监听：局域网 " + (address_now.empty() ? std::string("（取不到地址）") : address_now));
+      continue;
     }
     const bool local_peer = peer.sin_family == AF_INET && (ntohl(peer.sin_addr.s_addr) >> 24) == 127;
     panplay::set_socket_timeout(client, 30000);
