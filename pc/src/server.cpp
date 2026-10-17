@@ -814,7 +814,8 @@ std::string console_json(const std::string& path, const std::string& game_dir) {
   }
   using panplay::json_escape;
   return "{\"title_id\":\"" + json_escape(title.title_id) + "\",\"registered\":" + (title.registered ? "true" : "false") +
-         ",\"mounted\":" + (title.mounted ? "true" : "false") + ",\"problem\":\"" + json_escape(title.problem) +
+         ",\"mounted\":" + (title.mounted ? "true" : "false") + ",\"files_ok\":" + (title.files_ok ? "true" : "false") +
+         ",\"problem\":\"" + json_escape(title.problem) +
          "\",\"error\":\"" + json_escape(error) + "\"}";
 }
 
@@ -829,7 +830,7 @@ void register_after_install(const std::string& path, bool files_changed) {
     remember_console_error(path, "");
     return;
   }
-  if (!files_changed && title.registered && title.mounted) return;
+  if (!files_changed && title.registered && title.mounted && title.files_ok) return;
   {
     std::lock_guard<std::mutex> lock(installs.mu);
     if (installs.current && installs.current->path == path) installs.current->result.message = "正在注册到主机桌面…";

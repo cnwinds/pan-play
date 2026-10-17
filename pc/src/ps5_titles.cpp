@@ -8,6 +8,7 @@
 
 #include <sys/mount.h>
 #include <sys/param.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -295,6 +296,34 @@ void remove_staged(const std::string& id) {
   }
 }
 
+// 旧版盘游在主机上装的游戏文件权限是 0644 之类，没有执行位，主机启动不了（新装的见 install_sink 的 open_up）。
+// 注册时把整个游戏目录补成 0777，和 FTP 传上来的一样。返回补了多少个。
+int open_up_tree(const std::string& game_dir) {
+  int changed = 0;
+  const auto fix = [&](const fs::path& path) {
+    struct stat st {};
+    if (::stat(path.string().c_str(), &st) == 0 && (st.st_mode & 0777) != 0777 && ::chmod(path.string().c_str(), 0777) == 0) ++changed;
+  };
+  const fs::path root = fs::u8path(game_dir);
+  fix(root);
+  std::error_code ec;
+  for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+    std::error_code entry_ec;
+    if (it->is_symlink(entry_ec)) {
+      it.disable_recursion_pending();
+      continue;
+    }
+    fix(it->path());
+  }
+  return changed;
+}
+
+bool eboot_runnable(const std::string& game_dir) {
+  struct stat st {};
+  const std::string eboot = game_dir + "/eboot.bin";
+  return ::stat(eboot.c_str(), &st) == 0 && (st.st_mode & 0005) == 0005;
+}
+
 // 读不到游戏自己的 Title ID 时（param.json 坏了、被删了），按 mount.lnk 找注册到这个目录的应用。
 std::string title_linked_to(const std::string& game_dir) {
   std::error_code ec;
@@ -343,6 +372,7 @@ ConsoleTitle inspect_console_title(const std::string& game_dir) {
   const bool pending = fs::exists(pending_path(id), ec);
   title.registered = known && !pending && same_place(read_link(id), game_dir);
   title.mounted = mounted_from(id, game_dir);
+  title.files_ok = eboot_runnable(game_dir);
   if (foreign_title(id)) title.problem = "主机上已经有这个游戏（正式版或别的工具装的），不能再注册这个目录";
   else if (shadowmount_running()) title.problem = "ShadowMountPlus 在运行，注册交给它；想让盘游来管，先停掉它";
   return title;
@@ -366,6 +396,9 @@ std::string register_console_title(const std::string& game_dir) {
     std::error_code ec;
     fs::create_directories(app_dir(id), ec);
     if (ec) return "建不了 " + app_dir(id) + "：" + ec.message();
+    if (const int fixed = open_up_tree(game_dir); fixed > 0) {
+      panplay::log_info("补上了 " + std::to_string(fixed) + " 个文件、目录的权限：" + game_dir);
+    }
     // mount.lnk 和标记最先写：中途出错、断电时也认得出是盘游的、算没注册上，删除时能清理干净。
     if (!write_text(pending_path(id), "1")) return "写不进 " + pending_path(id);
     if (!write_text(link_path(id), game_dir)) return "写不进 " + link_path(id);

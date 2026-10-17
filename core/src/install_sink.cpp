@@ -17,15 +17,31 @@
 #include <thread>
 #include <vector>
 
+#if defined(PANPLAY_PS5)
+#include <sys/stat.h>
+#endif
+
 namespace panplay {
 
 bool login_ftp(SOCKET control, LineReader* reader, const FtpEndpoint& endpoint, std::string* error);
 
 namespace {
 
+// PS5 上游戏进程和盘游不是同一个用户，eboot.bin、sce_module 里的 prx 还要有执行位，否则主机提示「无法开始此游戏」。
+// 和 PS5 上的 FTP 服务端（ftpsrv）一样，目录和文件一律 0777。直接调 chmod：libc++ 的 permissions 可能用到主机上没有的调用。
+void open_up(const std::filesystem::path& path) {
+#if defined(PANPLAY_PS5)
+  ::chmod(path.string().c_str(), 0777);
+#else
+  (void)path;
+#endif
+}
+
 class LocalWriter final : public FileWriter {
  public:
-  explicit LocalWriter(const std::filesystem::path& path) : out_(path, std::ios::binary | std::ios::trunc) {}
+  explicit LocalWriter(const std::filesystem::path& path) : out_(path, std::ios::binary | std::ios::trunc) {
+    if (out_) open_up(path);
+  }
   bool ok() const { return static_cast<bool>(out_); }
 
   std::string write(const std::uint8_t* data, std::size_t size) override {
@@ -66,6 +82,11 @@ class LocalSink : public InstallSink {
     if (!storage_path(root_, path, &local, &error)) return error;
     std::filesystem::create_directories(local);
     if (!std::filesystem::is_directory(local)) return "无法创建目录";
+    // create_directories 顺带建出的上级目录也要放开，一直到存放位置为止。
+    const std::filesystem::path root = root_.lexically_normal();
+    for (std::filesystem::path dir = local.lexically_normal(); dir != root && dir.has_relative_path(); dir = dir.parent_path()) {
+      open_up(dir);
+    }
     return "";
   }
 
@@ -191,6 +212,7 @@ class LocalSink : public InstallSink {
     if (!storage_path(root_, path, &local, &error)) return error;
     std::ofstream out(local, std::ios::binary | (append ? std::ios::app : std::ios::trunc));
     if (!out) return "无法写入";
+    open_up(local);
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
     if (!out) return "写入中断";
     return "";

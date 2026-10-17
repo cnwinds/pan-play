@@ -11,6 +11,7 @@ struct ConsoleTitle {
   std::string title_id;     // 从游戏的 sce_sys/param.json 读，读不到时为空
   bool registered = false;  // 主机上有这个应用，且 mount.lnk 指向这个游戏目录
   bool mounted = false;     // 游戏目录正挂在 /system_ex/app/<ID>
+  bool files_ok = true;     // eboot.bin 别的用户能读、能执行；旧版盘游装的游戏缺执行位，主机会提示无法开始
   std::string problem;      // 不能注册的原因，能注册时为空
 };
 
