@@ -14,6 +14,13 @@ struct DriveSettings {
   std::map<std::string, std::string> values;
 };
 
+// RAR / 7z 解压时整个字典要放进内存，字典超过这个大小（MB）的压缩包不装。0 是不限制。
+#if defined(PANPLAY_PS5)
+constexpr std::uint64_t kDefaultMaxDictionaryMb = 512;
+#else
+constexpr std::uint64_t kDefaultMaxDictionaryMb = 4096;
+#endif
+
 struct AppSettings {
   std::string drive;
   std::map<std::string, DriveSettings> drives;
@@ -26,6 +33,7 @@ struct AppSettings {
   // 局域网里别的设备能不能打开界面，以及要不要访问口令。家里内网用，默认开着、不要口令。
   bool lan_access = true;
   bool require_code = false;
+  std::uint64_t max_dictionary_mb = kDefaultMaxDictionaryMb;
 
   DriveSettings current_drive() const;
   std::string library_path() const { return current_drive().library_path; }

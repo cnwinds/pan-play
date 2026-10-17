@@ -40,6 +40,8 @@ struct InstallRequest {
   PrefetchOptions prefetch;
   // 用户选了不装的压缩包组（按 archive_set_id）。是否已安装、有没有更新也只看没跳过的。
   std::set<std::string> skip_sets;
+  // RAR / 7z 的字典超过这么多字节就拒绝安装，0 是不限制。
+  std::uint64_t max_dictionary = 0;
 };
 
 struct Destination {
@@ -79,6 +81,8 @@ struct RarExtract {
   std::function<void(bool already)> on_entry;
   // 已读到整组分卷的第几个字节。
   std::function<void(std::int64_t archive_bytes)> on_bytes;
+  // 字典超过这么多字节就在解压前停下，0 是不限制。
+  std::uint64_t max_dictionary = 0;
 };
 
 // 一遍读完整组分卷：全部解压到暂存区，同时把压缩包里的条目按原路径记到 listed。
@@ -122,8 +126,10 @@ struct SevenZipArchive {
   std::vector<SevenZipFolder> folders;
 };
 
-// 只读包头和包尾的目录。用了这一版不支持的压缩方法、加了密码、字典超过主机内存时直接报错，不开始下载。
-std::string read_7z_archive(DrivePlugin& drive, const std::vector<DriveEntry>& parts, SevenZipArchive* archive);
+// 只读包头和包尾的目录。用了这一版不支持的压缩方法、加了密码、字典超过 max_dictionary 字节（0 不限制）时
+// 直接报错，不开始下载。
+std::string read_7z_archive(DrivePlugin& drive, const std::vector<DriveEntry>& parts, SevenZipArchive* archive,
+                            std::uint64_t max_dictionary = 0);
 
 struct SevenZipExtract {
   std::string staging_root;
@@ -154,6 +160,10 @@ bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const s
 std::vector<std::string> installed_sets(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 // 删掉没装完的游戏留在暂存区的全部文件，之后只能从头装。已经装好的游戏不受影响。
 std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
+// 从存放位置删掉这个游戏的整个文件夹，连同没装完时留下的暂存文件。
+std::string uninstall_game(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
+// 游戏装在存放位置下的哪个文件夹（Title ID，没有时用目录名）。目录名不能用作文件夹时为空。
+std::string install_folder_name(const std::string& source_dir);
 bool parse_destination(const std::string& text, Destination* destination, std::string* error);
 std::unique_ptr<InstallSink> open_destination(const Destination& destination, std::string* error);
 

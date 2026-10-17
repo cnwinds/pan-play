@@ -53,6 +53,9 @@ void read_current(const panplay::Json& json, AppSettings* settings) {
   if (!json.str("ftp_dir").empty()) settings->ftp_dir = json.str("ftp_dir");
   settings->lan_access = json.boolean_or("lan_access", true);
   settings->require_code = json.boolean_or("require_code", false);
+  if (json.get("max_dictionary_mb") != nullptr && json.num("max_dictionary_mb") >= 0) {
+    settings->max_dictionary_mb = static_cast<std::uint64_t>(json.num("max_dictionary_mb"));
+  }
 }
 
 // 版本 1 只有百度一个插件；存放位置是一个地址加主机目录，本机目录也会再套一层主机目录。
@@ -340,7 +343,7 @@ std::string save_settings(const AppSettings& settings) {
           "\",\"ftp_host\":\"" + json_escape(settings.ftp_host) + "\",\"ftp_port\":\"" + json_escape(settings.ftp_port) +
           "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) + "\",\"lan_access\":" +
           (settings.lan_access ? "true" : "false") + ",\"require_code\":" + (settings.require_code ? "true" : "false") +
-          "}";
+          ",\"max_dictionary_mb\":" + std::to_string(settings.max_dictionary_mb) + "}";
   const std::filesystem::path path = settings_file_path();
   std::filesystem::path tmp = path;
   tmp += ".tmp";

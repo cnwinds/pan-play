@@ -1,4 +1,5 @@
 #include "panplay/install.hpp"
+#include "panplay/trace.hpp"
 
 #include "install_common.hpp"
 
@@ -36,13 +37,6 @@ constexpr std::uint32_t kArmt = 0x3030701;
 constexpr std::uint32_t kSparc = 0x3030805;
 constexpr std::uint32_t kArm64 = 0xA;
 constexpr std::uint32_t kRiscv = 0xB;
-
-#if defined(PANPLAY_PS5)
-// 主机上留给安装的内存有限，字典再大就分配不出来。
-constexpr std::uint64_t kMaxDictionary = 128ull << 20;
-#else
-constexpr std::uint64_t kMaxDictionary = 0;
-#endif
 
 constexpr const char kRepack[] = "；请用 7-Zip 默认设置重新压缩，或换成 ZIP / RAR";
 
@@ -293,11 +287,6 @@ std::string read_folder(const CSzArEx& db, std::uint32_t index, SevenZipFolder* 
   if (out->method == kLzma2 && (out->props.size() != 1 || out->props[0] > 40)) return "7z 目录损坏";
   out->has_crc = SzBitWithVals_Check(&ar.FolderCRCs, index);
   if (out->has_crc) out->crc = ar.FolderCRCs.Vals[index];
-
-  if (kMaxDictionary > 0 && needed_dictionary(*out) > kMaxDictionary) {
-    return "这个 7z 用了 " + std::to_string(needed_dictionary(*out) >> 20) + " MB 的字典，主机内存不够解压；请用不超过 " +
-           std::to_string(kMaxDictionary >> 20) + " MB 的字典重新压缩，或换成 ZIP / RAR";
-  }
   return "";
 }
 
@@ -579,7 +568,8 @@ bool cancelled(const CancelToken* cancel) { return cancel != nullptr && cancel->
 
 bool is_unsupported_7z_error(const std::string& message) { return message.rfind("这个 7z ", 0) == 0; }
 
-std::string read_7z_archive(DrivePlugin& drive, const std::vector<DriveEntry>& parts, SevenZipArchive* archive) {
+std::string read_7z_archive(DrivePlugin& drive, const std::vector<DriveEntry>& parts, SevenZipArchive* archive,
+                            std::uint64_t max_dictionary) {
   init_crc_table();
   *archive = SevenZipArchive{};
   const std::vector<ArchiveVolume> volumes = archive_volumes(parts);
@@ -610,6 +600,12 @@ std::string read_7z_archive(DrivePlugin& drive, const std::vector<DriveEntry>& p
     error = copy_archive(db, archive);
   }
   SzArEx_Free(&db, &kAlloc);
+  if (error.empty()) {
+    std::uint64_t largest = 0;
+    for (const auto& folder : archive->folders) largest = std::max(largest, needed_dictionary(folder));
+    trace("7z 字典 " + std::to_string(largest >> 20) + " MB，解压需要这么多内存");
+    if (max_dictionary > 0 && largest > max_dictionary) error = dictionary_refusal("7z", largest, max_dictionary);
+  }
   if (!error.empty()) *archive = SevenZipArchive{};
   return error;
 }

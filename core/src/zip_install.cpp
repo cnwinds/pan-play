@@ -512,6 +512,15 @@ std::string discard_install(InstallSink& sink, const std::string& dest_prefix, c
   return "";
 }
 
+std::string uninstall_game(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
+  const std::string folder = install_folder(source_dir);
+  if (folder.empty() || folder.rfind(".panplay", 0) == 0) return "游戏目录名不能作为存放目录";
+  if (auto error = discard_install(sink, dest_prefix, source_dir); !error.empty()) return error;
+  return sink.remove_tree(join_storage_path(dest_prefix, folder));
+}
+
+std::string install_folder_name(const std::string& source_dir) { return install_folder(source_dir); }
+
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request) {
   InstallResult result;
   const std::string folder = install_folder(request.source_dir);
@@ -602,7 +611,8 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     if (source.rar) continue;
     source.volumes = archive_volumes(source.set->parts);
     if (source.sevenzip) {
-      if (auto seven_error = read_7z_archive(drive, source.set->parts, &source.seven); !seven_error.empty()) {
+      if (auto seven_error = read_7z_archive(drive, source.set->parts, &source.seven, request.max_dictionary);
+          !seven_error.empty()) {
         return fail(seven_error);
       }
       for (std::size_t k = 0; k < source.seven.files.size(); ++k) {
@@ -726,6 +736,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       options.cancel = request.cancel;
       options.prefetch = request.prefetch;
       options.staging_prefix = source.prefix;
+      options.max_dictionary = request.max_dictionary;
       options.on_file_done = [&](const std::vector<FinishedFile>& now_done) {
         result.files_done = static_cast<int>(now_done.size());
         report(phase);

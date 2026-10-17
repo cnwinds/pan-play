@@ -58,7 +58,7 @@ PS5 上要开着 FTP 服务，建议用 [zftpd](https://github.com/seregonwar/zf
 
 出了新补丁，再加一个子文件夹，打开游戏详情点「安装更新」即可，主游戏不会重下。
 
-7z 请用 7-Zip 默认设置压缩，加了密码或用了 PPMd、BCJ2 的装不了。更多细节见 [网盘游戏目录整理指南](docs/game-folder-guide.md)。
+7z 请用 7-Zip 默认设置压缩，加了密码或用了 PPMd、BCJ2 的装不了。RAR 和 7z 解压时整个字典都要放进内存，字典超过设置里「解压」上限（默认 PC 4 GB、PS5 512 MB）的包会被拒绝并说明原因。更多细节见 [网盘游戏目录整理指南](docs/game-folder-guide.md)。
 
 ## 其他
 

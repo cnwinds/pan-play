@@ -451,6 +451,36 @@ async function pollMeta() {
   scheduleMetaPoll(false);
 }
 
+function formatDuration(seconds) {
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 1) return "不到 1 分钟";
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return minutes % 60 ? `${hours} 小时 ${minutes % 60} 分` : `${hours} 小时`;
+  return hours % 24 ? `${Math.floor(hours / 24)} 天 ${hours % 24} 小时` : `${Math.floor(hours / 24)} 天`;
+}
+
+// 预计几点装完：今天只写时刻，之后的写上哪天。
+function finishClock(seconds) {
+  const at = new Date(Date.now() + seconds * 1000);
+  const clock = at.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const day = new Date(at);
+  day.setHours(0, 0, 0, 0);
+  const days = Math.round((day - today) / 86400000);
+  if (days === 0) return clock;
+  if (days === 1) return `明天 ${clock}`;
+  if (days === 2) return `后天 ${clock}`;
+  return `${at.getMonth() + 1} 月 ${at.getDate()} 日 ${clock}`;
+}
+
+// 正在解压时的平均速度和剩余时间；刚开始几秒还没算出来时没有。
+function taskPace(task) {
+  if (!task || task.state !== "running" || task.message !== "正在安装" || !(task.speed > 0)) return null;
+  return { speed: formatBytes(task.speed) + "/s", left: task.eta >= 0 ? task.eta : null };
+}
+
 function jobText(current) {
   if (current.state === "queued") return `排队中，第 ${queuePosition(current.path)} 个`;
   if (current.state === "running") {
@@ -458,10 +488,18 @@ function jobText(current) {
     if (current.message === "正在收尾") return `正在收尾，共 ${current.files_total} 个文件`;
     if (current.message === "正在核对") return `核对已装文件 ${current.files_checked} / ${current.files_to_check}`;
     if (current.bytes_total > 0 && current.message === "正在安装") {
-      return `已处理 ${formatBytes(current.bytes_done)} / ${formatBytes(current.bytes_total)} · ${current.files_done} 个文件`;
+      const parts = [`${formatBytes(current.bytes_done)} / ${formatBytes(current.bytes_total)}`];
+      const pace = taskPace(current);
+      if (pace) parts.push(`平均 ${pace.speed}`);
+      if (pace && pace.left !== null) parts.push(`剩余 ${formatDuration(pace.left)}`);
+      else parts.push(`${current.files_done} 个文件`);
+      return parts.join(" · ");
     }
     if (current.files_total > 0) return `已装 ${current.files_done} / ${current.files_total} 个文件`;
     return current.message || "正在读取压缩包…";
+  }
+  if (current.status === "installed" && current.speed > 0 && current.elapsed > 0) {
+    return `${current.message || "安装完成"} · 用时 ${formatDuration(current.elapsed)} · 平均 ${formatBytes(current.speed)}/s`;
   }
   if (current.message) return current.message;
   if (current.status === "installed" || current.status === "already") return "安装完成";
@@ -545,10 +583,9 @@ async function queueAction(path, body) {
   }
 }
 
-// 删掉没装完的游戏已经写进存放位置的文件。成功返回空，取消或失败返回原因。
-async function discardInstall(game) {
-  if (!window.confirm(`删除「${displayName(game)}」已经装了一部分的文件？\n删除后再装要从头开始。`)) return "cancelled";
-  const error = await queueAction("/api/discard", { path: game.path });
+// endpoint 是 /api/discard（删掉没装完的文件）或 /api/uninstall（删掉装好的整个游戏）。成功返回空，失败返回原因。
+async function removeInstall(game, endpoint) {
+  const error = await queueAction(endpoint, { path: game.path });
   if (error) return error;
   for (const item of games) {
     if (item.path !== game.path) continue;
@@ -556,8 +593,14 @@ async function discardInstall(game) {
     paintTile(item);
   }
   game.state = "install";
+  for (const layer of game.layers || []) layer.installed = false;
   loadGames();
   return "";
+}
+
+async function discardInstall(game) {
+  if (!window.confirm(`删除「${displayName(game)}」已经装了一部分的文件？\n删除后再装要从头开始。`)) return "cancelled";
+  return removeInstall(game, "/api/discard");
 }
 
 // skip 是选了不装的压缩包组；不传时沿用上次的选择。
@@ -606,6 +649,8 @@ function paintDock() {
   dock.dataset.state = summary.state;
   dockTitle.textContent = displayName(summary.head);
   dockStatus.textContent = summary.text;
+  const pace = taskPace(running);
+  dockStatus.title = pace && pace.left !== null ? `平均 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : "";
   const artKey = summary.head.path + "\n" + (summary.head.cover_url || "");
   if (dockArtKey !== artKey) {
     dockArtKey = artKey;
@@ -907,6 +952,92 @@ function resumeProgress(game, task) {
   return { done: Math.min(done, total || done), total, files };
 }
 
+// 详情里的删除确认，替换掉安装按钮那一行。有几步就要点几次；多步时最后一步的按钮先锁一会儿，
+// 免得连点两下直接删掉。
+function buildConfirm() {
+  const panel = el("div", "confirm");
+  panel.hidden = true;
+  panel.setAttribute("role", "group");
+  const top = el("div", "confirm-top");
+  const head = el("p", "confirm-head");
+  const steps = el("span", "confirm-steps");
+  steps.setAttribute("role", "img");
+  top.append(head, steps);
+  const body = el("div", "confirm-body");
+  const actions = el("div", "confirm-actions");
+  const back = el("button", "btn quiet", "取消");
+  back.type = "button";
+  const go = el("button", "btn danger");
+  go.type = "button";
+  actions.append(back, go);
+  panel.append(top, body, actions);
+  let flow = null;
+  let index = 0;
+  let armTimer = 0;
+
+  const showStep = () => {
+    const step = flow.steps[index];
+    const final = flow.steps.length > 1 && index === flow.steps.length - 1;
+    head.textContent = step.head;
+    body.replaceChildren(...step.body);
+    steps.hidden = flow.steps.length < 2;
+    steps.replaceChildren(...flow.steps.map((_, i) => el("i", i <= index ? "on" : "")));
+    steps.setAttribute("aria-label", `第 ${index + 1} 步，共 ${flow.steps.length} 步`);
+    panel.dataset.final = String(final);
+    go.textContent = step.button;
+    go.classList.remove("arming");
+    window.clearTimeout(armTimer);
+    go.disabled = final;
+    if (final) {
+      back.focus();
+      void go.offsetWidth;
+      go.classList.add("arming");
+      armTimer = window.setTimeout(() => { go.disabled = false; }, 1200);
+    }
+  };
+  const close = () => {
+    window.clearTimeout(armTimer);
+    flow = null;
+    panel.hidden = true;
+    go.classList.remove("arming");
+    back.disabled = false;
+  };
+  go.addEventListener("click", async () => {
+    if (index < flow.steps.length - 1) {
+      index += 1;
+      showStep();
+      return;
+    }
+    const current = flow;
+    go.disabled = true;
+    back.disabled = true;
+    go.classList.remove("arming");
+    go.textContent = current.busy;
+    await current.onConfirm();
+    if (flow === current) close();
+  });
+  back.addEventListener("click", () => {
+    const after = flow && flow.onCancel;
+    close();
+    if (after) after();
+  });
+  return {
+    panel,
+    get open() { return flow !== null; },
+    get busy() { return back.disabled; },
+    ask(options) {
+      flow = options;
+      index = 0;
+      panel.hidden = false;
+      back.disabled = false;
+      showStep();
+      back.focus();
+    },
+    cancel() { back.click(); },
+    close,
+  };
+}
+
 function openDetail(game, opener) {
   closeDetail();
   detailOverlay.hidden = false;
@@ -932,6 +1063,10 @@ function openDetail(game, opener) {
   const action = el("button", "btn primary");
   action.type = "button";
   const progress = el("div", "progress");
+  const progressTop = el("div", "progress-top");
+  const progressPct = el("span", "progress-pct num");
+  const progressEta = el("span", "progress-eta");
+  progressTop.append(progressPct, progressEta);
   const progressRow = el("div", "progress-row");
   const progressText = el("span");
   progressText.setAttribute("role", "status");
@@ -940,7 +1075,7 @@ function openDetail(game, opener) {
   progressRow.append(progressText, cancel);
   const meter = el("span", "meter");
   meter.append(el("span"));
-  progress.append(meter, progressRow);
+  progress.append(progressTop, meter, progressRow);
   const resume = el("div", "progress resume");
   const resumeMeter = el("span", "meter");
   resumeMeter.append(el("span"));
@@ -961,8 +1096,14 @@ function openDetail(game, opener) {
   const discard = el("button", "btn discard", "删除");
   discard.type = "button";
   discard.title = "删除已经装了一部分的文件，之后要从头装";
+  const remove = el("button", "btn discard", "删除");
+  remove.type = "button";
+  remove.title = "从存放位置删除这个游戏";
   const actionRow = el("div", "action-row");
-  actionRow.append(action, discard);
+  actionRow.append(action, discard, remove);
+  const confirm = buildConfirm();
+  // 删除成功后的一句提示；队列里有这款游戏的结果时以队列为准。
+  let notice = "";
   const adjust = el("button", "text-link", "调整要装的补丁");
   adjust.type = "button";
   // picking：选择面板开着；waitingLayers：点了安装但压缩包列表还没读到，读到后再决定要不要先选。
@@ -971,6 +1112,7 @@ function openDetail(game, opener) {
   const picker = buildLayerPicker((skip) => {
     picking = false;
     status.hidden = true;
+    notice = "";
     startInstall(game, skip);
     paint();
   }, () => {
@@ -978,7 +1120,7 @@ function openDetail(game, opener) {
     paint();
     action.focus();
   });
-  install.append(actionRow, picker.panel, adjust, resume, progress, queueRow, status);
+  install.append(actionRow, confirm.panel, picker.panel, adjust, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1069,9 +1211,11 @@ function openDetail(game, opener) {
       picking = false;
       picker.close();
     }
-    actionRow.hidden = picking;
+    if (confirm.open && !confirm.busy && (running || queued)) confirm.close();
+    actionRow.hidden = picking || confirm.open;
     discard.hidden = game.state !== "continue" || running || queued;
-    adjust.hidden = picking || game.state !== "installed" || running || queued || (game.layers || []).length < 2;
+    remove.hidden = !["installed", "update"].includes(game.state) || running || queued;
+    adjust.hidden = picking || confirm.open || game.state !== "installed" || running || queued || (game.layers || []).length < 2;
     const last = picking ? null : resumeProgress(game, task);
     resume.hidden = !last;
     if (last) {
@@ -1085,6 +1229,11 @@ function openDetail(game, opener) {
       progressText.textContent = jobText(task);
       meter.style.setProperty("--p", taskFraction(task));
       cancel.disabled = task.message === "正在取消…";
+      const pace = taskPace(task);
+      progressTop.hidden = !taskStarted(task);
+      progressPct.textContent = Math.round(taskFraction(task) * 100) + "%";
+      progressEta.textContent = pace && pace.left !== null ? `预计 ${finishClock(pace.left)} 装完` : "";
+      progressEta.title = pace ? `从开始解压算的平均速度 ${pace.speed}` : "";
     }
     queueRow.hidden = !queued;
     if (queued) {
@@ -1092,9 +1241,11 @@ function openDetail(game, opener) {
       first.hidden = position <= 1;
     }
     const finished = task && task.state === "done";
-    status.hidden = !finished;
+    if (running || queued) notice = "";
+    status.hidden = !finished && !notice;
     status.className = "status-text" + (finished && settledState(task) !== "installed" ? " warn" : "");
     if (finished) status.textContent = jobText(task);
+    else if (notice) status.textContent = notice;
 
     desc.textContent = game.description || "";
     desc.hidden = !game.description;
@@ -1136,6 +1287,7 @@ function openDetail(game, opener) {
       return;
     }
     status.hidden = true;
+    notice = "";
     startInstall(game);
   };
   action.addEventListener("click", () => {
@@ -1183,15 +1335,49 @@ function openDetail(game, opener) {
     }, 2000);
   });
   cancel.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
-  discard.addEventListener("click", async () => {
-    discard.disabled = true;
+  const removeWith = (endpoint, done, focusAfter) => async () => {
+    const error = await removeInstall(game, endpoint);
+    if (!detail || detail.game !== game) return;
+    confirm.close();
+    notice = error ? "" : done;
+    paint();
+    if (error) detail.fail(error);
+    else reload();
+    (error ? focusAfter : action).focus();
+  };
+  const askRemove = (steps, endpoint, done, focusAfter) => {
     status.hidden = true;
-    const error = await discardInstall(game);
-    discard.disabled = false;
-    if (detail && detail.game === game) {
-      if (error && error !== "cancelled") detail.fail(error);
-      else paint();
-    }
+    confirm.ask({
+      steps,
+      busy: "正在删除…",
+      onConfirm: removeWith(endpoint, done, focusAfter),
+      onCancel: () => {
+        paint();
+        focusAfter.focus();
+      },
+    });
+    paint();
+  };
+  discard.addEventListener("click", () => {
+    askRemove([{
+      head: "删除已经装了一部分的文件？",
+      body: [el("p", "", "删除后再装要从头开始。")],
+      button: "删除",
+    }], "/api/discard", "已删除没装完的文件。", discard);
+  });
+  remove.addEventListener("click", () => {
+    const where = (game.install_dir || "").trim();
+    const first = [el("p", "", "会删掉存放位置里这个游戏的整个文件夹：")];
+    if (where) first.push(el("code", "confirm-path", where));
+    const size = game.archive_bytes ? `（压缩包 ${formatBytes(game.archive_bytes)}）` : "";
+    askRemove([
+      { head: `删除「${displayName(game)}」？`, body: first, button: "删除" },
+      {
+        head: "再确认一次",
+        body: [el("p", "", `删除后不能恢复，想再玩要从网盘重新下载安装${size}。`)],
+        button: "确认删除",
+      },
+    ], "/api/uninstall", "已从存放位置删除。", remove);
   });
   first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));
   leave.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
@@ -1235,6 +1421,12 @@ function openDetail(game, opener) {
       status.hidden = false;
       status.className = "status-text warn";
       status.textContent = message;
+    },
+    // Esc 先关掉删除确认，再关详情。
+    escape() {
+      if (!confirm.open || confirm.busy) return confirm.busy;
+      confirm.cancel();
+      return true;
     },
   };
   paint();
@@ -1302,7 +1494,9 @@ function buildRenameForm(game, onSaved) {
 $("#detail-backdrop").addEventListener("click", closeDetail);
 $("#detail-close").addEventListener("click", closeDetail);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !detailOverlay.hidden) closeDetail();
+  if (event.key !== "Escape" || detailOverlay.hidden) return;
+  if (detail && detail.escape()) return;
+  closeDetail();
 });
 
 /* 登录 */
@@ -1448,6 +1642,9 @@ function summarizeSettings() {
   } else {
     setTabStatus("target", "还没选保存方式", "warn");
   }
+
+  const dictionary = chosenDictionary();
+  setTabStatus("unpack", dictionary ? `字典上限 ${dictionaryText(dictionary)}` : "字典不限制", dictionary ? "ok" : "warn");
 }
 
 let catalogTimer = 0;
@@ -1512,6 +1709,52 @@ function renderDriveChoices(drives) {
   }
 }
 
+/* 解压：字典上限，0 是不限制 */
+
+const dictionaryPresets = [128, 256, 512, 1024, 2048, 4096, 8192, 0];
+let defaultDictionary = 0;
+
+function dictionaryText(mb) {
+  if (!mb) return "不限制";
+  return mb >= 1024 && mb % 1024 === 0 ? `${mb / 1024} GB` : `${mb} MB`;
+}
+
+function chosenDictionary() {
+  const checked = form.querySelector('input[name="max_dictionary_mb"]:checked');
+  return checked ? Number(checked.value) : defaultDictionary;
+}
+
+function paintDictionaryNote() {
+  const mb = chosenDictionary();
+  const text = mb
+    ? `字典超过 ${dictionaryText(mb)} 的 RAR / 7z 不装。WinRAR 默认字典 32 MB，7-Zip 最高压缩 64 MB，大多数游戏包都在这以内。`
+    : "再大的字典也照装。内存不够时会在解压中途失败，主机也可能变卡。";
+  $("#dict-note").textContent = `${text}带圆点的 ${dictionaryText(defaultDictionary)} 是这台设备的默认值。`;
+}
+
+function renderDictionary(value, fallback) {
+  defaultDictionary = fallback;
+  const values = [...dictionaryPresets];
+  if (!values.includes(value)) values.splice(values.findIndex((mb) => !mb || mb > value), 0, value);
+  const box = $("#dict-scale");
+  box.replaceChildren(...values.map((mb) => {
+    const option = el("label", "scale-step");
+    const radio = el("input");
+    radio.type = "radio";
+    radio.name = "max_dictionary_mb";
+    radio.value = String(mb);
+    radio.checked = mb === value;
+    radio.addEventListener("change", paintDictionaryNote);
+    option.append(radio, el("span", "num", dictionaryText(mb)));
+    if (mb === fallback) {
+      option.dataset.default = "";
+      option.title = "这台设备的默认值";
+    }
+    return option;
+  }));
+  paintDictionaryNote();
+}
+
 function renderTarget(mode) {
   for (const radio of form.querySelectorAll('input[name="target"]')) radio.checked = radio.value === mode;
   for (const group of form.querySelectorAll("[data-target]")) group.hidden = group.dataset.target !== mode;
@@ -1535,6 +1778,7 @@ async function loadSettings() {
   form.elements.local_dir.placeholder = targets.includes("ftp") ? "D:\\PS5 游戏" : "/data/homebrew";
   for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) form.elements[name].value = settings[name] || "";
   renderTarget(settings.target);
+  renderDictionary(settings.max_dictionary_mb ?? settings.default_dictionary_mb, settings.default_dictionary_mb);
   summarizeSettings();
   await Promise.all([loadAccess(), loadCatalogStatus()]);
 }
@@ -1616,6 +1860,7 @@ form.addEventListener("submit", async (event) => {
     target: form.querySelector('input[name="target"]:checked')?.value || "",
   };
   for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) body[name] = form.elements[name].value;
+  body.max_dictionary_mb = chosenDictionary();
   settingsNote.classList.remove("error");
   try {
     await api("/api/settings", body);

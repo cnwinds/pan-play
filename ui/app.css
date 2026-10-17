@@ -772,6 +772,26 @@ body.drawer-open { overflow: hidden; }
 
 .progress-row .link:hover { color: var(--danger); }
 
+.progress-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.progress-pct {
+  font-size: 1.55rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.01em;
+}
+
+.progress-eta {
+  color: var(--muted);
+  font-size: 0.84rem;
+  white-space: nowrap;
+}
+
 .action-row {
   display: flex;
   gap: 0.6rem;
@@ -796,6 +816,115 @@ body.drawer-open { overflow: hidden; }
   border-color: rgba(255, 138, 122, 0.55);
   background: rgba(255, 138, 122, 0.08);
   color: var(--danger);
+}
+
+.btn.danger {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(255, 138, 122, 0.45);
+  background: rgba(255, 138, 122, 0.1);
+  color: var(--danger);
+}
+
+.btn.danger:hover:not(:disabled) {
+  border-color: rgba(255, 138, 122, 0.7);
+  background: rgba(255, 138, 122, 0.18);
+}
+
+/* 删除确认：替换安装按钮那一行，多步时最后一步换成实心按钮，锁住的那一会儿遮罩从左往右退开 */
+.confirm {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem 1.1rem 1.05rem;
+  border: 1px solid rgba(255, 138, 122, 0.26);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(255, 138, 122, 0.07), rgba(255, 138, 122, 0.015) 70%), var(--deck);
+  animation: confirm-in 0.18s ease-out;
+}
+
+.confirm-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.confirm-head {
+  min-width: 0;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.confirm-steps {
+  display: flex;
+  flex: none;
+  gap: 4px;
+}
+
+.confirm-steps i {
+  width: 16px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+  transition: background-color 0.2s;
+}
+
+.confirm-steps i.on { background: var(--danger); }
+
+.confirm-body {
+  display: grid;
+  gap: 0.45rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.confirm-path {
+  display: block;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--night);
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+}
+
+.confirm-actions .btn { min-width: 96px; }
+
+.confirm[data-final="true"] .btn.danger {
+  border-color: transparent;
+  background: #df5f4f;
+  color: #fff;
+}
+
+.confirm[data-final="true"] .btn.danger:hover:not(:disabled) { background: #ea6e5e; }
+
+.btn.danger.arming:disabled { opacity: 1; cursor: wait; }
+
+.btn.danger.arming::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 14, 22, 0.45);
+  transform-origin: right;
+  animation: confirm-arm 1.2s linear forwards;
+}
+
+@keyframes confirm-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes confirm-arm {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
 }
 
 .install .text-link {
@@ -1637,6 +1766,71 @@ body.drawer-open { overflow: hidden; }
 }
 
 .field-row input { min-width: 0; }
+
+/* 字典上限：一排刻度，默认值下面标一个小点 */
+.scale {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--night);
+}
+
+.scale-step {
+  position: relative;
+  cursor: pointer;
+}
+
+.scale-step input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.scale-step span {
+  display: block;
+  padding: 0.5rem 0.85rem 0.6rem;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  white-space: nowrap;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.scale-step:hover span { color: var(--text); }
+
+.scale-step input:checked + span {
+  background: rgba(77, 139, 255, 0.16);
+  color: var(--signal-hi);
+  box-shadow: 0 0 0 1px rgba(77, 139, 255, 0.45) inset;
+}
+
+.scale-step input:focus-visible + span { outline: 2px solid var(--signal-hi); outline-offset: 1px; }
+
+.scale-step[data-default]::after {
+  content: "";
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.scale-step[data-default]:has(input:checked)::after { background: var(--signal-hi); }
+
+.scale-note {
+  max-width: 580px;
+  margin-top: 0.15rem;
+  color: var(--faint);
+  font-size: 0.82rem;
+}
 
 @media (max-width: 760px) {
   .bar-inner {

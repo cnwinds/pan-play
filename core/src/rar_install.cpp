@@ -429,6 +429,10 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       largest_dictionary = dictionary;
       trace("RAR 字典 " + std::to_string(dictionary >> 20) + " MB" + (solid ? "（固实）" : "") + "，解压需要这么多内存");
     }
+    if (options.max_dictionary > 0 && dictionary > options.max_dictionary) {
+      failure = dictionary_refusal("RAR", dictionary, options.max_dictionary);
+      break;
+    }
     writer.out.reset();
     writer.interrupted = false;
     writer.error.clear();

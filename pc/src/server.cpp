@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -86,7 +87,9 @@ std::string settings_json(const AppSettings& settings) {
   const auto modes = target_modes();
   for (std::size_t i = 0; i < modes.size(); ++i) json += (i > 0 ? ",\"" : "\"") + modes[i] + "\"";
   json += "],\"local_dir\":\"" + json_escape(settings.local_dir) + "\",\"ftp_host\":\"" + json_escape(settings.ftp_host) +
-          "\",\"ftp_port\":\"" + json_escape(settings.ftp_port) + "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) + "\"}";
+          "\",\"ftp_port\":\"" + json_escape(settings.ftp_port) + "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) +
+          "\",\"max_dictionary_mb\":" + std::to_string(settings.max_dictionary_mb) +
+          ",\"default_dictionary_mb\":" + std::to_string(kDefaultMaxDictionaryMb) + "}";
   return json;
 }
 
@@ -126,6 +129,11 @@ std::string apply_settings(const panplay::Json& json, AppSettings* settings) {
     if (host.find_first_of(":/ ") != std::string::npos) return "主机地址只填 IP 或主机名，端口单独填";
   }
   if (!ftp_dir.empty() && ftp_dir.front() != '/') return "主机目录要以 / 开头";
+  const bool has_dictionary = json.get("max_dictionary_mb") != nullptr;
+  const double dictionary = json.num("max_dictionary_mb");
+  if (has_dictionary && (dictionary < 0 || dictionary > 65536 || dictionary != static_cast<double>(static_cast<std::uint64_t>(dictionary)))) {
+    return "字典上限要是 0 到 65536 之间的整数（MB）";
+  }
 
   settings->drive = kind->id;
   settings->target = mode;
@@ -133,6 +141,7 @@ std::string apply_settings(const panplay::Json& json, AppSettings* settings) {
   settings->ftp_host = host;
   if (!port.empty()) settings->ftp_port = port;
   if (!ftp_dir.empty()) settings->ftp_dir = ftp_dir;
+  if (has_dictionary) settings->max_dictionary_mb = static_cast<std::uint64_t>(dictionary);
   return "";
 }
 
@@ -231,6 +240,11 @@ struct InstallTask {
   std::string path;
   panplay::InstallResult result;
   std::shared_ptr<panplay::CancelToken> cancel;
+  // 平均速度从第一次真正解压算起：续装开头核对已装文件时进度跳得飞快，不算进去。
+  // rate_base 是开始计时时的进度，没开始时为 -1；rate_last 是最近一次解压进度的时间。
+  std::int64_t rate_base = -1;
+  std::chrono::steady_clock::time_point rate_since;
+  std::chrono::steady_clock::time_point rate_last;
 };
 
 // 安装队列：一次只装一个，装完自动接着装下一个。正在装的和排队的会存到磁盘，程序重开后接着装。
@@ -240,7 +254,7 @@ struct InstallQueue {
   std::unique_ptr<InstallTask> current;
   std::deque<InstallTask> waiting;
   std::deque<InstallTask> finished;
-  // 正在删除没装完的文件的游戏，删完之前不能再加入队列。
+  // 正在删除文件（没装完的或整个游戏）的游戏，删完之前不能再加入队列。
   std::set<std::string> discarding;
   bool worker_running = false;
   std::thread worker;
@@ -755,6 +769,17 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
   return detail;
 }
 
+// 游戏装在哪个文件夹，删除前给用户确认。存放位置没填好时为空。
+std::string install_location(const AppSettings& settings, const std::string& path) {
+  const std::string folder = panplay::install_folder_name(path);
+  if (folder.empty()) return "";
+  if (settings.target == "ftp") {
+    return settings.ftp_host.empty() ? "" : settings.ftp_host + ":" + panplay::join_storage_path(settings.prefix(), folder);
+  }
+  if (settings.local_dir.empty()) return "";
+  return (std::filesystem::u8path(settings.local_dir) / std::filesystem::u8path(folder)).u8string();
+}
+
 // 详情页要的游戏信息。cached 时只给上次读到的（source 为 cache，没有时为 none），立刻返回；
 // 否则实时读网盘和主机（source 为 live），读到的存起来，游戏库列表缓存里这款游戏的状态也跟着改。
 std::string one_game_json(const std::string& path, bool cached) {
@@ -800,7 +825,8 @@ std::string one_game_json(const std::string& path, bool cached) {
     if (queued.count(path) != 0) state = queued.at(path);
     json += ",\"archive_bytes\":" + std::to_string(detail->archive_bytes) + ",\"formats\":\"" +
             panplay::json_escape(detail->formats) + "\",\"state\":\"" + state + "\",\"layers\":" +
-            (detail->layers.empty() ? "[]" : detail->layers) + ",\"resume\":" + resume;
+            (detail->layers.empty() ? "[]" : detail->layers) + ",\"resume\":" + resume + ",\"install_dir\":\"" +
+            panplay::json_escape(install_location(settings, path)) + "\"";
   }
   return json + game_meta_fields(name, title_id, load_name_overrides(), true) + "}";
 }
@@ -826,6 +852,13 @@ void publish_progress(const panplay::InstallResult& snapshot) {
     task->result.bytes_total = snapshot.bytes_total;
     task->result.files_checked = snapshot.files_checked;
     task->result.files_to_check = snapshot.files_to_check;
+    if (snapshot.message == "正在安装" && snapshot.bytes_total > 0) {
+      task->rate_last = std::chrono::steady_clock::now();
+      if (task->rate_base < 0) {
+        task->rate_base = snapshot.bytes_done;
+        task->rate_since = task->rate_last;
+      }
+    }
     path = task->path;
   }
   // 程序被直接关掉或断电时，详情页还能看到大致装到哪里。
@@ -886,6 +919,7 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
       request.on_progress = publish_progress;
       request.cancel = cancel;
       request.skip_sets = load_skipped_sets(path);
+      request.max_dictionary = settings.max_dictionary_mb << 20;
       result = panplay::install_game(*drive, *sink, request);
     }
   } catch (const std::exception& ex) {
@@ -960,6 +994,21 @@ void load_queue() {
   start_worker_locked();
 }
 
+// 平均速度（字节/秒）、预计还要几秒、解压了几秒。正在解压时按现在算，停下后按最后一次解压进度算。
+std::string rate_fields(const InstallTask& task, bool running) {
+  if (task.rate_base < 0) return ",\"speed\":0,\"eta\":-1,\"elapsed\":0";
+  const panplay::InstallResult& r = task.result;
+  const bool live = running && r.message == "正在安装";
+  const auto until = live ? std::chrono::steady_clock::now() : task.rate_last;
+  const double seconds = std::chrono::duration<double>(until - task.rate_since).count();
+  const std::int64_t moved = r.bytes_done - task.rate_base;
+  const double speed = seconds >= 3 && moved > 0 ? static_cast<double>(moved) / seconds : 0;
+  const std::int64_t left = std::max<std::int64_t>(0, r.bytes_total - r.bytes_done);
+  const long long eta = running && speed > 0 ? static_cast<long long>(static_cast<double>(left) / speed) : -1;
+  return ",\"speed\":" + std::to_string(static_cast<long long>(speed)) + ",\"eta\":" + std::to_string(eta) +
+         ",\"elapsed\":" + std::to_string(static_cast<long long>(seconds));
+}
+
 std::string task_json(const InstallTask& task, const char* state, const NameOverrides& overrides) {
   const std::string name = task.path.substr(task.path.find_last_of('/') + 1);
   const std::string title_id = panplay::find_title_id(name);
@@ -970,7 +1019,8 @@ std::string task_json(const InstallTask& task, const char* state, const NameOver
          "\",\"files_done\":" + std::to_string(r.files_done) + ",\"files_total\":" + std::to_string(r.files_total) +
          ",\"bytes_done\":" + std::to_string(r.bytes_done) + ",\"bytes_total\":" + std::to_string(r.bytes_total) +
          ",\"files_checked\":" + std::to_string(r.files_checked) + ",\"files_to_check\":" + std::to_string(r.files_to_check) +
-         ",\"retryable\":" + (r.retryable ? "true" : "false") + game_meta_fields(name, title_id, overrides, false) + "}";
+         ",\"retryable\":" + (r.retryable ? "true" : "false") + rate_fields(task, std::strcmp(state, "running") == 0) +
+         game_meta_fields(name, title_id, overrides, false) + "}";
 }
 
 // 队列顺序：正在装的，排队的，最近完成的。
@@ -1494,7 +1544,7 @@ void handle_client(SOCKET client, bool local_peer) {
           return;
         }
         if (installs.discarding.count(path) != 0) {
-          reply_json(client, 409, json_error("正在删除这个游戏没装完的文件，删完再装"));
+          reply_json(client, 409, json_error("正在删除这个游戏的文件，删完再装"));
           return;
         }
         // 带了 skip 就是用户刚选过要装哪些；没带（继续、重试）沿用上次的选择。
@@ -1535,8 +1585,10 @@ void handle_client(SOCKET client, bool local_peer) {
     reply_json(client, 200, queue_json());
     return;
   }
-  // 删掉没装完的游戏已经写到存放位置的文件，并把它移出队列。正在装或排队的要先取消。
-  if (method == "POST" && target == "/api/discard") {
+  // discard 删掉没装完的游戏已经写到存放位置的文件，uninstall 删掉整个游戏文件夹；都会把它移出队列。
+  // 正在装或排队的要先取消。
+  if (method == "POST" && (target == "/api/discard" || target == "/api/uninstall")) {
+    const bool whole = target == "/api/uninstall";
     std::string parse_error;
     const panplay::Json json = panplay::Json::parse(body, &parse_error);
     const std::string path = json.str("path");
@@ -1561,7 +1613,11 @@ void handle_client(SOCKET client, bool local_peer) {
     std::string error;
     try {
       const AppSettings settings = load_settings();
-      if (auto sink = open_sink(settings, &error)) error = panplay::discard_install(*sink, settings.prefix(), path);
+      if (auto sink = open_sink(settings, &error)) {
+        panplay::trace(std::string(whole ? "删除游戏 " : "删除没装完的文件 ") + path);
+        error = whole ? panplay::uninstall_game(*sink, settings.prefix(), path)
+                      : panplay::discard_install(*sink, settings.prefix(), path);
+      }
     } catch (const std::exception& ex) {
       error = std::string("删除失败: ") + ex.what();
     }

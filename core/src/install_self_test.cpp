@@ -1345,6 +1345,16 @@ int sevenzip_test() {
       return fail(std::string("7z 装完后暂存区没有清干净: ") + test.name);
     }
     if (install_game(drive, *local, request).status != "already") return fail(std::string("7z 装完后没有显示已安装: ") + test.name);
+
+    if (std::string(test.name) == "copy") continue;
+    MemorySink limited;
+    request.on_progress = nullptr;
+    request.max_dictionary = 1;
+    const InstallResult too_big = install_game(drive, limited, request);
+    if (too_big.status != "error" || too_big.message.find("超过上限") == std::string::npos || !too_big.retryable) {
+      return fail(std::string("字典超过上限的 7z 没有被拒绝: ") + test.name + " " + too_big.message);
+    }
+    if (!limited.files.empty()) return fail(std::string("拒绝 7z 之前写了文件: ") + test.name);
   }
 
   // 不支持的方法在读目录时就拒绝，不写任何文件。精简版 7zr 不能压 PPMd，生成不了就跳过这一项。
@@ -1577,6 +1587,29 @@ int run_install_pipeline_self_test() {
     if (!error.empty() || got != expect) return fail("RAR 解压内容不对");
     const InstallResult again = install_game(drive, *local, request);
     if (again.status != "already") return fail("RAR 安装后没有显示已安装");
+
+    if (auto remove_error = uninstall_game(*local, request.dest_prefix, request.source_dir); !remove_error.empty()) {
+      return fail("删除装好的游戏失败: " + remove_error);
+    }
+    error.clear();
+    if (local->file_size("/data/homebrew/CUSA77777/note.txt", &error) >= 0) return fail("删除游戏后文件还在");
+    const InstallResult reinstalled = install_game(drive, *local, request);
+    if (reinstalled.status != "installed") return fail("删除游戏后没有重新安装: " + reinstalled.status);
+  }
+
+  {
+    auto local = make_local_sink((root / "rar-dict").u8string());
+    InstallRequest request;
+    request.source_dir = "/apps/panplay/Rar CUSA77777";
+    request.dest_prefix = "/data/homebrew";
+    request.max_dictionary = 1;
+    const InstallResult refused = install_game(drive, *local, request);
+    if (refused.status != "error" || refused.message.find("超过上限") == std::string::npos) {
+      return fail("字典超过上限的 RAR 没有被拒绝: " + refused.status + " " + refused.message);
+    }
+    if (!refused.retryable) return fail("字典超过上限调高后可以重试，不该标成不能重试");
+    error.clear();
+    if (local->file_size("/data/homebrew/CUSA77777/note.txt", &error) >= 0) return fail("字典超过上限还是装了文件");
   }
 
   {

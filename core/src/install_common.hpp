@@ -64,8 +64,10 @@ bool is_install_package(const std::string& name, std::int64_t size);
 bool in_sce_sys(const std::string& name);
 std::string install_package_error(const std::string& name);
 bool is_install_package_error(const std::string& message);
-// 7z 用了不支持的方法、加了密码或字典太大：压缩包本身的问题，再装一次也一样。
+// 7z 用了不支持的方法或加了密码：压缩包本身的问题，再装一次也一样。
 bool is_unsupported_7z_error(const std::string& message);
+// 字典超过设置里的上限时拒绝安装的说明。调高上限后可以重试，所以不算压缩包本身的问题。
+std::string dictionary_refusal(const std::string& format, std::uint64_t dictionary, std::uint64_t limit);
 
 // 解压出的一个文件：第一次写入时才建目录、开写入流，同时算 CRC。
 // stop >= 0 时，累计写满 stop 字节就返回 kInterrupted，供自测模拟中断。expected 是压缩包里记的解压后大小。
