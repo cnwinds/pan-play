@@ -31,14 +31,13 @@
 
 #if defined(PANPLAY_PS5)
 #include "ps5_dashboard.hpp"
+#include "ps5_notify.hpp"
 #include "ps5_thread.hpp"
 #include "ps5_titles.hpp"
 
 #include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
-
-extern "C" int sceNotificationSend(int user_id, bool is_logged, const char* payload);
 #endif
 
 namespace {
@@ -61,18 +60,6 @@ std::vector<std::string> utf8_args() {
 }
 
 #if defined(PANPLAY_PS5)
-// 主机右上角弹一条通知。
-void notify(const std::string& text) {
-  constexpr int kSystemUser = 0xFE;
-  const std::string payload =
-      "{\"rawData\":{\"viewTemplateType\":\"InteractiveToastTemplateB\",\"channelType\":\"Downloads\","
-      "\"useCaseId\":\"IDC\",\"toastOverwriteType\":\"No\",\"isImmediate\":true,\"priority\":100,"
-      "\"viewData\":{\"icon\":{\"type\":\"Predefined\",\"parameters\":{\"icon\":\"download\"}},"
-      "\"message\":{\"body\":\"" + panplay::json_escape(text) + "\"}}},"
-      "\"createdDateTime\":\"2026-01-01T00:00:00.000Z\",\"localNotificationId\":\"73726\"}";
-  sceNotificationSend(kSystemUser, true, payload.c_str());
-}
-
 // 装图标要加载系统库、调系统接口，在有的固件上会一直卡住。卡在服务线程里时，连新线程都开不了，
 // 所以放在启动服务之前做，并在数据目录留个标记：上次没做完（卡住了）就跳过一次，盘游照常启动。
 void ensure_dashboard_icon(int port) {

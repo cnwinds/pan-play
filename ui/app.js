@@ -808,7 +808,7 @@ const actionText = {
 
 // 主机桌面注册状态。healthy 时状态写在主按钮上，不另起一行；其余给一句提示和要做的操作，不能注册时没有按钮。
 function consoleSummary(info) {
-  if (info.problem) return { healthy: false, text: info.problem, state: "info", button: "" };
+  if (info.problem) return { healthy: false, text: info.problem, state: "warn", button: "" };
   if (info.files_ok === false) return { healthy: false, text: "游戏文件缺少执行权限，主机上启动不了", state: "warn", button: "修复" };
   if (info.registered && info.mounted) return { healthy: true };
   if (info.registered) return { healthy: false, text: "游戏目录没挂上，在主机桌面上启动不了", state: "warn", button: "修复" };

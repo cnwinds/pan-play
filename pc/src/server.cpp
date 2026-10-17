@@ -15,6 +15,7 @@
 #include "panplay/trace.hpp"
 
 #if defined(PANPLAY_PS5)
+#include "ps5_notify.hpp"
 #include "ps5_titles.hpp"
 #endif
 
@@ -820,22 +821,49 @@ std::string console_json(const std::string& path, const std::string& game_dir) {
 }
 
 // 装完后注册到主机桌面。这次写了文件（新装、装了更新）就重新注册，主机上显示的版本才会跟着变；
-// 本来就装好的，已经注册好、挂载也在时不重做。
-void register_after_install(const std::string& path, bool files_changed) {
+// 本来就装好的，已经注册好、挂载也在时不重做。返回现在是不是已经注册在主机上。
+bool register_after_install(const std::string& path, bool files_changed) {
   const std::string game_dir = console_game_dir(load_settings(), path);
-  if (game_dir.empty()) return;
+  if (game_dir.empty()) return false;
   const ConsoleTitle title = inspect_console_title(game_dir);
   if (title.title_id.empty() || !title.problem.empty()) {
     if (!title.problem.empty()) panplay::log_info("不注册到主机：" + title.problem);
     remember_console_error(path, "");
-    return;
+    return false;
   }
-  if (!files_changed && title.registered && title.mounted && title.files_ok) return;
+  if (!files_changed && title.registered && title.mounted && title.files_ok) return true;
   {
     std::lock_guard<std::mutex> lock(installs.mu);
     if (installs.current && installs.current->path == path) installs.current->result.message = "正在注册到主机桌面…";
   }
-  remember_console_error(path, register_console_title(game_dir));
+  const std::string error = register_console_title(game_dir);
+  remember_console_error(path, error);
+  return error.empty();
+}
+
+// 游戏界面上显示的名字：用户改过的、商店的中文名、资料库的英文名，都没有就用网盘目录名。
+std::string game_display_name(const std::string& path) {
+  const std::string name = folder_name_of(path);
+  const std::string title_id = panplay::find_title_id(name);
+  const NameOverrides overrides = load_name_overrides();
+  if (const auto custom = overrides.find(name_key(name, title_id)); custom != overrides.end()) return custom->second;
+  panplay::CatalogMatch match;
+  if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
+  panplay::StoreMeta meta;
+  if (match.found && match.entry.concept_id > 0 && store_meta != nullptr) store_meta->lookup(match.entry.concept_id, &meta);
+  if (meta.found && !meta.name.empty()) return meta.name;
+  if (match.found && !match.entry.name.empty()) return match.entry.name;
+  return name;
+}
+
+// 新装或装了更新时在主机上弹「已安装完成」，带游戏图标。
+void announce_installed(const std::string& path, bool registered) {
+  const std::string game_dir = console_game_dir(load_settings(), path);
+  if (game_dir.empty()) return;
+  const ConsoleTitle title = inspect_console_title(game_dir);
+  const std::string icon = registered && !title.title_id.empty() ? "/user/appmeta/" + title.title_id + "/icon0.png"
+                                                                  : game_dir + "/sce_sys/icon0.png";
+  notify_game_installed(title.title_id, registered, game_display_name(path), icon);
 }
 #endif
 
@@ -1065,7 +1093,8 @@ void queue_worker() {
     if (result.status == "installed" || result.status == "already") {
       forget_install_progress(path);
 #if defined(PANPLAY_PS5)
-      register_after_install(path, result.status == "installed");
+      const bool registered = register_after_install(path, result.status == "installed");
+      if (result.status == "installed") announce_installed(path, registered);
 #endif
     } else {
       save_install_progress(path, progress_of(result));
