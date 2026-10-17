@@ -793,14 +793,13 @@ const actionText = {
   "need-settings": "先到设置里填写存放位置",
 };
 
-// 主机桌面注册状态的一句话和按钮文字；不能注册时没有按钮。
+// 主机桌面注册状态。healthy 时状态写在主按钮上，不另起一行；其余给一句提示和要做的操作，不能注册时没有按钮。
 function consoleSummary(info) {
-  const id = info.title_id ? `（${info.title_id}）` : "";
-  if (info.problem) return { text: info.problem, state: "warn", button: "" };
-  if (info.registered && info.mounted) return { text: `已注册到主机桌面${id}`, state: "ok", button: "重新注册" };
-  if (info.registered) return { text: `已注册${id}，但游戏目录没挂上，启动不了`, state: "warn", button: "重新注册" };
-  if (info.error) return { text: `没能注册到主机桌面：${info.error}`, state: "warn", button: "重试注册" };
-  return { text: "还没注册到主机桌面", state: "warn", button: "注册到主机" };
+  if (info.problem) return { healthy: false, text: info.problem, state: "info", button: "" };
+  if (info.registered && info.mounted) return { healthy: true };
+  if (info.registered) return { healthy: false, text: "游戏目录没挂上，在主机桌面上启动不了", state: "warn", button: "修复" };
+  if (info.error) return { healthy: false, text: `没能注册到主机桌面：${info.error}`, state: "warn", button: "重试" };
+  return { healthy: false, text: "还没出现在主机桌面", state: "warn", button: "注册" };
 }
 
 function detailFacts(game) {
@@ -1114,19 +1113,48 @@ function openDetail(game, opener) {
   queueRow.append(queueText, queueLinks);
   const status = el("p", "status-text");
   status.setAttribute("role", "status");
-  const discard = el("button", "btn discard", "删除");
-  discard.type = "button";
-  discard.title = "删除已经装了一部分的文件，之后要从头装";
-  const remove = el("button", "btn discard", "删除");
-  remove.type = "button";
-  remove.title = "从存放位置删除这个游戏";
+  // 不常用的操作（调整补丁、注册到主机、删除）收在主按钮旁的「⋯」菜单里，主按钮只管安装和显示状态。
+  const menuItem = (text, className = "") => {
+    const item = el("button", "more-item " + className, text);
+    item.type = "button";
+    item.setAttribute("role", "menuitem");
+    return item;
+  };
+  const adjust = menuItem("调整要装的补丁");
+  const registerItem = menuItem("注册到主机桌面");
+  const discard = menuItem("删除已装的部分", "danger");
+  const remove = menuItem("删除游戏", "danger");
+  const more = el("button", "btn more");
+  more.type = "button";
+  more.setAttribute("aria-haspopup", "menu");
+  more.setAttribute("aria-label", "更多操作");
+  more.innerHTML = '<svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true" fill="currentColor"><circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13" cy="8" r="1.5"/></svg>';
+  const menu = el("div", "more-menu");
+  menu.setAttribute("role", "menu");
+  menu.append(adjust, registerItem, discard, remove);
+  const moreWrap = el("div", "more-wrap");
+  moreWrap.append(more, menu);
+  let menuOpen = false;
+  const setMenu = (open) => {
+    menuOpen = open;
+    menu.hidden = !open;
+    more.setAttribute("aria-expanded", String(open));
+    if (open) menu.querySelector(".more-item:not([hidden])")?.focus();
+  };
+  setMenu(false);
+  more.addEventListener("click", () => setMenu(!menuOpen));
+  // 选了一项、或焦点离开菜单（点了别处）就收起来。
+  menu.addEventListener("click", (event) => {
+    if (event.target.closest(".more-item")) setMenu(false);
+  });
+  moreWrap.addEventListener("focusout", (event) => {
+    if (menuOpen && !moreWrap.contains(event.relatedTarget)) setMenu(false);
+  });
   const actionRow = el("div", "action-row");
-  actionRow.append(action, discard, remove);
+  actionRow.append(action, moreWrap);
   const confirm = buildConfirm();
   // 删除成功后的一句提示；队列里有这款游戏的结果时以队列为准。
   let notice = "";
-  const adjust = el("button", "text-link", "调整要装的补丁");
-  adjust.type = "button";
   // picking：选择面板开着；waitingLayers：点了安装但压缩包列表还没读到，读到后再决定要不要先选。
   let picking = false;
   let waitingLayers = false;
@@ -1141,15 +1169,15 @@ function openDetail(game, opener) {
     paint();
     action.focus();
   });
-  // 主机上装好的游戏：有没有注册到主机桌面，以及注册、重新注册的入口。
-  const consoleRow = el("div", "console-row");
-  const consoleText = el("span", "console-text");
+  // 主机桌面注册有问题时才出现的一行提示，带上要做的那个操作；正常时状态写在主按钮上。
+  const consoleRow = el("div", "console-note");
+  const consoleText = el("span");
   consoleText.setAttribute("role", "status");
-  const consoleAction = el("button", "text-link");
+  const consoleAction = el("button", "btn small");
   consoleAction.type = "button";
   consoleRow.append(consoleText, consoleAction);
   let consoleBusy = false;
-  install.append(actionRow, confirm.panel, picker.panel, adjust, consoleRow, resume, progress, queueRow, status);
+  install.append(actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1232,6 +1260,8 @@ function openDetail(game, opener) {
       label = { continue: "排队继续安装", update: "排队安装更新" }[game.state] || "加入安装队列";
     }
     if (waitingLayers) label = "正在读取压缩包…";
+    const onConsole = game.console && ["installed", "update"].includes(game.state) ? consoleSummary(game.console) : null;
+    if (game.state === "installed" && onConsole && onConsole.healthy) label = "已安装 · 已在主机桌面";
     action.textContent = label;
     action.classList.toggle("done", game.state === "installed");
     action.disabled = waitingLayers || running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
@@ -1242,17 +1272,20 @@ function openDetail(game, opener) {
     }
     if (confirm.open && !confirm.busy && (running || queued)) confirm.close();
     actionRow.hidden = picking || confirm.open;
-    discard.hidden = game.state !== "continue" || running || queued;
-    remove.hidden = !["installed", "update"].includes(game.state) || running || queued;
-    adjust.hidden = picking || confirm.open || game.state !== "installed" || running || queued || (game.layers || []).length < 2;
-    consoleRow.hidden = !game.console || picking || confirm.open || running || queued ||
-      !["installed", "update"].includes(game.state);
+    const busy = running || queued;
+    discard.hidden = game.state !== "continue" || busy;
+    remove.hidden = !["installed", "update"].includes(game.state) || busy;
+    adjust.hidden = game.state !== "installed" || busy || (game.layers || []).length < 2;
+    registerItem.hidden = !onConsole || Boolean(game.console.problem) || busy || consoleBusy;
+    registerItem.textContent = onConsole && onConsole.healthy ? "重新注册到主机桌面" : "注册到主机桌面";
+    moreWrap.hidden = [adjust, registerItem, discard, remove].every((item) => item.hidden);
+    if (moreWrap.hidden && menuOpen) setMenu(false);
+    consoleRow.hidden = !onConsole || (onConsole.healthy && !consoleBusy) || picking || confirm.open || busy;
     if (!consoleRow.hidden) {
-      const summary = consoleSummary(game.console);
-      consoleRow.dataset.state = consoleBusy ? "" : summary.state;
-      consoleText.textContent = consoleBusy ? "正在注册到主机桌面…" : summary.text;
-      consoleAction.textContent = summary.button;
-      consoleAction.hidden = consoleBusy || !summary.button;
+      consoleRow.dataset.state = consoleBusy ? "info" : onConsole.state;
+      consoleText.textContent = consoleBusy ? "正在注册到主机桌面…" : onConsole.text;
+      consoleAction.textContent = onConsole.button || "";
+      consoleAction.hidden = consoleBusy || !onConsole.button;
     }
     const last = picking ? null : resumeProgress(game, task);
     resume.hidden = !last;
@@ -1341,7 +1374,7 @@ function openDetail(game, opener) {
     beginInstall();
   });
   adjust.addEventListener("click", openPicker);
-  consoleAction.addEventListener("click", async () => {
+  const registerConsole = async () => {
     consoleBusy = true;
     paint();
     try {
@@ -1352,7 +1385,9 @@ function openDetail(game, opener) {
     }
     consoleBusy = false;
     if (detail && detail.game === game) paint();
-  });
+  };
+  consoleAction.addEventListener("click", registerConsole);
+  registerItem.addEventListener("click", registerConsole);
 
   // 立即向商店重新取中文名、封面和简介：服务端把这款插到最前面，这里每秒问一次，取完就刷新详情和封面。
   refreshMeta.addEventListener("click", async () => {
@@ -1413,7 +1448,7 @@ function openDetail(game, opener) {
       head: "删除已经装了一部分的文件？",
       body: [el("p", "", "删除后再装要从头开始。")],
       button: "删除",
-    }], "/api/discard", "已删除没装完的文件。", discard);
+    }], "/api/discard", "已删除没装完的文件。", more);
   });
   remove.addEventListener("click", () => {
     const where = (game.install_dir || "").trim();
@@ -1428,7 +1463,7 @@ function openDetail(game, opener) {
         body: [el("p", "", `删除后不能恢复，想再玩要从网盘重新下载安装${size}。`)],
         button: "确认删除",
       },
-    ], "/api/uninstall", "已从存放位置删除。", remove);
+    ], "/api/uninstall", "已从存放位置删除。", more);
   });
   first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));
   leave.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
@@ -1473,8 +1508,13 @@ function openDetail(game, opener) {
       status.className = "status-text warn";
       status.textContent = message;
     },
-    // Esc 先关掉删除确认，再关详情。
+    // Esc 先收起「⋯」菜单、关掉删除确认，再关详情。
     escape() {
+      if (menuOpen) {
+        setMenu(false);
+        more.focus();
+        return true;
+      }
       if (!confirm.open || confirm.busy) return confirm.busy;
       confirm.cancel();
       return true;

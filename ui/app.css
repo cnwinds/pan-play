@@ -771,6 +771,7 @@ body.drawer-open { overflow: hidden; }
 
 .install .btn.primary { min-height: 46px; font-size: 1rem; }
 .install .btn.done { background: rgba(95, 211, 160, 0.14); color: var(--mint); opacity: 1; }
+.install .btn.done::before { content: "✓"; margin-right: 0.45em; font-weight: 700; }
 
 .progress {
   display: grid;
@@ -834,23 +835,6 @@ body.drawer-open { overflow: hidden; }
 .action-row .btn.primary { flex: 1; min-width: 0; }
 .action-row[hidden],
 .action-row .btn[hidden] { display: none; }
-
-.install .btn.discard {
-  flex: none;
-  min-width: 76px;
-  padding: 0 1rem;
-  border: 1px solid var(--line);
-  background: transparent;
-  color: var(--muted);
-  font-weight: 500;
-  transition: border-color 0.15s, color 0.15s, background-color 0.15s;
-}
-
-.install .btn.discard:hover:not(:disabled) {
-  border-color: rgba(255, 138, 122, 0.55);
-  background: rgba(255, 138, 122, 0.08);
-  color: var(--danger);
-}
 
 .btn.danger {
   position: relative;
@@ -964,35 +948,78 @@ body.drawer-open { overflow: hidden; }
   to { transform: scaleX(0); }
 }
 
-.install .text-link {
-  justify-self: center;
+/* 主按钮旁的「⋯」：不常用的操作收在这里 */
+.more-wrap {
+  position: relative;
+  flex: none;
+}
+
+.more-wrap .btn.more {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  min-height: 46px;
   padding: 0;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.more-wrap .btn.more:hover,
+.more-wrap .btn.more[aria-expanded="true"] { border-color: var(--faint); color: var(--text); }
+.more-wrap[hidden] { display: none; }
+
+.more-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 5;
+  display: grid;
+  min-width: 190px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--raise);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.5);
+}
+
+.more-menu[hidden],
+.more-item[hidden] { display: none; }
+
+.more-item {
+  padding: 0.6rem 0.75rem;
   border: 0;
+  border-radius: 7px;
   background: none;
-  color: var(--muted);
-  font-size: 0.88rem;
-  text-decoration: underline;
-  text-underline-offset: 3px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
 }
 
-.install .text-link:hover { color: var(--text); }
+.more-item:hover,
+.more-item:focus-visible { background: rgba(255, 255, 255, 0.07); outline: none; }
+.more-item.danger { color: var(--danger); }
 
-/* 主机桌面注册状态，和调整补丁的链接一样居中 */
-.console-row {
+/* 主机桌面注册有问题时的一行提示 */
+.console-note {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  align-items: baseline;
-  gap: 0.35rem 0.75rem;
-  color: var(--muted);
-  font-size: 0.88rem;
-  text-align: center;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.5rem 0.5rem 0.85rem;
+  border-radius: 9px;
+  background: rgba(240, 179, 87, 0.09);
+  color: var(--amber);
+  font-size: 0.86rem;
 }
 
-.console-row[hidden] { display: none; }
-.console-row[data-state="ok"] .console-text { color: var(--mint); }
-.console-row[data-state="warn"] .console-text { color: var(--amber); }
-.console-row .text-link[hidden] { display: none; }
+.console-note[hidden],
+.console-note .btn[hidden] { display: none; }
+.console-note[data-state="info"] { background: rgba(255, 255, 255, 0.04); color: var(--muted); }
+.console-note .btn { flex: none; border-color: rgba(240, 179, 87, 0.45); background: transparent; color: var(--amber); }
 
 /* 安装前挑选要装的补丁 */
 .layer-picker {
