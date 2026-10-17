@@ -32,6 +32,7 @@
 #if defined(PANPLAY_PS5)
 #include "ps5_dashboard.hpp"
 #include "ps5_thread.hpp"
+#include "ps5_titles.hpp"
 
 #include <cstdio>
 #include <fcntl.h>
@@ -402,6 +403,8 @@ int main(int argc, char** argv) {
       std::_Exit(0);
     }
     PANPLAY_DEBUG("没有已在运行的盘游，开始启动服务");
+    // 注册过的游戏靠 nullfs 挂载才能启动，挂载重启就没了，开机后要先挂回去。
+    restore_console_mounts();
     options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
       notify("盘游已启动 " + url + (code.empty() ? "" : " 口令 " + code));
     };

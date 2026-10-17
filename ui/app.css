@@ -940,6 +940,23 @@ body.drawer-open { overflow: hidden; }
 
 .install .text-link:hover { color: var(--text); }
 
+/* 主机桌面注册状态，和调整补丁的链接一样居中 */
+.console-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+  text-align: center;
+}
+
+.console-row[hidden] { display: none; }
+.console-row[data-state="ok"] .console-text { color: var(--mint); }
+.console-row[data-state="warn"] .console-text { color: var(--amber); }
+.console-row .text-link[hidden] { display: none; }
+
 /* 安装前挑选要装的补丁 */
 .layer-picker {
   display: grid;

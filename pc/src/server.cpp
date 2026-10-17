@@ -14,6 +14,10 @@
 #include "panplay/store_meta.hpp"
 #include "panplay/trace.hpp"
 
+#if defined(PANPLAY_PS5)
+#include "ps5_titles.hpp"
+#endif
+
 #if defined(PANPLAY_EMBED_UI)
 #include "embedded_ui.hpp"
 #endif
@@ -783,6 +787,51 @@ std::string install_location(const AppSettings& settings, const std::string& pat
   return (std::filesystem::u8path(settings.local_dir) / std::filesystem::u8path(folder)).u8string();
 }
 
+#if defined(PANPLAY_PS5)
+// 主机上装到本机文件夹的游戏才能注册到主机桌面。
+std::string console_game_dir(const AppSettings& settings, const std::string& path) {
+  return settings.target == "local" ? install_location(settings, path) : "";
+}
+
+// 最近一次自动注册失败的原因，按网盘游戏目录记，详情页显示。
+std::mutex console_errors_mu;
+std::map<std::string, std::string> console_errors;
+
+void remember_console_error(const std::string& path, const std::string& error) {
+  std::lock_guard<std::mutex> lock(console_errors_mu);
+  if (error.empty()) console_errors.erase(path);
+  else console_errors[path] = error;
+}
+
+std::string console_json(const std::string& path, const std::string& game_dir) {
+  const ConsoleTitle title = inspect_console_title(game_dir);
+  std::string error;
+  {
+    std::lock_guard<std::mutex> lock(console_errors_mu);
+    const auto found = console_errors.find(path);
+    if (found != console_errors.end()) error = found->second;
+  }
+  using panplay::json_escape;
+  return "{\"title_id\":\"" + json_escape(title.title_id) + "\",\"registered\":" + (title.registered ? "true" : "false") +
+         ",\"mounted\":" + (title.mounted ? "true" : "false") + ",\"problem\":\"" + json_escape(title.problem) +
+         "\",\"error\":\"" + json_escape(error) + "\"}";
+}
+
+// 装完后注册到主机桌面；已经注册好、挂载也在时不重做。
+void register_after_install(const std::string& path) {
+  const std::string game_dir = console_game_dir(load_settings(), path);
+  if (game_dir.empty()) return;
+  const ConsoleTitle title = inspect_console_title(game_dir);
+  if (title.title_id.empty() || !title.problem.empty()) {
+    if (!title.problem.empty()) panplay::log_info("不注册到主机：" + title.problem);
+    remember_console_error(path, "");
+    return;
+  }
+  if (title.registered && title.mounted) return;
+  remember_console_error(path, register_console_title(game_dir));
+}
+#endif
+
 // 详情页要的游戏信息。cached 时只给上次读到的（source 为 cache，没有时为 none），立刻返回；
 // 否则实时读网盘和主机（source 为 live），读到的存起来，游戏库列表缓存里这款游戏的状态也跟着改。
 std::string one_game_json(const std::string& path, bool cached) {
@@ -830,6 +879,12 @@ std::string one_game_json(const std::string& path, bool cached) {
             panplay::json_escape(detail->formats) + "\",\"state\":\"" + state + "\",\"layers\":" +
             (detail->layers.empty() ? "[]" : detail->layers) + ",\"resume\":" + resume + ",\"install_dir\":\"" +
             panplay::json_escape(install_location(settings, path)) + "\"";
+#if defined(PANPLAY_PS5)
+    const std::string game_dir = console_game_dir(settings, path);
+    if (!game_dir.empty() && (state == "installed" || state == "update")) {
+      json += ",\"console\":" + console_json(path, game_dir);
+    }
+#endif
   }
   return json + game_meta_fields(name, title_id, load_name_overrides(), true) + "}";
 }
@@ -961,8 +1016,14 @@ void queue_worker() {
     const panplay::InstallResult result = run_install(path, cancel.get());
     panplay::log_line(result.status == "error" ? panplay::LogLevel::warn : panplay::LogLevel::info,
                       "安装结束 " + path + "：" + result.status + " " + result.message + "，" + panplay::memory_summary());
-    if (result.status == "installed" || result.status == "already") forget_install_progress(path);
-    else save_install_progress(path, progress_of(result));
+    if (result.status == "installed" || result.status == "already") {
+      forget_install_progress(path);
+#if defined(PANPLAY_PS5)
+      register_after_install(path);
+#endif
+    } else {
+      save_install_progress(path, progress_of(result));
+    }
     forget_game_detail(path);
     std::lock_guard<std::mutex> lock(installs.mu);
     InstallTask done = std::move(*installs.current);
@@ -1595,6 +1656,27 @@ void handle_client(SOCKET client, bool local_peer) {
   }
   // discard 删掉没装完的游戏已经写到存放位置的文件，uninstall 删掉整个游戏文件夹；都会把它移出队列。
   // 正在装或排队的要先取消。
+#if defined(PANPLAY_PS5)
+  // 把装好的游戏重新注册到主机桌面（自动注册失败、图标被删掉、挂载丢了时用）。
+  if (method == "POST" && target == "/api/console/register") {
+    std::string parse_error;
+    const panplay::Json json = panplay::Json::parse(body, &parse_error);
+    const std::string path = json.str("path");
+    const std::string game_dir = console_game_dir(load_settings(), path);
+    if (!parse_error.empty() || path.empty() || game_dir.empty()) {
+      reply_json(client, 400, json_error("只有装在主机本机文件夹里的游戏能注册"));
+      return;
+    }
+    const std::string error = register_console_title(game_dir);
+    remember_console_error(path, error);
+    if (!error.empty()) {
+      reply_json(client, 500, json_error(error));
+      return;
+    }
+    reply_json(client, 200, "{\"console\":" + console_json(path, game_dir) + "}");
+    return;
+  }
+#endif
   if (method == "POST" && (target == "/api/discard" || target == "/api/uninstall")) {
     const bool whole = target == "/api/uninstall";
     std::string parse_error;
@@ -1623,8 +1705,18 @@ void handle_client(SOCKET client, bool local_peer) {
       const AppSettings settings = load_settings();
       if (auto sink = open_sink(settings, &error)) {
         panplay::log_info(std::string(whole ? "删除游戏 " : "删除没装完的文件 ") + path);
-        error = whole ? panplay::uninstall_game(*sink, settings.prefix(), path)
-                      : panplay::discard_install(*sink, settings.prefix(), path);
+#if defined(PANPLAY_PS5)
+        // 先从主机注销、卸掉挂载，注销不成就不删文件，免得留下打不开的图标。
+        if (const std::string game_dir = console_game_dir(settings, path); whole && !game_dir.empty()) {
+          error = unregister_console_title(game_dir);
+          if (!error.empty()) error = "没能从主机注销，先不删除：" + error;
+          remember_console_error(path, "");
+        }
+#endif
+        if (error.empty()) {
+          error = whole ? panplay::uninstall_game(*sink, settings.prefix(), path)
+                        : panplay::discard_install(*sink, settings.prefix(), path);
+        }
       }
     } catch (const std::exception& ex) {
       error = std::string("删除失败: ") + ex.what();

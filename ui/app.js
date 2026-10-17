@@ -782,6 +782,16 @@ const actionText = {
   "need-settings": "先到设置里填写存放位置",
 };
 
+// 主机桌面注册状态的一句话和按钮文字；不能注册时没有按钮。
+function consoleSummary(info) {
+  const id = info.title_id ? `（${info.title_id}）` : "";
+  if (info.problem) return { text: info.problem, state: "warn", button: "" };
+  if (info.registered && info.mounted) return { text: `已注册到主机桌面${id}`, state: "ok", button: "重新注册" };
+  if (info.registered) return { text: `已注册${id}，但游戏目录没挂上，启动不了`, state: "warn", button: "重新注册" };
+  if (info.error) return { text: `没能注册到主机桌面：${info.error}`, state: "warn", button: "重试注册" };
+  return { text: "还没注册到主机桌面", state: "warn", button: "注册到主机" };
+}
+
 function detailFacts(game) {
   const facts = [];
   const platform = platformText(game);
@@ -1120,7 +1130,15 @@ function openDetail(game, opener) {
     paint();
     action.focus();
   });
-  install.append(actionRow, confirm.panel, picker.panel, adjust, resume, progress, queueRow, status);
+  // 主机上装好的游戏：有没有注册到主机桌面，以及注册、重新注册的入口。
+  const consoleRow = el("div", "console-row");
+  const consoleText = el("span", "console-text");
+  consoleText.setAttribute("role", "status");
+  const consoleAction = el("button", "text-link");
+  consoleAction.type = "button";
+  consoleRow.append(consoleText, consoleAction);
+  let consoleBusy = false;
+  install.append(actionRow, confirm.panel, picker.panel, adjust, consoleRow, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1216,6 +1234,15 @@ function openDetail(game, opener) {
     discard.hidden = game.state !== "continue" || running || queued;
     remove.hidden = !["installed", "update"].includes(game.state) || running || queued;
     adjust.hidden = picking || confirm.open || game.state !== "installed" || running || queued || (game.layers || []).length < 2;
+    consoleRow.hidden = !game.console || picking || confirm.open || running || queued ||
+      !["installed", "update"].includes(game.state);
+    if (!consoleRow.hidden) {
+      const summary = consoleSummary(game.console);
+      consoleRow.dataset.state = consoleBusy ? "" : summary.state;
+      consoleText.textContent = consoleBusy ? "正在注册到主机桌面…" : summary.text;
+      consoleAction.textContent = summary.button;
+      consoleAction.hidden = consoleBusy || !summary.button;
+    }
     const last = picking ? null : resumeProgress(game, task);
     resume.hidden = !last;
     if (last) {
@@ -1303,6 +1330,18 @@ function openDetail(game, opener) {
     beginInstall();
   });
   adjust.addEventListener("click", openPicker);
+  consoleAction.addEventListener("click", async () => {
+    consoleBusy = true;
+    paint();
+    try {
+      game.console = (await api("/api/console/register", { path: game.path })).console;
+      notice = "已注册到主机桌面。";
+    } catch (error) {
+      game.console = { ...game.console, error: error.message };
+    }
+    consoleBusy = false;
+    if (detail && detail.game === game) paint();
+  });
 
   // 立即向商店重新取中文名、封面和简介：服务端把这款插到最前面，这里每秒问一次，取完就刷新详情和封面。
   refreshMeta.addEventListener("click", async () => {
@@ -1369,6 +1408,7 @@ function openDetail(game, opener) {
     const where = (game.install_dir || "").trim();
     const first = [el("p", "", "会删掉存放位置里这个游戏的整个文件夹：")];
     if (where) first.push(el("code", "confirm-path", where));
+    if (game.console && game.console.registered) first.push(el("p", "", "主机桌面上这个游戏的图标也会一起移除。"));
     const size = game.archive_bytes ? `（压缩包 ${formatBytes(game.archive_bytes)}）` : "";
     askRemove([
       { head: `删除「${displayName(game)}」？`, body: first, button: "删除" },
