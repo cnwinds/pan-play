@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -71,9 +72,22 @@ void notify(const std::string& text) {
   sceNotificationSend(kSystemUser, true, payload.c_str());
 }
 
+// 装图标要加载系统库、调系统接口，在有的固件上会一直卡住。卡在服务线程里时，连新线程都开不了，
+// 所以放在启动服务之前做，并在数据目录留个标记：上次没做完（卡住了）就跳过一次，盘游照常启动。
 void ensure_dashboard_icon(int port) {
+  const std::filesystem::path pending = panplay::app_data_dir() / "dashboard-icon.pending";
+  std::error_code ec;
+  if (std::filesystem::exists(pending, ec)) {
+    std::filesystem::remove(pending, ec);
+    panplay::trace("上次安装桌面图标没有做完，这次跳过");
+    notify("上次安装盘游桌面图标时卡住了，这次跳过；再发送一次 elf 会重试");
+    return;
+  }
+  std::ofstream(pending.string()) << "1";
   std::string error;
-  switch (install_dashboard_icon(port, &error)) {
+  const DashboardIcon result = install_dashboard_icon(port, &error);
+  std::filesystem::remove(pending, ec);
+  switch (result) {
     case DashboardIcon::unchanged:
       panplay::trace("桌面图标已在");
       break;
@@ -385,24 +399,22 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     ServerOptions options;
     options.lan_required = true;
+    // 已经在运行时也检查一遍：图标被删了，重新发送一次载荷就能装回来。
+    ensure_dashboard_icon(options.port);
     std::string running_url;
     std::string running_code;
     panplay::trace("检查端口 " + std::to_string(options.port) + " 上是否已有盘游");
     if (running_instance(options.port, &running_url, &running_code)) {
       panplay::trace("已有盘游在运行 " + running_url + "，本次退出");
       notify("盘游已经在运行 " + running_url + (running_code.empty() ? "" : " 口令 " + running_code));
-      // 图标被删了，重新发送一次载荷就能装回来。
-      ensure_dashboard_icon(options.port);
       // 走正常退出时，系统库在析构全局对象时抛 resource deadlock would occur 并中止进程，这里什么都不用清理。
       std::fflush(nullptr);
       std::_Exit(0);
     }
     panplay::trace("没有已在运行的盘游，开始启动服务");
-    options.on_ready = [port = options.port](const std::string&, const std::string& url, const std::string& code) {
+    options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
       panplay::trace("服务就绪，弹出启动通知 " + url);
       notify("盘游已启动 " + url + (code.empty() ? "" : " 口令 " + code));
-      // 装图标要调系统接口，出了问题也不能拖住服务。
-      std::thread([port] { ensure_dashboard_icon(port); }).detach();
     };
     options.on_quit = [] {
       panplay::trace("用户在设置页退出盘游");
