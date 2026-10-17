@@ -446,8 +446,8 @@ button:disabled { cursor: default; }
 .tile:focus-visible { outline: none; }
 .tile:focus-visible .art { outline: 2px solid var(--signal-hi); outline-offset: 3px; }
 
-/* PS5 自带浏览器不认 aspect-ratio：用 padding 按宽度撑出正方形，封面和占位都绝对定位铺满。
-   没有图片撑高度时，占位格子才不会缩成一小块。 */
+/* PS5 自带浏览器不认 aspect-ratio，格子的宽高也不会自己撑满一列，而是跟着里面的图走。
+   所以每个格子垫一张透明的正方形图（art-sizer）撑出尺寸，封面和占位绝对定位盖在上面。 */
 .art {
   position: relative;
   display: block;
@@ -457,13 +457,14 @@ button:disabled { cursor: default; }
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset;
 }
 
-.art::before {
-  content: "";
+.art .art-sizer {
   display: block;
-  padding-top: 100%;
+  width: 100%;
+  height: auto;
+  visibility: hidden;
 }
 
-.art > img,
+.art > .cover,
 .art > .fallback {
   position: absolute;
   top: 0;
@@ -479,7 +480,7 @@ button:disabled { cursor: default; }
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12) inset, 0 14px 28px rgba(0, 0, 0, 0.45);
 }
 
-.art img {
+.art .cover {
   display: block;
   width: 100%;
   height: 100%;
@@ -527,7 +528,7 @@ button:disabled { cursor: default; }
 .badge.continue { color: var(--amber); }
 .badge.queued { color: var(--signal-hi); }
 
-.tile[data-state="queued"] .art img,
+.tile[data-state="queued"] .art .cover,
 .tile[data-state="queued"] .art .fallback { opacity: 0.55; }
 
 /* 安装进度直接画在封面上 */

@@ -158,9 +158,18 @@ function hashHue(text) {
   return hash % 360;
 }
 
+// 撑尺寸用的透明正方形图。PS5 自带浏览器里格子的宽高跟着里面的图走，没有图就缩成 0，
+// 所以每个格子都垫一张，封面和占位绝对定位盖在上面，和有封面时的排版一模一样。
+const ART_SIZER = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1000' height='1000'/%3E";
+
 // 封面：有商店图用商店图，没有就用 Title ID 生成一张。
 function buildArt(game, className) {
   const art = el("span", "art " + (className || ""));
+  const sizer = document.createElement("img");
+  sizer.className = "art-sizer";
+  sizer.alt = "";
+  sizer.src = ART_SIZER;
+  art.append(sizer);
   const fallback = () => {
     const hue = hashHue(game.title_id || game.name || "?");
     art.style.background = `linear-gradient(160deg, hsl(${hue} 42% 34%), hsl(${(hue + 40) % 360} 46% 18%))`;
@@ -176,6 +185,7 @@ function buildArt(game, className) {
   const url = (game.cover_url || "").trim();
   if (url) {
     const img = document.createElement("img");
+    img.className = "cover";
     img.alt = "";
     img.loading = "lazy";
     img.decoding = "async";
@@ -1136,20 +1146,30 @@ function openDetail(game, opener) {
   const moreWrap = el("div", "more-wrap");
   moreWrap.append(more, menu);
   let menuOpen = false;
+  // 菜单开着时在别处按下鼠标就收起。不能靠焦点离开来判断：WebKit（PS5 自带浏览器）点按钮不会把焦点给按钮，
+  // 点菜单项时焦点先丢了，菜单抢在点击生效前收起，点击就落空了。
+  const closeOnOutside = (event) => {
+    if (!moreWrap.contains(event.target)) setMenu(false);
+  };
   const setMenu = (open) => {
     menuOpen = open;
     menu.hidden = !open;
     more.setAttribute("aria-expanded", String(open));
-    if (open) menu.querySelector(".more-item:not([hidden])")?.focus();
+    if (open) {
+      document.addEventListener("mousedown", closeOnOutside, true);
+      menu.querySelector(".more-item:not([hidden])")?.focus();
+    } else {
+      document.removeEventListener("mousedown", closeOnOutside, true);
+    }
   };
   setMenu(false);
   more.addEventListener("click", () => setMenu(!menuOpen));
-  // 选了一项、或焦点离开菜单（点了别处）就收起来。
+  // 选了一项就收起来；用 Tab 把焦点移到菜单外的别的元素时也收起。
   menu.addEventListener("click", (event) => {
     if (event.target.closest(".more-item")) setMenu(false);
   });
   moreWrap.addEventListener("focusout", (event) => {
-    if (menuOpen && !moreWrap.contains(event.relatedTarget)) setMenu(false);
+    if (menuOpen && event.relatedTarget && !moreWrap.contains(event.relatedTarget)) setMenu(false);
   });
   const actionRow = el("div", "action-row");
   actionRow.append(action, moreWrap);
