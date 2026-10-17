@@ -124,9 +124,10 @@ void PrefetchReader::range_worker_loop(AbortSignal& signal) {
     const std::int64_t length = std::min<std::int64_t>(static_cast<std::int64_t>(options_.block_size), size_ - start);
     assign_position_ += length;
     ++in_flight_;
+    Block block;
+    block.data = take_buffer_locked();
     lock.unlock();
 
-    Block block;
     block.start = start;
     block.data.resize(static_cast<std::size_t>(length));
     std::size_t filled = 0;
@@ -216,6 +217,21 @@ std::int64_t PrefetchReader::buffered_end_locked() const {
   return last.start + static_cast<std::int64_t>(last.data.size());
 }
 
+void PrefetchReader::retire_locked(Block&& block) {
+  // 留两块：读取方一次换下一块，后台线程马上就会取走，多留没用，只会多占内存。
+  if (history_.data.capacity() >= options_.block_size && spare_.size() < 2) {
+    spare_.push_back(std::move(history_.data));
+  }
+  history_ = std::move(block);
+}
+
+std::vector<std::uint8_t> PrefetchReader::take_buffer_locked() {
+  if (spare_.empty()) return {};
+  std::vector<std::uint8_t> buffer = std::move(spare_.back());
+  spare_.pop_back();
+  return buffer;
+}
+
 bool PrefetchReader::stale(std::uint64_t generation) {
   std::lock_guard<std::mutex> lock(mu_);
   return stop_ || generation != generation_;
@@ -256,9 +272,10 @@ void PrefetchReader::worker_loop(AbortSignal& signal) {
     if (stop_) break;
     const std::uint64_t generation = generation_;
     const std::int64_t start = fill_position_;
+    Block block;
+    block.data = take_buffer_locked();
     lock.unlock();
 
-    Block block;
     block.start = start;
     block.data.resize(static_cast<std::size_t>(std::min<std::int64_t>(options_.block_size, size_ - start)));
     std::size_t filled = 0;
@@ -338,7 +355,7 @@ std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::strin
       Block& front = blocks_.front();
       const std::int64_t front_end = front.start + static_cast<std::int64_t>(front.data.size());
       if (front_end <= position_) {
-        history_ = std::move(front);
+        retire_locked(std::move(front));
         blocks_.pop_front();
         cv_.notify_all();
         continue;
@@ -364,7 +381,7 @@ std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::strin
   front.used += n;
   position_ += static_cast<std::int64_t>(n);
   if (front.used == front.data.size()) {
-    history_ = std::move(front);
+    retire_locked(std::move(front));
     blocks_.pop_front();
     cv_.notify_all();
   }
@@ -387,7 +404,7 @@ std::string PrefetchReader::seek(std::int64_t position) {
         front.used = static_cast<std::size_t>(position - front.start);
         break;
       }
-      history_ = std::move(front);
+      retire_locked(std::move(front));
       blocks_.pop_front();
     }
     position_ = position;

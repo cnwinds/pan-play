@@ -20,6 +20,17 @@
 
 #if defined(PANPLAY_PS5)
 extern "C" int sceKernelAvailableFlexibleMemorySize(std::size_t* size);
+
+struct SceLibcMallocManagedSize {
+  std::uint16_t size;
+  std::uint16_t version;
+  std::uint32_t reserved1;
+  std::size_t maxSystemSize;
+  std::size_t currentSystemSize;
+  std::size_t maxInuseSize;
+  std::size_t currentInuseSize;
+};
+extern "C" int malloc_stats_fast(SceLibcMallocManagedSize* stats);
 #endif
 
 namespace panplay {
@@ -169,6 +180,14 @@ std::string memory_summary() {
   if (getrusage(RUSAGE_SELF, &usage) == 0) out = "峰值内存 " + std::to_string(usage.ru_maxrss / 1024) + " MB";
 #endif
 #if defined(PANPLAY_PS5)
+  SceLibcMallocManagedSize heap{};
+  heap.size = sizeof(heap);
+  heap.version = 1;
+  if (malloc_stats_fast(&heap) == 0) {
+    out += (out.empty() ? "" : "，") + std::string("堆在用 ") + std::to_string(heap.currentInuseSize >> 20) + " MB（最多 " +
+           std::to_string(heap.maxInuseSize >> 20) + " MB），堆向系统要了 " + std::to_string(heap.currentSystemSize >> 20) +
+           " MB";
+  }
   std::size_t flexible = 0;
   if (sceKernelAvailableFlexibleMemorySize(&flexible) == 0) {
     out += (out.empty() ? "" : "，") + std::string("剩余可用内存 ") + std::to_string(flexible >> 20) + " MB";

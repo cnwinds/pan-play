@@ -55,6 +55,9 @@ class PrefetchReader {
   bool wait_retry(int attempt, std::uint64_t generation);
   bool stale(std::uint64_t generation);
   std::int64_t buffered_end_locked() const;
+  // 以下两个要持有 mu_。读完的块换下 history_，旧 history_ 的内存留给下一块用。
+  void retire_locked(Block&& block);
+  std::vector<std::uint8_t> take_buffer_locked();
 
   DrivePlugin& drive_;
   const std::string file_id_;
@@ -69,6 +72,8 @@ class PrefetchReader {
   std::deque<Block> blocks_;
   // 刚读完的块留着，往回跳一小段（比如重读文件头）时不用重新连接。
   Block history_;
+  // 每块都重新分配几 MB、用完就释放，装一个游戏要来回几千次，堆会越来越碎；换下来的内存在这里留着复用。
+  std::vector<std::vector<std::uint8_t>> spare_;
   std::int64_t fill_position_ = 0;
   std::uint64_t generation_ = 0;
   bool started_ = false;

@@ -4,6 +4,7 @@
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
 #include "panplay/prefetch.hpp"
+#include "panplay/trace.hpp"
 
 #include <zlib.h>
 
@@ -711,6 +712,11 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     source.extracted = true;
     source.start = result.bytes_total;
     for (const auto& part : source.set->parts) result.bytes_total += part.size;
+    trace(std::string("解压 ") + (source.rar ? "RAR" : source.sevenzip ? "7z" : "ZIP") + " " + source.set->parts.front().name +
+          "，" + std::to_string(source.set->parts.size()) + " 卷共 " +
+          std::to_string((result.bytes_total - source.start) >> 20) + " MB，预读 " +
+          std::to_string(request.prefetch.connections) + " 条连接 × " + std::to_string(request.prefetch.block_size >> 20) +
+          " MB，" + memory_summary());
     if (source.rar) {
       RarExtract options;
       options.staging_root = staging_root;

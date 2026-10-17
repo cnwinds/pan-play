@@ -182,6 +182,11 @@ uint GetNumberOfThreads()
     return 1;
   if (NumCPU>MaxPoolThreads)
     return MaxPoolThreads;
+#ifdef PANPLAY_UNRAR_MAX_THREADS
+  // panplay: on the console the unpack threads compete with the system UI.
+  if (NumCPU>PANPLAY_UNRAR_MAX_THREADS)
+    return PANPLAY_UNRAR_MAX_THREADS;
+#endif
   return NumCPU;
 }
 

@@ -373,7 +373,9 @@ int main(int argc, char** argv) {
     if (running_instance(options.port, &running_url, &running_code)) {
       panplay::trace("已有盘游在运行 " + running_url + "，本次退出");
       notify("盘游已经在运行 " + running_url + (running_code.empty() ? "" : " 口令 " + running_code));
-      return 0;
+      // 走正常退出时，系统库在析构全局对象时抛 resource deadlock would occur 并中止进程，这里什么都不用清理。
+      std::fflush(nullptr);
+      std::_Exit(0);
     }
     panplay::trace("没有已在运行的盘游，开始启动服务");
     options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {

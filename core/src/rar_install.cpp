@@ -3,6 +3,7 @@
 #include "install_common.hpp"
 #include "panplay/library.hpp"
 #include "panplay/prefetch.hpp"
+#include "panplay/trace.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -19,8 +20,6 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
-#include <iostream>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -383,14 +382,17 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
     RarSession& state;
     std::chrono::steady_clock::time_point started;
     ~Trace() {
-      if (std::getenv("PANPLAY_TRACE") == nullptr) return;
-      const auto seconds = [](std::chrono::steady_clock::duration value) { return std::chrono::duration<double>(value).count(); };
+      if (!trace_enabled()) return;
+      const auto seconds = [](std::chrono::steady_clock::duration value) {
+        return std::to_string(static_cast<long long>(std::chrono::duration<double>(value).count()));
+      };
       const auto total = std::chrono::steady_clock::now() - started;
-      std::cerr << "rar 解压共 " << seconds(total) << " 秒：等数据 " << seconds(state.read_time) << " 秒（" << state.read_calls
-                << " 次读），写出 " << seconds(state.write_time) << " 秒，其余（解压+校验）"
-                << seconds(total - state.read_time - state.write_time) << " 秒\n";
+      panplay::trace("RAR 解压结束，共 " + seconds(total) + " 秒：等数据 " + seconds(state.read_time) + " 秒（" +
+                     std::to_string(state.read_calls) + " 次读），写出 " + seconds(state.write_time) + " 秒，其余（解压+校验）" +
+                     seconds(total - state.read_time - state.write_time) + " 秒，" + memory_summary());
     }
-  } trace{guard.state, started};
+  } trace_end{guard.state, started};
+  std::uint64_t largest_dictionary = 0;
   HANDLE handle = nullptr;
   if (auto error = open_archive(guard, RAR_OM_EXTRACT, &handle); !error.empty()) return error;
   RarWrite writer;
@@ -421,6 +423,12 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       break;
     }
     const bool solid = (header.Flags & RHDF_SOLID) != 0;
+    // 解压要把整个字典放在内存里，这是装 RAR 时最大的一块内存。
+    const std::uint64_t dictionary = static_cast<std::uint64_t>(header.DictSize) << 10;
+    if (dictionary > largest_dictionary) {
+      largest_dictionary = dictionary;
+      trace("RAR 字典 " + std::to_string(dictionary >> 20) + " MB" + (solid ? "（固实）" : "") + "，解压需要这么多内存");
+    }
     writer.out.reset();
     writer.interrupted = false;
     writer.error.clear();
