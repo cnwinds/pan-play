@@ -1,4 +1,5 @@
 #include "panplay/socket_util.hpp"
+#include "panplay/trace.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -12,9 +13,13 @@ namespace {
 constexpr int kReuseUnicastPort = 0x3007;
 #endif
 
-bool trace_enabled() {
-  const char* value = std::getenv("PANPLAY_FTP_TRACE");
-  return value && value[0] == '1';
+// 每条 FTP 命令都记，装一个游戏就是几万行，所以调试日志之外还要单独设 PANPLAY_FTP_TRACE=1。
+bool ftp_trace_enabled() {
+  static const bool requested = [] {
+    const char* value = std::getenv("PANPLAY_FTP_TRACE");
+    return value && value[0] == '1';
+  }();
+  return requested && log_enabled(LogLevel::debug);
 }
 
 }  // namespace
@@ -92,7 +97,7 @@ bool send_all(SOCKET socket, const char* data, std::size_t size) {
 }
 
 bool send_line(SOCKET socket, const std::string& line) {
-  if (trace_enabled()) std::cerr << "ftp > " << line << "\n";
+  if (ftp_trace_enabled()) log_line(LogLevel::debug, "ftp > " + line);
   const std::string framed = line + "\r\n";
   return send_all(socket, framed.data(), framed.size());
 }
@@ -112,7 +117,7 @@ bool LineReader::recv_line(std::string* line) {
       *line = pending.substr(0, pos);
       pending.erase(0, pos + 1);
       if (!line->empty() && line->back() == '\r') line->pop_back();
-      if (trace_enabled()) std::cerr << "ftp < " << *line << "\n";
+      if (ftp_trace_enabled()) log_line(LogLevel::debug, "ftp < " + *line);
       return true;
     }
     if (!recv_some(socket, &pending)) return false;

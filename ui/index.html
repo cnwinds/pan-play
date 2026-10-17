@@ -125,6 +125,12 @@
         <span class="tab-text"><strong>游戏资料库</strong><span class="tab-status" id="status-catalog">读取中…</span></span>
         <span class="tab-dot" id="dot-catalog" aria-hidden="true"></span>
       </button>
+      <button type="button" class="settings-tab" role="tab" id="tab-log" data-panel="log"
+              aria-controls="panel-log" aria-selected="false" tabindex="-1">
+        <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3.5h7l4 4V20a.5.5 0 0 1-.5.5h-10A.5.5 0 0 1 7 20z"/><path d="M14 3.5v4h4M9.5 12h5M9.5 15h5M9.5 18h3"/></svg>
+        <span class="tab-text"><strong>日志</strong><span class="tab-status" id="status-log">读取中…</span></span>
+        <span class="tab-dot" id="dot-log" aria-hidden="true"></span>
+      </button>
     </div>
     <div class="settings-quit">
       <button type="button" class="btn quiet small" id="quit">退出盘游</button>
@@ -204,6 +210,22 @@
             <div class="scale" id="dict-scale"></div>
             <p class="scale-note" id="dict-note"></p>
           </fieldset>
+        </div>
+      </section>
+      <section id="panel-log" role="tabpanel" aria-labelledby="head-log" hidden>
+        <header class="panel-head">
+          <h2 id="head-log">日志</h2>
+          <p>盘游把运行情况记在日志文件里，遇到问题时可以把它发给开发者。平时只记启动、安装、删除和出错。</p>
+        </header>
+        <div class="panel-body">
+          <div class="choices">
+            <label class="choice-card">
+              <input type="checkbox" name="verbose_log">
+              <strong>详细日志</strong>
+              <span>每个请求、网络连接和内存占用也记下来，排查问题时打开，用完记得关掉</span>
+            </label>
+          </div>
+          <p class="log-path">日志文件 <span class="num" id="log-path"></span></p>
         </div>
       </section>
       <footer class="panel-foot">

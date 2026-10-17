@@ -56,4 +56,5 @@ $PS5_PAYLOAD_SDK/bin/prospero-cmake -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYP
 
 - 自测需要 PATH 里有 `rar` 和 `7z`，或用 `PANPLAY_RAR`、`PANPLAY_7Z` 指定。Windows 上默认用 `C:\Program Files\WinRAR\Rar.exe` 和 `C:\Program Files\7-Zip\7z.exe`。
 - Windows 和 Linux 以外的平台在 CMake 配置时下载 mbedTLS、zlib 和根证书包。
+- 日志分错误、警告、信息、调试四级。作为服务运行时写到数据目录的 `panplay.log`（超过 2 MB 换新文件，留一份 `panplay.old.log`），默认记到信息级，设置里打开「详细日志」记到调试级；命令行子命令只把警告以上打到 stderr。环境变量 `PANPLAY_LOG=error|warn|info|debug` 可以指定级别；FTP 的每条命令要另设 `PANPLAY_FTP_TRACE=1` 才记。代码里调试级用 `PANPLAY_DEBUG(...)`，没打开时连消息都不拼。
 - 推送后 GitHub Actions 会编出三个平台的包；在 `main` 上推送 `v` 开头的标签会自动建 Release，流程见 [发布流程](agents/release.md)。

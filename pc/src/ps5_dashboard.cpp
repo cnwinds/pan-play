@@ -68,7 +68,7 @@ std::string firmware_text() {
 }
 
 void* open_lib(const char* name, std::string* error) {
-  panplay::trace(std::string("桌面图标：加载 ") + name);
+  panplay::log_info(std::string("桌面图标：加载 ") + name);
   void* lib = dlopen(name, RTLD_LAZY);
   if (lib == nullptr) {
     const char* reason = dlerror();
@@ -97,7 +97,7 @@ bool load_app_inst_util(AppInstUtil* out, std::string* error) {
   if (user_service == nullptr) return false;
   const auto user_init = find_symbol<int (*)(void*)>(user_service, "sceUserServiceInitialize", error);
   if (user_init == nullptr) return false;
-  panplay::trace("桌面图标：sceUserServiceInitialize 返回 " + hex_code(user_init(nullptr)));
+  panplay::log_info("桌面图标：sceUserServiceInitialize 返回 " + hex_code(user_init(nullptr)));
 
   void* lib = open_lib("libSceAppInstUtil.sprx", error);
   if (lib == nullptr) return false;
@@ -107,7 +107,7 @@ bool load_app_inst_util(AppInstUtil* out, std::string* error) {
     *error = "sceAppInstUtilInitialize 返回 " + hex_code(code);
     return false;
   }
-  panplay::trace("桌面图标：sceAppInstUtilInitialize 成功");
+  panplay::log_info("桌面图标：sceAppInstUtilInitialize 成功");
 
   out->install_all = find_symbol<int (*)(void*)>(lib, "sceAppInstUtilAppInstallAll", error);
   // 按目录注册单个应用的函数没有导出名字，只能按 NID 找。
@@ -128,15 +128,15 @@ bool load_app_inst_util(AppInstUtil* out, std::string* error) {
 std::string register_title(const AppInstUtil& util) {
   int code = 0;
   if (util.install_title_dir != nullptr && firmware_major() < 12) {
-    panplay::trace("桌面图标：调用 sceAppInstUtilAppInstallTitleDir");
+    panplay::log_info("桌面图标：调用 sceAppInstUtilAppInstallTitleDir");
     code = util.install_title_dir(kTitleId, "/user/app/", nullptr);
   } else if (util.install_all != nullptr) {
-    panplay::trace("桌面图标：调用 sceAppInstUtilAppInstallAll");
+    panplay::log_info("桌面图标：调用 sceAppInstUtilAppInstallAll");
     code = util.install_all(nullptr);
   } else {
     return "这个固件上找不到 sceAppInstUtilAppInstallAll";
   }
-  panplay::trace("桌面图标：注册返回 " + hex_code(code));
+  panplay::log_info("桌面图标：注册返回 " + hex_code(code));
   if (code != 0 && code != kAppRestored) return "注册桌面图标返回 " + hex_code(code);
   return "";
 }
@@ -153,7 +153,7 @@ DashboardIcon install_dashboard_icon(int port, std::string* error) {
   std::error_code ec;
   const bool registered = std::filesystem::exists(std::string("/user/appmeta/") + kTitleId + "/param.json", ec);
   if (registered && file_equals(param_path, param) && file_equals(icon_path, icon)) return DashboardIcon::unchanged;
-  panplay::trace(std::string("桌面图标：固件 ") + firmware_text() + "，" + (registered ? "内容有变，重装" : "还没注册，开始安装"));
+  panplay::log_info(std::string("桌面图标：固件 ") + firmware_text() + "，" + (registered ? "内容有变，重装" : "还没注册，开始安装"));
 
   AppInstUtil util;
   if (!load_app_inst_util(&util, error)) return DashboardIcon::failed;
@@ -169,7 +169,7 @@ DashboardIcon install_dashboard_icon(int port, std::string* error) {
     } else if (!write_file(param_path, param) || !write_file(icon_path, icon)) {
       failure = "写不进 " + app_dir + "/sce_sys";
     } else {
-      panplay::trace("桌面图标：已写入 " + app_dir + "/sce_sys");
+      panplay::log_info("桌面图标：已写入 " + app_dir + "/sce_sys");
       failure = register_title(util);
     }
     kernel_set_ucred_authid(-1, own_auth_id);

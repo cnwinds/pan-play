@@ -1838,6 +1838,12 @@ body.drawer-open { overflow: hidden; }
   font-size: 0.82rem;
 }
 
+.log-path {
+  color: var(--faint);
+  font-size: 0.82rem;
+  word-break: break-all;
+}
+
 @media (max-width: 760px) {
   .bar-inner {
     flex-wrap: wrap;

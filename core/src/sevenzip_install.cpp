@@ -603,7 +603,7 @@ std::string read_7z_archive(DrivePlugin& drive, const std::vector<DriveEntry>& p
   if (error.empty()) {
     std::uint64_t largest = 0;
     for (const auto& folder : archive->folders) largest = std::max(largest, needed_dictionary(folder));
-    trace("7z 字典 " + std::to_string(largest >> 20) + " MB，解压需要这么多内存");
+    PANPLAY_DEBUG("7z 字典 " + std::to_string(largest >> 20) + " MB，解压需要这么多内存");
     if (max_dictionary > 0 && largest > max_dictionary) error = dictionary_refusal("7z", largest, max_dictionary);
   }
   if (!error.empty()) *archive = SevenZipArchive{};
@@ -735,10 +735,12 @@ std::string extract_7z_entries(DrivePlugin& drive, InstallSink& sink, const std:
     report(folder.pack_offset + static_cast<std::int64_t>(folder.pack_size), true);
   }
 
-  if (std::getenv("PANPLAY_TRACE") != nullptr) {
+  if (log_enabled(LogLevel::debug)) {
     const double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    std::fprintf(stderr, "[trace] 7z: %.1fs total, %.1fs reading+decoding, %.1f MB decoded\n", total, wait_seconds,
-                 static_cast<double>(decoded_bytes) / (1 << 20));
+    char text[128];
+    std::snprintf(text, sizeof(text), "7z 解压结束，共 %.1f 秒，读取加解码 %.1f 秒，解出 %.1f MB", total, wait_seconds,
+                  static_cast<double>(decoded_bytes) / (1 << 20));
+    log_line(LogLevel::debug, text);
   }
   return "";
 }

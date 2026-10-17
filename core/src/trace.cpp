@@ -6,12 +6,20 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
+#include <mutex>
 #include <thread>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+
 #if defined(_WIN32)
+#define PSAPI_VERSION 2
+#include <windows.h>
 #include <io.h>
+#include <psapi.h>
 #else
 #include <signal.h>
 #include <sys/resource.h>
@@ -36,9 +44,18 @@ extern "C" int malloc_stats_fast(SceLibcMallocManagedSize* stats);
 namespace panplay {
 namespace {
 
-std::atomic<bool> enabled{false};
+constexpr std::uint64_t kMaxLogBytes = 2u << 20;
+
+std::atomic<int> current_level{static_cast<int>(LogLevel::warn)};
 const auto started = std::chrono::steady_clock::now();
 std::atomic<int> next_thread{1};
+
+// 日志文件的描述符，没打开时为 -1，写到 stderr。信号处理里只读它，换文件时在锁里改。
+std::atomic<int> log_fd{-1};
+std::mutex file_mu;
+std::filesystem::path file_path;
+std::uint64_t file_bytes = 0;
+bool capture_stdio_to_file = false;
 
 int thread_number() {
   thread_local const int number = next_thread++;
@@ -47,17 +64,76 @@ int thread_number() {
 
 // 信号处理里也会调用，只能用 write 这类异步信号安全的调用。
 void write_raw(const char* data, std::size_t size) {
+  const int fd = log_fd.load();
 #if defined(_WIN32)
-  _write(2, data, static_cast<unsigned>(size));
+  _write(fd >= 0 ? fd : 2, data, static_cast<unsigned>(size));
 #else
   while (size > 0) {
-    const ssize_t n = ::write(STDERR_FILENO, data, size);
+    const ssize_t n = ::write(fd >= 0 ? fd : STDERR_FILENO, data, size);
     if (n < 0 && errno == EINTR) continue;
     if (n <= 0) return;
     data += n;
     size -= static_cast<std::size_t>(n);
   }
 #endif
+}
+
+void close_fd(int fd) {
+#if defined(_WIN32)
+  _close(fd);
+#else
+  ::close(fd);
+#endif
+}
+
+std::filesystem::path old_log_path() {
+  std::filesystem::path name = file_path.stem();
+  name += ".old";
+  name += file_path.extension();
+  return file_path.parent_path() / name;
+}
+
+// 调用方持有 file_mu。
+bool reopen_locked() {
+#if defined(_WIN32)
+  const int fd = _wopen(file_path.c_str(), _O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+  const int fd = ::open(file_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+#endif
+  if (fd < 0) return false;
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(file_path, ec);
+  file_bytes = ec ? 0 : size;
+#if !defined(_WIN32)
+  if (capture_stdio_to_file) {
+    std::fflush(nullptr);
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  }
+#endif
+  const int previous = log_fd.exchange(fd);
+  if (previous >= 0) close_fd(previous);
+  return true;
+}
+
+// 调用方持有 file_mu。Windows 上开着的文件改不了名，先关掉再改。
+void rotate_locked() {
+  const int previous = log_fd.exchange(-1);
+  if (previous >= 0) close_fd(previous);
+  std::error_code ec;
+  std::filesystem::rename(file_path, old_log_path(), ec);
+  reopen_locked();
+}
+
+const char* level_tag(LogLevel level) {
+  switch (level) {
+    case LogLevel::error: return "E";
+    case LogLevel::warn: return "W";
+    case LogLevel::info: return "I";
+    case LogLevel::debug: return "D";
+  }
+  return "?";
 }
 
 void write_crash_line(int sig, const void* address) {
@@ -106,21 +182,42 @@ void on_terminate() {
       what = "非 std::exception 类型";
     }
   }
-  trace("!!! 未捕获的异常，进程结束: " + what);
+  log_error("!!! 未捕获的异常，进程结束: " + what);
   std::abort();
 }
 
 }  // namespace
 
-void enable_trace() {
-  enabled = true;
-  thread_number();
+void set_log_level(LogLevel level) { current_level = static_cast<int>(level); }
+
+LogLevel log_level() { return static_cast<LogLevel>(current_level.load()); }
+
+bool log_enabled(LogLevel level) { return static_cast<int>(level) <= current_level.load(); }
+
+LogLevel log_level_from_env(LogLevel fallback) {
+  const char* value = std::getenv("PANPLAY_LOG");
+  if (value == nullptr) return fallback;
+  if (std::strcmp(value, "error") == 0) return LogLevel::error;
+  if (std::strcmp(value, "warn") == 0) return LogLevel::warn;
+  if (std::strcmp(value, "info") == 0) return LogLevel::info;
+  if (std::strcmp(value, "debug") == 0) return LogLevel::debug;
+  return fallback;
 }
 
-bool trace_enabled() { return enabled; }
+bool open_log_file(const std::filesystem::path& path, bool capture_stdio) {
+  thread_number();
+  std::lock_guard<std::mutex> lock(file_mu);
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  file_path = path;
+  capture_stdio_to_file = capture_stdio;
+  // 追加写：再次启动不会冲掉上次崩溃前的记录。
+  if (std::filesystem::file_size(path, ec) > kMaxLogBytes && !ec) std::filesystem::rename(path, old_log_path(), ec);
+  return reopen_locked();
+}
 
-void trace(const std::string& message) {
-  if (!enabled) return;
+void log_line(LogLevel level, const std::string& message) {
+  if (!log_enabled(level)) return;
   const auto now = std::chrono::system_clock::now();
   const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
   const int ms = static_cast<int>(
@@ -133,10 +230,20 @@ void trace(const std::string& message) {
 #endif
   const double uptime = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
   char head[96];
-  std::snprintf(head, sizeof(head), "%04d-%02d-%02d %02d:%02d:%02d.%03d +%.3fs [t%d] ", tm.tm_year + 1900,
-                tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, ms, uptime, thread_number());
+  std::snprintf(head, sizeof(head), "%04d-%02d-%02d %02d:%02d:%02d.%03d +%.3fs [t%d] %s ", tm.tm_year + 1900,
+                tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, ms, uptime, thread_number(),
+                level_tag(level));
   const std::string line = head + message + "\n";
+  std::lock_guard<std::mutex> lock(file_mu);
   write_raw(line.data(), line.size());
+  if (log_fd.load() < 0) return;
+  // 写文件时，警告和错误在控制台上也打一份，开着窗口的人能直接看到。
+  if (level <= LogLevel::warn && !capture_stdio_to_file) {
+    std::fwrite(line.data(), 1, line.size(), stderr);
+    std::fflush(stderr);
+  }
+  file_bytes += line.size();
+  if (file_bytes > kMaxLogBytes) rotate_locked();
 }
 
 void install_crash_trace() {
@@ -151,7 +258,7 @@ void install_crash_trace() {
   for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTERM, SIGHUP, SIGSYS}) sigaction(sig, &action, nullptr);
 #endif
   std::set_terminate(on_terminate);
-  std::atexit([] { trace("进程调用 exit 退出"); });
+  std::atexit([] { log_info("进程调用 exit 退出"); });
 }
 
 void install_signal_stack() {
@@ -168,14 +275,19 @@ void start_trace_heartbeat() {
   std::thread([] {
     for (int beat = 1;; ++beat) {
       std::this_thread::sleep_for(std::chrono::seconds(beat <= 24 ? 5 : 60));
-      trace("心跳 " + memory_summary());
+      PANPLAY_DEBUG("心跳 " + memory_summary());
     }
   }).detach();
 }
 
 std::string memory_summary() {
   std::string out;
-#if !defined(_WIN32)
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS counters{};
+  if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+    out = "峰值内存 " + std::to_string(counters.PeakWorkingSetSize >> 20) + " MB";
+  }
+#else
   rusage usage{};
   if (getrusage(RUSAGE_SELF, &usage) == 0) out = "峰值内存 " + std::to_string(usage.ru_maxrss / 1024) + " MB";
 #endif

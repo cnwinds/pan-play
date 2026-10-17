@@ -89,7 +89,9 @@ std::string settings_json(const AppSettings& settings) {
   json += "],\"local_dir\":\"" + json_escape(settings.local_dir) + "\",\"ftp_host\":\"" + json_escape(settings.ftp_host) +
           "\",\"ftp_port\":\"" + json_escape(settings.ftp_port) + "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) +
           "\",\"max_dictionary_mb\":" + std::to_string(settings.max_dictionary_mb) +
-          ",\"default_dictionary_mb\":" + std::to_string(kDefaultMaxDictionaryMb) + "}";
+          ",\"default_dictionary_mb\":" + std::to_string(kDefaultMaxDictionaryMb) +
+          ",\"verbose_log\":" + (settings.verbose_log ? "true" : "false") + ",\"log_path\":\"" +
+          json_escape((panplay::app_data_dir() / "panplay.log").u8string()) + "\"}";
   return json;
 }
 
@@ -142,6 +144,7 @@ std::string apply_settings(const panplay::Json& json, AppSettings* settings) {
   if (!port.empty()) settings->ftp_port = port;
   if (!ftp_dir.empty()) settings->ftp_dir = ftp_dir;
   if (has_dictionary) settings->max_dictionary_mb = static_cast<std::uint64_t>(dictionary);
+  if (json.get("verbose_log") != nullptr) settings->verbose_log = json.boolean_or("verbose_log", false);
   return "";
 }
 
@@ -954,9 +957,10 @@ void queue_worker() {
       path = installs.current->path;
       cancel = installs.current->cancel;
     }
-    panplay::trace("开始安装 " + path);
+    panplay::log_info("开始安装 " + path);
     const panplay::InstallResult result = run_install(path, cancel.get());
-    panplay::trace("安装结束 " + path + "：" + result.status + " " + result.message + "，" + panplay::memory_summary());
+    panplay::log_line(result.status == "error" ? panplay::LogLevel::warn : panplay::LogLevel::info,
+                      "安装结束 " + path + "：" + result.status + " " + result.message + "，" + panplay::memory_summary());
     if (result.status == "installed" || result.status == "already") forget_install_progress(path);
     else save_install_progress(path, progress_of(result));
     forget_game_detail(path);
@@ -990,7 +994,7 @@ void load_queue() {
     task.path = item.text;
     installs.waiting.push_back(std::move(task));
   }
-  panplay::trace("上次没装完的队列有 " + std::to_string(installs.waiting.size()) + " 个，接着装");
+  if (!installs.waiting.empty()) panplay::log_info("上次没装完的队列有 " + std::to_string(installs.waiting.size()) + " 个，接着装");
   start_worker_locked();
 }
 
@@ -1281,7 +1285,7 @@ void handle_client(SOCKET client, bool local_peer) {
   const std::string target = request_target(header);
   // 界面每秒轮询队列、每几秒查资料库状态，封面一页几十张，这些不记。
   if (target != "/api/queue" && target != "/api/catalog" && target.rfind("/api/cover/", 0) != 0) {
-    panplay::trace("请求 " + method + " " + target + (local_peer ? "（本机）" : "（局域网）"));
+    PANPLAY_DEBUG("请求 " + method + " " + target + (local_peer ? "（本机）" : "（局域网）"));
   }
   if (!local_peer && !lan.enabled) {
     reply_json(client, 403, json_error("局域网访问已关闭，请在运行盘游的电脑上打开设置里的局域网访问"));
@@ -1423,6 +1427,10 @@ void handle_client(SOCKET client, bool local_peer) {
       return;
     }
     const std::string error = save_settings(settings);
+    if (error.empty() && (settings.verbose_log ? panplay::LogLevel::debug : panplay::LogLevel::info) != panplay::log_level()) {
+      panplay::set_log_level(settings.verbose_log ? panplay::LogLevel::debug : panplay::LogLevel::info);
+      panplay::log_info(std::string("详细日志已") + (settings.verbose_log ? "打开" : "关闭"));
+    }
     reply_json(client, error.empty() ? 200 : 500, error.empty() ? "{\"ok\":true}" : json_error(error));
     return;
   }
@@ -1614,14 +1622,14 @@ void handle_client(SOCKET client, bool local_peer) {
     try {
       const AppSettings settings = load_settings();
       if (auto sink = open_sink(settings, &error)) {
-        panplay::trace(std::string(whole ? "删除游戏 " : "删除没装完的文件 ") + path);
+        panplay::log_info(std::string(whole ? "删除游戏 " : "删除没装完的文件 ") + path);
         error = whole ? panplay::uninstall_game(*sink, settings.prefix(), path)
                       : panplay::discard_install(*sink, settings.prefix(), path);
       }
     } catch (const std::exception& ex) {
       error = std::string("删除失败: ") + ex.what();
     }
-    if (!error.empty()) panplay::trace("删除失败 " + path + "：" + error);
+    if (!error.empty()) panplay::log_warn("删除失败 " + path + "：" + error);
     {
       std::lock_guard<std::mutex> lock(installs.mu);
       installs.discarding.erase(path);
@@ -1670,78 +1678,76 @@ std::string lan_address() {
 int run_server(const ServerOptions& options) {
   const int port = options.port;
   on_quit = options.on_quit;
-  panplay::trace("数据目录 " + panplay::app_data_dir().u8string());
+  panplay::log_info("数据目录 " + panplay::app_data_dir().u8string());
+  {
+    const AppSettings settings = load_settings();
+    panplay::set_log_level(panplay::log_level_from_env(settings.verbose_log ? panplay::LogLevel::debug
+                                                                            : panplay::LogLevel::info));
+    lan.required = options.lan_required;
+    lan.enabled = lan.required || options.lan.value_or(settings.lan_access);
+    lan.require_code = settings.require_code;
+    lan.port = port;
+    PANPLAY_DEBUG("读取访问口令");
+    lan.code = load_or_create_access_code();
+    panplay::log_info(std::string("设置：局域网访问 ") + (lan.enabled ? "开" : "关") + "，口令 " +
+                      (lan.require_code ? "开" : "关") + "，详细日志 " + (settings.verbose_log ? "开" : "关"));
+  }
   {
     std::string catalog_error;
     const auto catalog_start = std::chrono::steady_clock::now();
-    panplay::trace("加载游戏资料库");
-    if (panplay::GameCatalog::instance().load_default(&catalog_error)) {
-      std::cout << "已加载游戏资料库 " << panplay::GameCatalog::instance().size() << " 条\n";
-    } else {
-      std::cerr << "游戏资料库未加载（将使用目录名占位，后台自动同步中）: " << catalog_error << "\n";
+    PANPLAY_DEBUG("加载游戏资料库");
+    if (!panplay::GameCatalog::instance().load_default(&catalog_error)) {
+      panplay::log_warn("游戏资料库未加载（将使用目录名占位，后台自动同步中）: " + catalog_error);
     }
-    panplay::trace("游戏资料库加载完：" + std::to_string(panplay::GameCatalog::instance().size()) + " 条，来源 " +
-                   panplay::GameCatalog::instance().meta().path + "，耗时 " +
-                   std::to_string(panplay::ms_since(catalog_start)) + " ms，" + panplay::memory_summary());
-    panplay::trace("启动资料库同步线程");
+    panplay::log_info("游戏资料库 " + std::to_string(panplay::GameCatalog::instance().size()) + " 条，来源 " +
+                      panplay::GameCatalog::instance().meta().path + "，耗时 " +
+                      std::to_string(panplay::ms_since(catalog_start)) + " ms，" + panplay::memory_summary());
+    PANPLAY_DEBUG("启动资料库同步线程");
     panplay::CatalogSync::instance().start(7, 24);
-    panplay::trace("读取商店资料缓存");
+    PANPLAY_DEBUG("读取商店资料缓存");
     store_meta = new panplay::StoreMetaCache(panplay::app_data_dir());
-    panplay::trace("启动商店资料线程");
+    PANPLAY_DEBUG("启动商店资料线程");
     store_meta->start();
   }
 
   std::string net_error;
   if (!panplay::net_startup(&net_error)) {
-    panplay::trace("网络初始化失败: " + net_error);
-    std::cerr << net_error << "\n";
+    panplay::log_error("网络初始化失败: " + net_error);
     return 1;
   }
-  {
-    panplay::trace("读取设置");
-    const AppSettings settings = load_settings();
-    lan.required = options.lan_required;
-    lan.enabled = lan.required || options.lan.value_or(settings.lan_access);
-    lan.require_code = settings.require_code;
-    lan.port = port;
-    panplay::trace("读取访问口令");
-    lan.code = load_or_create_access_code();
-    panplay::trace(std::string("设置读取完：局域网访问 ") + (lan.enabled ? "开" : "关") + "，口令 " +
-                   (lan.require_code ? "开" : "关"));
-  }
   SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (listener == INVALID_SOCKET) panplay::trace("创建监听套接字失败 errno " + std::to_string(errno));
+  if (listener == INVALID_SOCKET) panplay::log_error("创建监听套接字失败 errno " + std::to_string(errno));
   panplay::set_listen_exclusive(listener);
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(static_cast<std::uint16_t>(port));
   address.sin_addr.s_addr = htonl(INADDR_ANY);
-  panplay::trace("监听端口 " + std::to_string(port));
+  PANPLAY_DEBUG("监听端口 " + std::to_string(port));
   if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(listener, 8) != 0) {
-    panplay::trace("监听端口 " + std::to_string(port) + " 失败 errno " + std::to_string(errno));
-    std::cerr << "无法在端口 " << port << " 监听\n";
+    panplay::log_error("无法在端口 " + std::to_string(port) + " 监听，errno " + std::to_string(errno));
     return 1;
   }
-  panplay::trace("端口 " + std::to_string(port) + " 监听成功");
   const std::string local_url = "http://127.0.0.1:" + std::to_string(port);
   const std::string other_url = lan_url();
-  panplay::trace("局域网地址 " + (other_url.empty() ? std::string("（取不到）") : other_url));
+  panplay::log_info("服务就绪：本机 " + local_url + "，局域网 " + (other_url.empty() ? std::string("（取不到地址）") : other_url));
   const std::string code = lan.require_code ? lan.code : "";
+#if !defined(PANPLAY_PS5)
+  // 给开着控制台窗口的人看的。PS5 上标准输出接在日志文件里，上面那行日志已经记了。
   std::cout << "盘游界面 " << local_url << "\n";
   if (!other_url.empty()) std::cout << "局域网里打开 " << other_url << "\n";
   if (!lan.enabled) std::cout << "局域网访问已关闭，可在设置里打开\n";
   if (!code.empty()) std::cout << "访问口令 " << code << "（" << access_code_path() << "）\n";
   std::cout << "按 Ctrl+C 结束" << std::endl;
+#endif
   if (options.on_ready) options.on_ready(local_url, other_url, code);
-  panplay::trace("恢复安装队列");
   load_queue();
-  panplay::trace("安装队列恢复完，开始接受连接");
+  PANPLAY_DEBUG("安装队列恢复完，开始接受连接");
   while (true) {
     sockaddr_in peer{};
     panplay::socklen peer_length = sizeof(peer);
     SOCKET client = accept(listener, reinterpret_cast<sockaddr*>(&peer), &peer_length);
     if (client == INVALID_SOCKET) {
-      panplay::trace("accept 失败 errno " + std::to_string(errno) + "，停止服务");
+      panplay::log_error("accept 失败 errno " + std::to_string(errno) + "，停止服务");
       break;
     }
     const bool local_peer = peer.sin_family == AF_INET && (ntohl(peer.sin_addr.s_addr) >> 24) == 127;
@@ -1750,7 +1756,7 @@ int run_server(const ServerOptions& options) {
       try {
         handle_client(client, local_peer);
       } catch (const std::exception& e) {
-        panplay::trace(std::string("处理请求时出错: ") + e.what());
+        panplay::log_error(std::string("处理请求时出错: ") + e.what());
         try {
           reply_json(client, 500, json_error("服务器内部错误"));
         } catch (...) {

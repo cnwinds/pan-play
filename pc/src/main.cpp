@@ -79,7 +79,7 @@ void ensure_dashboard_icon(int port) {
   std::error_code ec;
   if (std::filesystem::exists(pending, ec)) {
     std::filesystem::remove(pending, ec);
-    panplay::trace("上次安装桌面图标没有做完，这次跳过");
+    panplay::log_warn("上次安装桌面图标没有做完，这次跳过");
     notify("上次安装盘游桌面图标时卡住了，这次跳过；再发送一次 elf 会重试");
     return;
   }
@@ -89,38 +89,33 @@ void ensure_dashboard_icon(int port) {
   std::filesystem::remove(pending, ec);
   switch (result) {
     case DashboardIcon::unchanged:
-      panplay::trace("桌面图标已在");
+      PANPLAY_DEBUG("桌面图标已在");
       break;
     case DashboardIcon::installed:
-      panplay::trace("已安装桌面图标");
+      panplay::log_info("已安装桌面图标");
       notify("已在主机桌面添加「盘游」图标，点它就能在主机上打开盘游");
       break;
     case DashboardIcon::failed:
-      panplay::trace("桌面图标没装上：" + error);
+      panplay::log_warn("桌面图标没装上：" + error);
       notify("盘游桌面图标没装上：" + error);
       break;
   }
 }
 
-// 一启动就把输出改写到数据目录的 panplay.log。加载器（elfldr 等）把输出接到管道或套接字上，
-// 对面不再读时写满就会卡住正在打印的线程。追加写：再次启动不会冲掉上次崩溃前的记录，超过 2 MB 时换新文件。
-void redirect_output_to_log() {
+#endif
+
+// 作为服务运行时日志写到数据目录的 panplay.log，先按「信息」级记，读到设置后由 run_server 按「详细日志」调整。
+// PS5 上标准输出和标准错误也接过去：加载器把它们接在管道上，对面不再读时写满会卡住正在打印的线程。
+void start_service_log(bool capture_stdio, int argc) {
   std::cout.flush();
   std::cerr.flush();
-  std::fflush(nullptr);
-  const std::filesystem::path path = panplay::app_data_dir() / "panplay.log";
-  std::error_code ec;
-  if (std::filesystem::file_size(path, ec) > (2u << 20) && !ec) {
-    std::filesystem::rename(path, panplay::app_data_dir() / "panplay.old.log", ec);
-  }
-  const int fd = open(path.string().c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-  if (fd < 0) return;
-  dup2(fd, STDOUT_FILENO);
-  dup2(fd, STDERR_FILENO);
-  close(fd);
-  std::setvbuf(stdout, nullptr, _IOLBF, 0);
+  panplay::open_log_file(panplay::app_data_dir() / "panplay.log", capture_stdio);
+  panplay::set_log_level(panplay::log_level_from_env(panplay::LogLevel::info));
+  panplay::install_crash_trace();
+  panplay::log_info("==== 盘游启动，参数 " + std::to_string(argc) + " 个，编译于 " + __DATE__ + " " + __TIME__ + "，" +
+                    panplay::memory_summary());
+  panplay::start_trace_heartbeat();
 }
-#endif
 
 #if defined(PANPLAY_PS5) || defined(_WIN32)
 // 本机这个端口上已经开着盘游时，取它的局域网地址和口令（不要口令时为空）。
@@ -387,14 +382,9 @@ int main(int argc, char** argv) {
     argv = utf8_argv.data();
   }
 #if defined(PANPLAY_PS5)
-  redirect_output_to_log();
-  panplay::enable_trace();
-  panplay::install_crash_trace();
-  panplay::trace("==== 盘游启动 pid " + std::to_string(getpid()) + "，参数 " + std::to_string(argc) + " 个，编译于 " +
-                 __DATE__ + " " + __TIME__ + "，" + panplay::memory_summary());
-  panplay::trace("线程栈：系统默认 " + std::to_string(ps5_default_thread_stack() >> 10) + " KB，盘游改用 " +
-                 std::to_string(kPs5ThreadStack >> 10) + " KB");
-  panplay::start_trace_heartbeat();
+  start_service_log(true, argc);
+  PANPLAY_DEBUG("pid " + std::to_string(getpid()) + "，线程栈：系统默认 " + std::to_string(ps5_default_thread_stack() >> 10) +
+                " KB，盘游改用 " + std::to_string(kPs5ThreadStack >> 10) + " KB");
   // 载荷由 ELF 加载器启动，通常不带参数：直接开局域网界面。
   if (argc < 2) {
     ServerOptions options;
@@ -403,33 +393,28 @@ int main(int argc, char** argv) {
     ensure_dashboard_icon(options.port);
     std::string running_url;
     std::string running_code;
-    panplay::trace("检查端口 " + std::to_string(options.port) + " 上是否已有盘游");
+    PANPLAY_DEBUG("检查端口 " + std::to_string(options.port) + " 上是否已有盘游");
     if (running_instance(options.port, &running_url, &running_code)) {
-      panplay::trace("已有盘游在运行 " + running_url + "，本次退出");
+      panplay::log_info("已有盘游在运行 " + running_url + "，本次退出");
       notify("盘游已经在运行 " + running_url + (running_code.empty() ? "" : " 口令 " + running_code));
       // 走正常退出时，系统库在析构全局对象时抛 resource deadlock would occur 并中止进程，这里什么都不用清理。
       std::fflush(nullptr);
       std::_Exit(0);
     }
-    panplay::trace("没有已在运行的盘游，开始启动服务");
+    PANPLAY_DEBUG("没有已在运行的盘游，开始启动服务");
     options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
-      panplay::trace("服务就绪，弹出启动通知 " + url);
       notify("盘游已启动 " + url + (code.empty() ? "" : " 口令 " + code));
     };
-    options.on_quit = [] {
-      panplay::trace("用户在设置页退出盘游");
-      notify("盘游已退出");
-    };
+    options.on_quit = [] { notify("盘游已退出"); };
     const int code = run_server(options);
-    panplay::trace("run_server 返回 " + std::to_string(code));
+    panplay::log_info("服务结束，返回 " + std::to_string(code));
     if (code != 0) notify("盘游没能启动：端口 " + std::to_string(options.port) + " 可能已被占用");
     return code;
   }
 #else
-  if (std::getenv("PANPLAY_TRACE") != nullptr) {
-    panplay::enable_trace();
-    panplay::install_crash_trace();
-  }
+  // 命令行子命令不写日志文件，警告以上打到 stderr；PANPLAY_LOG=debug 可以看全部细节。
+  panplay::set_log_level(panplay::log_level_from_env(panplay::LogLevel::warn));
+  panplay::install_crash_trace();
 #endif
 #if defined(_WIN32)
   // 双击 exe 时不带参数：直接开本机界面，并用默认浏览器打开。窗口一关程序就退出，所以出错时停住让人看到原因。
@@ -443,6 +428,7 @@ int main(int argc, char** argv) {
       ShellExecuteA(nullptr, "open", local_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
       return 0;
     }
+    start_service_log(false, argc);
     options.on_ready = [](const std::string& url, const std::string&, const std::string&) {
       ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     };
@@ -459,7 +445,12 @@ int main(int argc, char** argv) {
     return 1;
   }
   const std::string command = argv[1];
-  if (command == "serve") return serve(argc, argv);
+  if (command == "serve") {
+#if !defined(PANPLAY_PS5)
+    start_service_log(false, argc);
+#endif
+    return serve(argc, argv);
+  }
   if (command == "bench-prefetch") return panplay::run_prefetch_bench();
   if (command == "bench-download" && argc >= 3) {
     return bench_download(argv[2], argc >= 4 ? std::stoi(argv[3]) : 20, argc >= 5 ? std::stoi(argv[4]) : 0,

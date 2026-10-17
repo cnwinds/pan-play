@@ -1645,6 +1645,9 @@ function summarizeSettings() {
 
   const dictionary = chosenDictionary();
   setTabStatus("unpack", dictionary ? `字典上限 ${dictionaryText(dictionary)}` : "字典不限制", dictionary ? "ok" : "warn");
+
+  const verbose = form.elements.verbose_log.checked;
+  setTabStatus("log", verbose ? "详细日志开着" : "只记要紧的", verbose ? "warn" : "ok");
 }
 
 let catalogTimer = 0;
@@ -1779,6 +1782,8 @@ async function loadSettings() {
   for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) form.elements[name].value = settings[name] || "";
   renderTarget(settings.target);
   renderDictionary(settings.max_dictionary_mb ?? settings.default_dictionary_mb, settings.default_dictionary_mb);
+  form.elements.verbose_log.checked = Boolean(settings.verbose_log);
+  $("#log-path").textContent = settings.log_path || "";
   summarizeSettings();
   await Promise.all([loadAccess(), loadCatalogStatus()]);
 }
@@ -1861,6 +1866,7 @@ form.addEventListener("submit", async (event) => {
   };
   for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) body[name] = form.elements[name].value;
   body.max_dictionary_mb = chosenDictionary();
+  body.verbose_log = form.elements.verbose_log.checked;
   settingsNote.classList.remove("error");
   try {
     await api("/api/settings", body);

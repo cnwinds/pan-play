@@ -70,10 +70,10 @@ bool fetch_and_write_catalog(const std::string& output_path, const std::string& 
   request.headers.push_back({"User-Agent", "panplay-catalog-sync/1.0"});
   request.timeout_ms = 120000;
 
-  trace("资料库同步：开始下载 " + request.url + "，" + memory_summary());
+  PANPLAY_DEBUG("资料库同步：开始下载 " + request.url + "，" + memory_summary());
   const auto download_start = std::chrono::steady_clock::now();
   const HttpResponse response = http_send(request);
-  trace("资料库同步：下载结束 HTTP " + std::to_string(response.status) + "，" + std::to_string(response.body.size()) +
+  PANPLAY_DEBUG("资料库同步：下载结束 HTTP " + std::to_string(response.status) + "，" + std::to_string(response.body.size()) +
         " 字节，耗时 " + std::to_string(ms_since(download_start)) + " ms" +
         (response.error.empty() ? "" : "，错误 " + response.error) + "，" + memory_summary());
   if (!response.error.empty()) {
@@ -86,10 +86,10 @@ bool fetch_and_write_catalog(const std::string& output_path, const std::string& 
   }
 
   std::string parse_error;
-  trace("资料库同步：开始解析 JSON");
+  PANPLAY_DEBUG("资料库同步：开始解析 JSON");
   const auto parse_start = std::chrono::steady_clock::now();
   const Json root = Json::parse(response.body, &parse_error);
-  trace("资料库同步：解析结束，" + std::to_string(root.array.size()) + " 条，耗时 " +
+  PANPLAY_DEBUG("资料库同步：解析结束，" + std::to_string(root.array.size()) + " 条，耗时 " +
         std::to_string(ms_since(parse_start)) + " ms" + (parse_error.empty() ? "" : "，错误 " + parse_error) + "，" +
         memory_summary());
   if (!parse_error.empty()) {
@@ -107,7 +107,7 @@ bool fetch_and_write_catalog(const std::string& output_path, const std::string& 
   std::filesystem::path tmp_path = out_path;
   tmp_path += ".tmp";
 
-  trace("资料库同步：写入 " + tmp_path.u8string());
+  PANPLAY_DEBUG("资料库同步：写入 " + tmp_path.u8string());
   std::ofstream out(tmp_path, std::ios::binary);
   if (!out) {
     if (error) *error = "无法写入临时 catalog 文件";
@@ -164,7 +164,7 @@ bool fetch_and_write_catalog(const std::string& output_path, const std::string& 
     if (error) *error = "替换 catalog 文件失败";
     return false;
   }
-  trace("资料库同步：写入完成 " + std::to_string(count) + " 条");
+  PANPLAY_DEBUG("资料库同步：写入完成 " + std::to_string(count) + " 条");
   return true;
 }
 
@@ -211,32 +211,30 @@ void CatalogSync::sync_once() {
 
   if (ok) {
     std::string reload_error;
-    trace("资料库同步：重新加载 " + path);
+    PANPLAY_DEBUG("资料库同步：重新加载 " + path);
     if (GameCatalog::instance().load_file(path, &reload_error)) {
-      trace("资料库同步：重新加载完 " + std::to_string(GameCatalog::instance().size()) + " 条，" + memory_summary());
+      log_info("游戏资料库已自动同步，共 " + std::to_string(GameCatalog::instance().size()) + " 条，" + memory_summary());
       std::lock_guard<std::mutex> lock(mu_);
       info_.phase = CatalogSyncPhase::idle;
       info_.last_success_unix = unix_now();
       info_.last_error.clear();
-      std::cerr << "游戏资料库已自动同步，共 " << GameCatalog::instance().size() << " 条\n";
     } else {
       std::lock_guard<std::mutex> lock(mu_);
       info_.phase = CatalogSyncPhase::idle;
       info_.last_error = reload_error.empty() ? "重载资料库失败" : reload_error;
-      std::cerr << "资料库已下载但重载失败: " << info_.last_error << "\n";
+      log_warn("资料库已下载但重载失败: " + info_.last_error);
     }
   } else {
     std::lock_guard<std::mutex> lock(mu_);
     info_.phase = CatalogSyncPhase::idle;
     info_.last_error = sync_error;
-    trace("资料库同步失败: " + sync_error);
-    std::cerr << "自动同步资料库失败（保留现有数据）: " << sync_error << "\n";
+    log_warn("自动同步资料库失败（保留现有数据）: " + sync_error);
   }
 }
 
 void CatalogSync::run_loop() {
   const bool update = needs_update();
-  trace(std::string("资料库同步线程启动，") + (update ? "资料库过期，马上同步" : "资料库够新，暂不同步"));
+  PANPLAY_DEBUG(std::string("资料库同步线程启动，") + (update ? "资料库过期，马上同步" : "资料库够新，暂不同步"));
   if (update) sync_once();
 
   while (!stop_) {

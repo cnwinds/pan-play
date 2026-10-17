@@ -1,4 +1,5 @@
 #include "panplay/prefetch.hpp"
+#include "panplay/trace.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -291,7 +292,7 @@ void PrefetchReader::worker_loop(AbortSignal& signal) {
         drop_stream();
         if (!arm_open(signal, generation)) break;
         std::string open_error;
-        if (std::getenv("PANPLAY_TRACE") != nullptr) std::cerr << "打开下载 @" << at << "\n";
+        PANPLAY_DEBUG("预读：打开下载 @" + std::to_string(at));
         auto opened = drive_.open_stream(file_id_, at, &open_error, &signal);
         if (!opened) {
           if (++failures > options_.max_retries) {
@@ -427,9 +428,8 @@ std::string PrefetchReader::seek(std::int64_t position) {
       return "";
     }
   }
-  if (std::getenv("PANPLAY_TRACE") != nullptr) {
-    std::cerr << "跳转 " << position_ << " -> " << position << "，缓冲到 " << buffered_end_locked() << "\n";
-  }
+  PANPLAY_DEBUG("预读：跳转 " + std::to_string(position_) + " -> " + std::to_string(position) + "，缓冲到 " +
+                std::to_string(buffered_end_locked()));
   ++generation_;
   blocks_.clear();
   pending_.clear();

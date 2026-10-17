@@ -579,10 +579,9 @@ void StoreMetaCache::process(std::int64_t concept_id) {
 
   if (full) {
     std::string error;
-    trace("商店资料：抓取 " + std::to_string(concept_id));
+    PANPLAY_DEBUG("商店资料：抓取 " + std::to_string(concept_id));
     if (!fetch_store_meta(concept_id, fetch_, &meta, &error, [this] { throttle(); })) {
-      trace("商店资料：" + std::to_string(concept_id) + " 取不到: " + error);
-      std::cerr << "商店资料 " << concept_id << " 暂时取不到: " << error << "\n";
+      log_warn("商店资料 " + std::to_string(concept_id) + " 暂时取不到: " + error);
       std::lock_guard<std::mutex> lock(mu_);
       retry_after_[concept_id] = std::chrono::steady_clock::now() + kOfflineRetry;
       in_flight_.erase(concept_id);
@@ -616,8 +615,8 @@ void StoreMetaCache::process(std::int64_t concept_id) {
     }
   }
   meta.has_cover = meta.found && std::filesystem::exists(cover_path);
-  trace("商店资料：" + std::to_string(concept_id) + (meta.found ? " 已更新" : " 商店没有收录") +
-        (meta.has_cover ? "，有封面" : "，无封面"));
+  PANPLAY_DEBUG("商店资料：" + std::to_string(concept_id) + (meta.found ? " 已更新" : " 商店没有收录") +
+                (meta.has_cover ? "，有封面" : "，无封面"));
 
   std::lock_guard<std::mutex> lock(mu_);
   entries_[concept_id] = meta;
@@ -630,7 +629,7 @@ void StoreMetaCache::process(std::int64_t concept_id) {
 
 void StoreMetaCache::load() {
   const std::string text = read_text(dir_ / "store-meta.json");
-  trace("商店资料缓存 " + std::to_string(text.size()) + " 字节");
+  PANPLAY_DEBUG("商店资料缓存 " + std::to_string(text.size()) + " 字节");
   if (text.empty()) return;
   const Json root = Json::parse(text, nullptr);
   const Json* concepts = root.get("concepts");
@@ -703,7 +702,7 @@ void StoreMetaCache::save_locked() {
   }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
-  if (ec) std::cerr << "写入商店资料缓存失败: " << ec.message() << "\n";
+  if (ec) log_warn("写入商店资料缓存失败: " + ec.message());
 }
 
 int run_store_meta_cli(const std::string& concept_id) {

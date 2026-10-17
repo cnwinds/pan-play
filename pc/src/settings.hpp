@@ -34,6 +34,8 @@ struct AppSettings {
   bool lan_access = true;
   bool require_code = false;
   std::uint64_t max_dictionary_mb = kDefaultMaxDictionaryMb;
+  // 详细日志：连逐个请求、网络连接、心跳这类排查用的细节也记。平时关着，只记启动、安装和出错。
+  bool verbose_log = false;
 
   DriveSettings current_drive() const;
   std::string library_path() const { return current_drive().library_path; }
