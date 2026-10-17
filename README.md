@@ -18,11 +18,11 @@
 
 ### 跑在 PS5 上（不用开电脑）
 
-1. 主机运行 [websrv](https://github.com/ps5-payload-dev/websrv)，桌面会出现 Homebrew Launcher。
-2. 解压 `panplay-<版本>-ps5-homebrew.zip`，把得到的 `Panplay` 文件夹用 FTP 放进主机的 `/data/homebrew/`，或拷到 U 盘的 `homebrew/` 再插上主机。
-3. 在 Homebrew Launcher 里点盘游，主机右上角通知会给出访问地址，用手机或电脑浏览器打开。
+1. 用 payload 加载器把 `panplay-<版本>-ps5.elf` 发送到主机。
+2. 主机右上角通知会给出访问地址，用手机或电脑浏览器打开。
+3. 第一次运行会在主机桌面装一个「盘游」图标，点它直接在主机上打开盘游。
 
-盘游在后台运行，去玩游戏不影响它安装。游戏默认装到主机的 `/data/homebrew`。
+盘游在后台运行，去玩游戏不影响它安装。主机重启后要重新发送一次 elf，桌面图标不用重装；没发送就点图标，会打不开页面。游戏默认装到主机的 `/data/homebrew`。
 
 ### 跑在 Windows 电脑上
 

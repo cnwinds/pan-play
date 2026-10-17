@@ -50,7 +50,7 @@ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 $PS5_PAYLOAD_SDK/bin/prospero-cmake -S . -B build-ps5 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-ps5
 ```
 
-改了 `ps5/icon.svg` 后重新生成 Homebrew Launcher 用的 `icon0.png`（512×512），比如用 Chrome：`chrome --headless=new --window-size=512,512 --screenshot=ps5/homebrew/sce_sys/icon0.png file:///<仓库路径>/ps5/icon.svg`。
+改了 `ps5/icon.svg` 后重新生成桌面图标用的 `icon0.png`（512×512，编译时打包进 elf），比如用 Chrome：`chrome --headless=new --window-size=512,512 --screenshot=ps5/icon0.png file:///<仓库路径>/ps5/icon.svg`。
 
 ## 说明
 

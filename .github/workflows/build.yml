@@ -70,19 +70,10 @@ jobs:
               && cmake --build build-ps5; } 2>&1 | tee build.log \
             || { .github/report-errors.sh build.log; exit 1; }
 
-      # websrv 的 Homebrew Launcher 认 homebrew/<名字>/ 下的 eboot.elf、sce_sys/icon0.png 和 homebrew.js。
-      - name: 打包 Homebrew Launcher 目录
-        run: |
-          mkdir -p dist-ps5/Panplay
-          cp -r ps5/homebrew/. dist-ps5/Panplay/
-          cp build-ps5/panplay.elf dist-ps5/Panplay/eboot.elf
-          cp build-ps5/panplay.elf dist-ps5/panplay.elf
-          (cd dist-ps5 && zip -qr panplay-homebrew.zip Panplay && rm -r Panplay)
-
       - uses: actions/upload-artifact@v4
         with:
           name: panplay-ps5
-          path: dist-ps5/*
+          path: build-ps5/panplay.elf
 
   # 自测要 WinRAR 和 7-Zip 生成测试压缩包，这里没有，自测交给 linux 那边。
   windows:
@@ -125,7 +116,7 @@ jobs:
           name: panplay-windows
           path: build-win/panplay.exe
 
-  # 推送 v 开头的标签时发布：Windows 的 exe、PS5 的 elf 和 Homebrew Launcher 目录的 zip 挂到 Release 上。
+  # 推送 v 开头的标签时发布：Windows 的 exe 和 PS5 的 elf 挂到 Release 上。
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, ps5, windows]
@@ -143,7 +134,6 @@ jobs:
         run: |
           mv dist/panplay.exe "dist/panplay-${GITHUB_REF_NAME}-windows-x64.exe"
           mv dist/panplay.elf "dist/panplay-${GITHUB_REF_NAME}-ps5.elf"
-          mv dist/panplay-homebrew.zip "dist/panplay-${GITHUB_REF_NAME}-ps5-homebrew.zip"
           cd dist && sha256sum * > SHA256SUMS.txt
 
       - uses: softprops/action-gh-release@v2
@@ -152,8 +142,7 @@ jobs:
           generate_release_notes: true
           body: |
             **Windows**：下载 `panplay-${{ github.ref_name }}-windows-x64.exe`，双击运行，会自动用浏览器打开 http://127.0.0.1:8734 。局域网里的手机、平板默认也能打开（地址在设置页「局域网访问」里，第一次运行时 Windows 防火墙可能会询问，允许专用网络即可）。
-            **PS5（点图标启动）**：主机先运行 [websrv](https://github.com/ps5-payload-dev/websrv)，桌面会多出 Homebrew Launcher。解压 `panplay-${{ github.ref_name }}-ps5-homebrew.zip`，把里面的 `Panplay` 文件夹用 FTP 放进主机的 `/data/homebrew/`，或者放到 U 盘的 `homebrew/` 目录插上主机。之后在 Homebrew Launcher 里点盘游的图标就能启动，主机右上角的通知里有访问地址，用手机或电脑浏览器打开。盘游在后台运行，开游戏不影响它；要停下来在设置页点「退出盘游」。
-            **PS5（payload）**：也可以把 `panplay-${{ github.ref_name }}-ps5.elf` 直接用 payload 加载器发送到主机。
+            **PS5**：用 payload 加载器把 `panplay-${{ github.ref_name }}-ps5.elf` 发送到主机。主机右上角的通知里有访问地址，用手机或电脑浏览器打开；第一次运行还会在主机桌面装一个「盘游」图标，点它直接在主机上打开盘游。盘游在后台运行，开游戏不影响它；要停下来在设置页点「退出盘游」。主机重启后要重新发送一次 elf，桌面图标不用重装。
             局域网访问默认不要口令（面向家里的内网）；需要的话在设置页「局域网访问」里开启访问口令，Windows 上也可以关掉局域网访问。PS5 默认把游戏装到 `/data/homebrew`。
             两个文件都自带游戏资料库，不用另外下载；联网后会自动从 GitHub 同步最新版，存在数据目录（Windows 是 `%APPDATA%\panplay`，PS5 是 `/data/panplay`）。
             网盘游戏目录怎么放，见 [网盘游戏目录整理指南](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/game-folder-guide.md)。

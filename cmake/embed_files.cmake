@@ -2,8 +2,9 @@
 #   cmake -DOUTPUT=<out.cpp> -DMODE=ui -DFILES="a|b" -DNAMES="a|b" -P embed_files.cmake
 #   cmake -DOUTPUT=<out.inc> -DMODE=ca -DFILES=<cacert.pem> -P embed_files.cmake
 #   cmake -DOUTPUT=<out.inc> -DMODE=gz -DFILES=<catalog.json> -P embed_files.cmake
+#   cmake -DOUTPUT=<out.inc> -DMODE=icon -DFILES=<icon0.png> -P embed_files.cmake
 # ui 模式生成 panplay_embedded::files 表；ca 模式生成以 0 结尾的 kCaBundle，供 mbedTLS 按 PEM 解析；
-# gz 模式先 gzip 压缩，生成 kCatalogGz。
+# gz 模式先 gzip 压缩，生成 kCatalogGz；icon 模式原样生成 kIcon0Png。
 
 function(bytes_of path out_var)
   file(READ "${path}" hex HEX)
@@ -20,6 +21,9 @@ elseif(MODE STREQUAL "gz")
   bytes_of("${OUTPUT}.gz" bytes)
   file(REMOVE "${OUTPUT}.gz")
   file(WRITE "${OUTPUT}.tmp" "static const unsigned char kCatalogGz[] = {\n${bytes}};\n")
+elseif(MODE STREQUAL "icon")
+  bytes_of("${FILES}" bytes)
+  file(WRITE "${OUTPUT}.tmp" "static const unsigned char kIcon0Png[] = {\n${bytes}};\n")
 else()
   string(REPLACE "|" ";" FILES "${FILES}")
   string(REPLACE "|" ";" NAMES "${NAMES}")

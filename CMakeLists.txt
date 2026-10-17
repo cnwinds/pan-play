@@ -83,9 +83,21 @@ if(PS5)
   set_target_properties(panplay PROPERTIES OUTPUT_NAME panplay.elf)
   # UnRAR 默认按核数开最多 8 个解压线程，主机上会抢系统界面的 CPU；网盘下载才是瓶颈，2 个够用。
   target_compile_definitions(panplay PRIVATE PANPLAY_PS5 PANPLAY_UNRAR_MAX_THREADS=2)
-  target_link_libraries(panplay PRIVATE SceNotification)
+  target_link_libraries(panplay PRIVATE SceNotification SceAppInstUtil)
   # 新线程改用 pc/src/ps5_thread.cpp 里的大栈。
   target_link_options(panplay PRIVATE "LINKER:--wrap=pthread_create")
+
+  # 桌面图标的 icon0.png 打包进程序，启动时写到 /user/app 下。
+  set(ICON0_PNG "${CMAKE_CURRENT_SOURCE_DIR}/ps5/icon0.png")
+  set(ICON0_INC "${CMAKE_BINARY_DIR}/generated/panplay_icon0.inc")
+  add_custom_command(OUTPUT "${ICON0_INC}"
+    COMMAND ${CMAKE_COMMAND} "-DOUTPUT=${ICON0_INC}" -DMODE=icon "-DFILES=${ICON0_PNG}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake"
+    DEPENDS "${ICON0_PNG}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake"
+    VERBATIM)
+  target_sources(panplay PRIVATE "${ICON0_INC}")
+  set_source_files_properties("${ICON0_INC}" PROPERTIES HEADER_FILE_ONLY ON)
+  target_include_directories(panplay PRIVATE "${CMAKE_BINARY_DIR}/generated")
 endif()
 
 if(WIN32)

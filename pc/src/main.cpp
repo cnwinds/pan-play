@@ -29,6 +29,7 @@
 #endif
 
 #if defined(PANPLAY_PS5)
+#include "ps5_dashboard.hpp"
 #include "ps5_thread.hpp"
 
 #include <cstdio>
@@ -70,7 +71,7 @@ void notify(const std::string& text) {
   sceNotificationSend(kSystemUser, true, payload.c_str());
 }
 
-// 一启动就把输出改写到数据目录的 panplay.log。加载器（websrv、elfldr）把输出接到管道或套接字上，
+// 一启动就把输出改写到数据目录的 panplay.log。加载器（elfldr 等）把输出接到管道或套接字上，
 // 对面不再读时写满就会卡住正在打印的线程。追加写：再次启动不会冲掉上次崩溃前的记录，超过 2 MB 时换新文件。
 void redirect_output_to_log() {
   std::cout.flush();
@@ -367,6 +368,21 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     ServerOptions options;
     options.lan_required = true;
+    // 已经在运行时也检查一遍：图标被删了，重新发送一次载荷就能装回来。
+    std::string icon_error;
+    switch (install_dashboard_icon(options.port, &icon_error)) {
+      case DashboardIcon::unchanged:
+        panplay::trace("桌面图标已在");
+        break;
+      case DashboardIcon::installed:
+        panplay::trace("已安装桌面图标");
+        notify("已在主机桌面添加「盘游」图标，点它就能在主机上打开盘游");
+        break;
+      case DashboardIcon::failed:
+        panplay::trace("桌面图标没装上：" + icon_error);
+        notify("盘游桌面图标没装上：" + icon_error);
+        break;
+    }
     std::string running_url;
     std::string running_code;
     panplay::trace("检查端口 " + std::to_string(options.port) + " 上是否已有盘游");

@@ -1,6 +1,6 @@
 # 发布流程
 
-每次发布都按这里的步骤走，不跳步。发布由 CI 完成：在 `main` 上推送 `v` 开头的标签后，`.github/workflows/build.yml` 编译 Linux、PS5、Windows 三个平台，Linux 上跑完整自测，全部通过后 `release` 任务建 GitHub Release，挂上 `panplay-<版本>-windows-x64.exe`、`panplay-<版本>-ps5.elf`、`panplay-<版本>-ps5-homebrew.zip` 和 `SHA256SUMS.txt`，说明文字由提交记录自动生成。
+每次发布都按这里的步骤走，不跳步。发布由 CI 完成：在 `main` 上推送 `v` 开头的标签后，`.github/workflows/build.yml` 编译 Linux、PS5、Windows 三个平台，Linux 上跑完整自测，全部通过后 `release` 任务建 GitHub Release，挂上 `panplay-<版本>-windows-x64.exe`、`panplay-<版本>-ps5.elf` 和 `SHA256SUMS.txt`，说明文字由提交记录自动生成。
 
 ## 1. 定版本号
 
@@ -59,7 +59,7 @@ $r = Invoke-RestMethod "https://api.github.com/repos/cnwinds/pan-play/releases/t
 $r.html_url; $r.assets | Select-Object name, size
 ```
 
-必须有四个附件：`panplay-vX.Y.Z-windows-x64.exe`、`panplay-vX.Y.Z-ps5.elf`、`panplay-vX.Y.Z-ps5-homebrew.zip`、`SHA256SUMS.txt`。把 Release 链接、包含的提交和验证情况（本地自测范围、CI 结果）告诉用户。
+必须有三个附件：`panplay-vX.Y.Z-windows-x64.exe`、`panplay-vX.Y.Z-ps5.elf`、`SHA256SUMS.txt`。把 Release 链接、包含的提交和验证情况（本地自测范围、CI 结果）告诉用户。
 
 ## 出了问题
 
