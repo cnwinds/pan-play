@@ -1621,6 +1621,7 @@ void handle_client(SOCKET client, bool local_peer) {
     } catch (const std::exception& ex) {
       error = std::string("删除失败: ") + ex.what();
     }
+    if (!error.empty()) panplay::trace("删除失败 " + path + "：" + error);
     {
       std::lock_guard<std::mutex> lock(installs.mu);
       installs.discarding.erase(path);

@@ -159,12 +159,32 @@ class LocalSink : public InstallSink {
     if (!storage_path(root_, path, &local, &error)) return error;
     const std::filesystem::path inside = local.lexically_normal().lexically_relative(root_.lexically_normal());
     if (inside.empty() || inside == "." || *inside.begin() == "..") return "不能删除存放位置以外或整个存放位置";
-    std::error_code ec;
-    std::filesystem::remove_all(local, ec);
-    return ec ? "无法删除目录" : "";
+    return remove_recursive(local);
   }
 
  private:
+  // 不用 remove_all：它删不掉时说不出是哪个文件、什么原因；新版 libc++ 里它还改用 openat/unlinkat 一类调用，
+  // 主机上不一定都支持。这里只用列目录、删文件、删空目录。
+  std::string remove_recursive(const std::filesystem::path& path) {
+    const auto shown = [&] { return path.lexically_normal().lexically_relative(root_.lexically_normal()).u8string(); };
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (status.type() == std::filesystem::file_type::not_found) return "";
+    if (ec) return "读不了 " + shown() + "：" + ec.message();
+    if (std::filesystem::is_directory(status)) {
+      std::vector<std::filesystem::path> children;
+      for (std::filesystem::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+        children.push_back(it->path());
+      }
+      if (ec) return "列不出 " + shown() + " 里的文件：" + ec.message();
+      for (const auto& child : children) {
+        if (auto error = remove_recursive(child); !error.empty()) return error;
+      }
+    }
+    if (!std::filesystem::remove(path, ec) && ec) return "删不掉 " + shown() + "：" + ec.message();
+    return "";
+  }
+
   std::string write_bytes(const std::string& path, const std::uint8_t* data, std::size_t size, bool append) {
     std::filesystem::path local;
     std::string error;
