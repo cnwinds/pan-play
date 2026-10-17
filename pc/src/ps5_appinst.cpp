@@ -88,13 +88,14 @@ std::string hex_code(int code) {
   return text;
 }
 
+// 也拿 auth_mu：身份是整个进程共用的，别的线程正顶着特权身份时在这里 dlopen 一样会卡死。
+// 失败不缓存，下次再试。
 std::string load_app_inst_util() {
-  static std::once_flag once;
-  static std::string error;
-  std::call_once(once, [] {
-    error = load();
-    util_ready = error.empty();
-  });
+  if (util_ready) return "";
+  std::lock_guard<std::mutex> lock(auth_mu);
+  if (util_ready) return "";
+  const std::string error = load();
+  util_ready = error.empty();
   return error;
 }
 
@@ -107,8 +108,10 @@ std::string with_privileged_auth(const std::function<std::string()>& action) {
     error = action();
   } catch (const std::exception& ex) {
     error = ex.what();
+  } catch (...) {
+    error = "执行时出错";
   }
-  kernel_set_ucred_authid(-1, own_auth_id);
+  if (kernel_set_ucred_authid(-1, own_auth_id) != 0) panplay::log_error("换回进程原来的身份失败");
   return error;
 }
 

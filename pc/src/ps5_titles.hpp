@@ -16,10 +16,12 @@ struct ConsoleTitle {
 
 ConsoleTitle inspect_console_title(const std::string& game_dir);
 
-// 注册（已注册时重做一遍，用来修复）。返回错误，成功为空。
+// 注册（已注册时重做一遍，用来修复、刷新版本信息）。主机上装着同一游戏的正式版时拒绝。返回错误，成功为空。
 std::string register_console_title(const std::string& game_dir);
 
-// 删除游戏前注销：先卸掉挂载再注销，免得系统顺着挂载删到游戏文件。没有注册到这个目录时什么都不做。返回错误。
+// 删除游戏前注销：先把 nullfs 一层层卸干净（游戏在运行就报错，不强卸），再注销，最后清掉盘游放在 /user/app、/user/appmeta 的东西。
+// 确认注册过的注销失败时报错，调用方据此不删文件，挂载保持卸下、mount.lnk 留着以便恢复。
+// 没注册到这个目录、主机上是正式版、ShadowMountPlus 在运行时不动主机那边。返回错误，成功为空。
 std::string unregister_console_title(const std::string& game_dir);
 
 // 盘游启动时按 /user/app/*/mount.lnk 把还没挂上的游戏目录挂回去。

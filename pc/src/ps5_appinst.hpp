@@ -11,8 +11,9 @@ std::string firmware_text();
 
 std::string hex_code(int code);
 
-// 第一次调用时按 websrv、ShadowMountPlus 的顺序加载用户服务和安装库并初始化，之后复用结果。返回错误，成功为空。
+// 按 websrv、ShadowMountPlus 的顺序加载用户服务和安装库并初始化，成功后复用，失败下次再试。返回错误，成功为空。
 // 必须在 with_privileged_auth 之外调用：顶着特权身份加载系统库会卡死，卡住时还占着模块加载锁，连新线程都开不了。
+// 它和 with_privileged_auth 拿同一把锁，所以别的线程换着身份时这里会等着，不会撞上。
 std::string load_app_inst_util();
 
 // 把进程身份临时换成能注册应用、挂载目录的特权身份，执行完换回。同一时间只有一个在执行。

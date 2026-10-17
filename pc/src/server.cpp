@@ -818,8 +818,9 @@ std::string console_json(const std::string& path, const std::string& game_dir) {
          "\",\"error\":\"" + json_escape(error) + "\"}";
 }
 
-// 装完后注册到主机桌面；已经注册好、挂载也在时不重做。
-void register_after_install(const std::string& path) {
+// 装完后注册到主机桌面。这次写了文件（新装、装了更新）就重新注册，主机上显示的版本才会跟着变；
+// 本来就装好的，已经注册好、挂载也在时不重做。
+void register_after_install(const std::string& path, bool files_changed) {
   const std::string game_dir = console_game_dir(load_settings(), path);
   if (game_dir.empty()) return;
   const ConsoleTitle title = inspect_console_title(game_dir);
@@ -828,7 +829,11 @@ void register_after_install(const std::string& path) {
     remember_console_error(path, "");
     return;
   }
-  if (title.registered && title.mounted) return;
+  if (!files_changed && title.registered && title.mounted) return;
+  {
+    std::lock_guard<std::mutex> lock(installs.mu);
+    if (installs.current && installs.current->path == path) installs.current->result.message = "正在注册到主机桌面…";
+  }
   remember_console_error(path, register_console_title(game_dir));
 }
 #endif
@@ -1020,7 +1025,7 @@ void queue_worker() {
     if (result.status == "installed" || result.status == "already") {
       forget_install_progress(path);
 #if defined(PANPLAY_PS5)
-      register_after_install(path);
+      register_after_install(path, result.status == "installed");
 #endif
     } else {
       save_install_progress(path, progress_of(result));
@@ -1630,7 +1635,7 @@ void handle_client(SOCKET client, bool local_peer) {
           return;
         }
         if (installs.discarding.count(path) != 0) {
-          reply_json(client, 409, json_error("正在删除这个游戏的文件，删完再装"));
+          reply_json(client, 409, json_error("正在删除或注册这个游戏，稍等再装"));
           return;
         }
         // 带了 skip 就是用户刚选过要装哪些；没带（继续、重试）沿用上次的选择。
@@ -1684,7 +1689,33 @@ void handle_client(SOCKET client, bool local_peer) {
       reply_json(client, 400, json_error("只有装在主机本机文件夹里的游戏能注册"));
       return;
     }
-    const std::string error = register_console_title(game_dir);
+    // 和删除共用一张占用表：删到一半时不能又挂上、注册回去；查队列和占用在同一把锁里，中间插不进安装。
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      const bool queued = (installs.current && installs.current->path == path) ||
+                          std::any_of(installs.waiting.begin(), installs.waiting.end(),
+                                      [&](const InstallTask& task) { return task.path == path; });
+      if (queued) {
+        reply_json(client, 409, json_error("这个游戏还在安装队列里，装完会自动注册"));
+        return;
+      }
+      if (!installs.discarding.insert(path).second) {
+        reply_json(client, 409, json_error("正在处理这个游戏，稍等再试"));
+        return;
+      }
+    }
+    struct ReleaseBusy {
+      const std::string& path;
+      ~ReleaseBusy() {
+        std::lock_guard<std::mutex> lock(installs.mu);
+        installs.discarding.erase(path);
+      }
+    };
+    std::string error;
+    {
+      const ReleaseBusy release{path};
+      error = register_console_title(game_dir);
+    }
     remember_console_error(path, error);
     if (!error.empty()) {
       reply_json(client, 500, json_error(error));
@@ -1713,7 +1744,7 @@ void handle_client(SOCKET client, bool local_peer) {
         return;
       }
       if (!installs.discarding.insert(path).second) {
-        reply_json(client, 409, json_error("正在删除"));
+        reply_json(client, 409, json_error("正在处理这个游戏，稍等再试"));
         return;
       }
     }
