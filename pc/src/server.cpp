@@ -281,15 +281,16 @@ std::string archive_problem(const panplay::GameFolder& game) {
 }
 
 // 和游戏库列表的判断一致：暂存区里有这款游戏的目录就算没装完（续装日志可能已经没了，留下的文件要能删掉；
-// 已装好的游戏更新到一半也是这样），其次才看完成标记。
+// 已装好的游戏更新到一半也是这样），其次存放目录里有这款游戏的目录就算装好了。用 FTP 拷进去或别的工具装的游戏
+// 没有盘游的完成标记，也算装好。
 std::string game_state(panplay::InstallSink& sink, const std::string& prefix, const panplay::GameFolder& game) {
   const std::string folder = game.title_id.empty() ? game.name : game.title_id;
   std::string error;
   const auto staging = sink.list_children(panplay::join_storage_path(prefix, ".panplay-staging"), &error);
   if (std::find(staging.begin(), staging.end(), folder) != staging.end()) return "continue";
-  const std::string marker = panplay::join_storage_path(panplay::join_storage_path(prefix, folder), ".panplay-done.json");
   error.clear();
-  if (sink.file_size(marker, &error) >= 0 && error.empty()) return "installed";
+  const auto installed = sink.list_children(prefix, &error);
+  if (std::find(installed.begin(), installed.end(), folder) != installed.end()) return "installed";
   return "install";
 }
 
