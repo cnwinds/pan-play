@@ -28,6 +28,9 @@ struct InstallResult {
   int files_to_check = 0;
   // 失败原因在压缩包本身（比如是 PKG 安装包）时为 false，再装一次结果也一样。
   bool retryable = true;
+  // 意外停下（网络断开、主机休眠唤醒、存放位置连接断了），等一会儿再装多半能接着装，安装队列会自动继续。
+  // 用户取消、压缩包有问题、字典超过上限、网盘没登录这些，自动再装也一样，为 false。
+  bool auto_resume = false;
 };
 
 struct InstallRequest {

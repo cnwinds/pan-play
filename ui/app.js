@@ -506,7 +506,8 @@ function taskPace(task) {
 function jobText(current, inDetail = false) {
   if (current.state === "queued") return `排队中，第 ${queuePosition(current.path)} 个`;
   if (current.state === "running") {
-    if (current.message === "正在取消…" || current.message === "正在注册到主机桌面…") return current.message;
+    if (current.message === "正在取消…" || current.message === "正在注册到主机桌面…" ||
+      (current.message || "").startsWith("安装中断")) return current.message;
     if (current.message === "正在收尾") return `正在收尾，共 ${current.files_total} 个文件`;
     if (current.message === "正在核对") return `核对已装文件 ${current.files_checked} / ${current.files_to_check}`;
     if (current.bytes_total > 0 && current.message === "正在安装") {

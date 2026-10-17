@@ -977,6 +977,8 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
     if (!sink) {
       result.status = "error";
       result.message = error;
+      // 填好了却连不上（FTP 那头的主机在休眠、网络还没恢复），等一会儿再连；没填好的等也没用。
+      result.auto_resume = !settings.dest().empty();
     } else {
       panplay::InstallRequest request;
       request.source_dir = path;
@@ -1001,6 +1003,43 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
   return result;
 }
 
+// 意外停下（网络断开、主机休眠唤醒）的安装，等一会儿自动接着装，已装好的文件不重装。
+// 等的间隔逐次拉长；这一轮比上一轮装得多，就说明网络回来过，重新计次，长时间安装中偶尔断一下不会把次数用光。
+panplay::InstallResult install_with_auto_resume(const std::string& path, panplay::CancelToken& cancel) {
+  static constexpr int kDelays[] = {10, 30, 60, 120, 300};
+  constexpr int kRounds = sizeof(kDelays) / sizeof(kDelays[0]);
+  int round = 0;
+  std::int64_t last_done = -1;
+  for (;;) {
+    panplay::InstallResult result = run_install(path, &cancel);
+    if (result.status != "error" || !result.auto_resume || cancel.cancelled()) return result;
+    if (last_done >= 0 && result.bytes_done > last_done) round = 0;
+    last_done = result.bytes_done;
+    if (round >= kRounds) return result;
+    const int delay = kDelays[round++];
+    panplay::log_warn("安装中断：" + result.message + "，" + std::to_string(delay) + " 秒后自动继续（第 " +
+                      std::to_string(round) + " / " + std::to_string(kRounds) + " 次）");
+    save_install_progress(path, progress_of(result));
+    for (int left = delay; left > 0; --left) {
+      {
+        std::lock_guard<std::mutex> lock(installs.mu);
+        if (installs.current && installs.current->path == path) {
+          installs.current->result.message = "安装中断，" + std::to_string(left) + " 秒后自动继续";
+        }
+      }
+      if (cancel.cancelled()) break;
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (cancel.cancelled()) {
+      result.status = "interrupted";
+      result.message = "已中断，再次执行安装会继续";
+      result.auto_resume = false;
+      return result;
+    }
+    panplay::log_info("自动继续安装 " + path);
+  }
+}
+
 void queue_worker() {
   for (;;) {
     std::string path;
@@ -1020,7 +1059,7 @@ void queue_worker() {
       cancel = installs.current->cancel;
     }
     panplay::log_info("开始安装 " + path);
-    const panplay::InstallResult result = run_install(path, cancel.get());
+    const panplay::InstallResult result = install_with_auto_resume(path, *cancel);
     panplay::log_line(result.status == "error" ? panplay::LogLevel::warn : panplay::LogLevel::info,
                       "安装结束 " + path + "：" + result.status + " " + result.message + "，" + panplay::memory_summary());
     if (result.status == "installed" || result.status == "already") {

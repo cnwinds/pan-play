@@ -68,6 +68,7 @@ bool is_install_package_error(const std::string& message);
 bool is_unsupported_7z_error(const std::string& message);
 // 字典超过设置里的上限时拒绝安装的说明。调高上限后可以重试，所以不算压缩包本身的问题。
 std::string dictionary_refusal(const std::string& format, std::uint64_t dictionary, std::uint64_t limit);
+bool is_dictionary_refusal(const std::string& message);
 
 // 解压出的一个文件：第一次写入时才建目录、开写入流，同时算 CRC。
 // stop >= 0 时，累计写满 stop 字节就返回 kInterrupted，供自测模拟中断。expected 是压缩包里记的解压后大小。

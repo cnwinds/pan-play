@@ -168,6 +168,10 @@ std::string dictionary_refusal(const std::string& format, std::uint64_t dictiona
          " 要把整个字典放进内存；可以在「设置 › 解压」调高上限后重试，或用更小的字典重新压缩";
 }
 
+bool is_dictionary_refusal(const std::string& message) {
+  return message.rfind("字典 ", 0) == 0 && message.find("超过上限") != std::string::npos;
+}
+
 OutputFile::OutputFile(InstallSink& sink, std::string path, std::int64_t expected, std::int64_t stop,
                        std::int64_t* written)
     : sink_(sink), path_(std::move(path)), expected_(expected), stop_(stop), written_(written),
