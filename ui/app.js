@@ -501,7 +501,9 @@ function taskPace(task) {
   return { speed: formatBytes(task.speed) + "/s", left: task.eta >= 0 ? task.eta : null };
 }
 
-function jobText(current) {
+// inDetail：详情页上方已经有百分比和预计几点装完，这一行只写进度和速度；底部进度栏没有，写剩余时间。
+// 文字要短：PS5 自带浏览器里这行太长会把整个抽屉撑宽，每秒变一次就跟着晃。
+function jobText(current, inDetail = false) {
   if (current.state === "queued") return `排队中，第 ${queuePosition(current.path)} 个`;
   if (current.state === "running") {
     if (current.message === "正在取消…" || current.message === "正在注册到主机桌面…") return current.message;
@@ -510,8 +512,8 @@ function jobText(current) {
     if (current.bytes_total > 0 && current.message === "正在安装") {
       const parts = [`${formatBytes(current.bytes_done)} / ${formatBytes(current.bytes_total)}`];
       const pace = taskPace(current);
-      if (pace) parts.push(`平均 ${pace.speed}`);
-      if (pace && pace.left !== null) parts.push(`剩余 ${formatDuration(pace.left)}`);
+      if (inDetail && pace) parts.push(pace.speed);
+      else if (!inDetail && pace && pace.left !== null) parts.push(`剩余 ${formatDuration(pace.left)}`);
       else parts.push(`${current.files_done} 个文件`);
       return parts.join(" · ");
     }
@@ -1318,7 +1320,7 @@ function openDetail(game, opener) {
     }
     progress.hidden = !running;
     if (running) {
-      progressText.textContent = jobText(task);
+      progressText.textContent = jobText(task, true);
       meter.style.setProperty("--p", taskFraction(task));
       cancel.disabled = task.message === "正在取消…";
       const pace = taskPace(task);
