@@ -461,18 +461,28 @@ function formatDuration(seconds) {
 }
 
 // 预计几点装完：今天只写时刻，之后的写上哪天。
+// 运行盘游那台机器的时区比 UTC 快多少分钟，队列接口带回来。PS5 自带浏览器拿不到时区、按 UTC 算，
+// 所以钟点按它算；没拿到时退回浏览器自己的时区。
+let serverUtcOffset = null;
+
+// 按那台机器的时区平移，之后用 getUTC* 取到的就是那里的日期和钟点。
+function serverClockDate(ms) {
+  const offset = serverUtcOffset ?? -new Date().getTimezoneOffset();
+  return new Date(ms + offset * 60000);
+}
+
+const pad2 = (value) => String(value).padStart(2, "0");
+
 function finishClock(seconds) {
-  const at = new Date(Date.now() + seconds * 1000);
-  const clock = at.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const day = new Date(at);
-  day.setHours(0, 0, 0, 0);
-  const days = Math.round((day - today) / 86400000);
+  const at = serverClockDate(Date.now() + seconds * 1000);
+  const now = serverClockDate(Date.now());
+  const clock = `${pad2(at.getUTCHours())}:${pad2(at.getUTCMinutes())}`;
+  const dayNumber = (date) => Math.floor(date.getTime() / 86400000);
+  const days = dayNumber(at) - dayNumber(now);
   if (days === 0) return clock;
   if (days === 1) return `明天 ${clock}`;
   if (days === 2) return `后天 ${clock}`;
-  return `${at.getMonth() + 1} 月 ${at.getDate()} 日 ${clock}`;
+  return `${at.getUTCMonth() + 1} 月 ${at.getUTCDate()} 日 ${clock}`;
 }
 
 // 正在解压时的平均速度和剩余时间；刚开始几秒还没算出来时没有。
@@ -548,6 +558,7 @@ function applyQueue() {
 function setQueue(data) {
   const active = new Set(tasks.filter((task) => task.state !== "done").map((task) => task.path));
   tasks = data.tasks || [];
+  if (Number.isFinite(data.utc_offset_min)) serverUtcOffset = data.utc_offset_min;
   const settled = tasks.filter((task) => task.state === "done" && active.has(task.path)).map((task) => task.path);
   applyQueue();
   if (settled.length) loadGames();
@@ -1629,8 +1640,10 @@ loginButton.addEventListener("click", () => {
 
 function formatTime(unixSeconds) {
   if (!unixSeconds || unixSeconds < 0) return "";
-  const date = new Date(unixSeconds * 1000);
-  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { hour12: false });
+  const date = serverClockDate(unixSeconds * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getUTCFullYear()}/${date.getUTCMonth() + 1}/${date.getUTCDate()} ` +
+    `${pad2(date.getUTCHours())}:${pad2(date.getUTCMinutes())}:${pad2(date.getUTCSeconds())}`;
 }
 
 function setTabStatus(name, text, state = "") {

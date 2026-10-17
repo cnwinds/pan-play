@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -1089,6 +1090,22 @@ std::string task_json(const InstallTask& task, const char* state, const NameOver
 }
 
 // 队列顺序：正在装的，排队的，最近完成的。
+// 本机时区比 UTC 快多少分钟。PS5 自带浏览器拿不到时区、按 UTC 算，界面上的钟点改按运行盘游这台机器的时区显示。
+int local_utc_offset_minutes() {
+  const std::time_t now = std::time(nullptr);
+  std::tm local{};
+  std::tm utc{};
+#if defined(_WIN32)
+  localtime_s(&local, &now);
+  gmtime_s(&utc, &now);
+#else
+  localtime_r(&now, &local);
+  gmtime_r(&now, &utc);
+#endif
+  utc.tm_isdst = local.tm_isdst;
+  return static_cast<int>(std::difftime(std::mktime(&local), std::mktime(&utc)) / 60);
+}
+
 std::string queue_json() {
   const NameOverrides overrides = load_name_overrides();
   std::lock_guard<std::mutex> lock(installs.mu);
@@ -1100,7 +1117,7 @@ std::string queue_json() {
   if (installs.current) add(*installs.current, "running");
   for (const auto& task : installs.waiting) add(task, "queued");
   for (const auto& task : installs.finished) add(task, "done");
-  return "{\"tasks\":[" + items + "]}";
+  return "{\"tasks\":[" + items + "],\"utc_offset_min\":" + std::to_string(local_utc_offset_minutes()) + "}";
 }
 
 template <typename Tasks>
