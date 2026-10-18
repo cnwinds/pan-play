@@ -1216,8 +1216,8 @@ function openDetail(game, opener) {
   const reviewAsk = el("div", "review-ask");
   const reviewQuestion = el("span", "review-question");
   const reviewButtons = el("span", "review-buttons");
-  const reviewGood = el("button", "btn small", "能玩");
-  const reviewBad = el("button", "btn small", "有问题");
+  const reviewGood = el("button", "btn small review-good", "能玩");
+  const reviewBad = el("button", "btn small review-bad", "有问题");
   const reviewLater = el("button", "link", "以后再说");
   const reviewClear = el("button", "link", "清除评价");
   for (const button of [reviewGood, reviewBad, reviewLater, reviewClear]) button.type = "button";
@@ -1278,6 +1278,8 @@ function openDetail(game, opener) {
       reviewQuestion.textContent = review ? "这个版本能正常玩吗？" : "装好了，能正常玩吗？";
       reviewLater.textContent = review ? "取消" : "以后再说";
       reviewClear.hidden = !review;
+      reviewGood.setAttribute("aria-pressed", String(Boolean(review && review.playable)));
+      reviewBad.setAttribute("aria-pressed", String(Boolean(review && !review.playable)));
     }
     if (!reviewBanner.hidden) {
       const own = shown === review;
