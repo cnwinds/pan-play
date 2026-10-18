@@ -209,3 +209,4 @@ virtual std::unique_ptr<FileWriter> open_writer(const std::string& path, std::st
    纯下载 20 秒（`panplay bench-download`）：1 条 30～39 MB/s，4 条 36～53，8 条 52～58，16 条 46。
    真实安装 PPSA05106 到本机目录：1 条 55 秒，4 条 32 秒，8 条 26 秒；经 FTP 走服务端 36 秒（改造前 163 秒）。
    多开没有收益，还容易被百度限速，所以不超过 8 条。命令行可用 `--connections`、`--block-mb`、`--blocks` 调整。
+   → 已由 [ADR 0005](0005-adaptive-connections.md) 取代：PS5 上 8 条只是在分主机那边的带宽，现在先用一条连接读到底，一条吃不满、多开确实更快才往上加。

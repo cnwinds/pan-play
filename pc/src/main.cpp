@@ -156,7 +156,7 @@ void print_usage() {
             << "  panplay serve [端口] [--lan|--local]   默认按设置（局域网可访问）；--local 这次只许本机打开\n"
             << "  panplay self-test\n"
             << "  panplay bench-prefetch\n"
-            << "  panplay bench-download <网盘目录> [秒] [连接数] [块MB]\n"
+            << "  panplay bench-download <网盘目录> [秒] [连接数|auto] [块MB]\n"
             << "  panplay dummy-ftp <端口> <根目录> [--zftpd]\n"
             << "  panplay login\n"
             << "  panplay ls [目录]\n"
@@ -261,12 +261,14 @@ int read_range(const std::string& file_id, const std::string& offset_text, const
   return 0;
 }
 
+// connections 小于 0 时按 ADR 0005 自动调整（最多 8 条），否则固定用这么多条。
 int bench_prefetch_download(panplay::DrivePlugin& drive, const panplay::DriveEntry& file, int seconds, int connections,
                             int block_mb) {
   panplay::PrefetchOptions options;
-  options.connections = connections;
+  options.adaptive = connections < 0;
+  if (connections > 0) options.connections = connections;
   options.block_size = static_cast<std::size_t>(block_mb) << 20;
-  options.max_blocks = std::max<std::size_t>(8, static_cast<std::size_t>(connections) * 2);
+  options.max_blocks = std::max<std::size_t>(16, static_cast<std::size_t>(options.connections) * 2);
   panplay::PrefetchReader reader(drive, file.file_id, file.size, nullptr, options);
   std::vector<std::uint8_t> buffer(1 << 20);
   const auto start = std::chrono::steady_clock::now();
@@ -282,14 +284,17 @@ int bench_prefetch_download(panplay::DrivePlugin& drive, const panplay::DriveEnt
     const auto now = std::chrono::steady_clock::now();
     const double span = std::chrono::duration<double>(now - window_start).count();
     if (span >= 2.0) {
-      std::cout << "  " << static_cast<double>(window) / span / (1 << 20) << " MB/s" << std::endl;
+      std::cout << "  " << static_cast<double>(window) / span / (1 << 20) << " MB/s，" << reader.connections() << " 条"
+                << std::endl;
       window = 0;
       window_start = now;
     }
   }
   const double spent = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   if (!error.empty()) std::cerr << error << "\n";
-  std::cout << connections << " 条连接，块 " << block_mb << " MB：共 " << (total >> 20) << " MB，" << spent << " 秒，平均 "
+  std::cout << (options.adaptive ? "自动（最后 " + std::to_string(reader.connections()) + " 条）"
+                                 : std::to_string(connections) + " 条连接")
+            << "，块 " << block_mb << " MB：共 " << (total >> 20) << " MB，" << spent << " 秒，平均 "
             << static_cast<double>(total) / spent / (1 << 20) << " MB/s" << std::endl;
   return 0;
 }
@@ -311,7 +316,7 @@ int bench_download(const std::string& dir, int seconds, int connections, int blo
     return 1;
   }
   std::cout << biggest->name << "，" << (biggest->size >> 20) << " MB" << std::endl;
-  if (connections > 0) return bench_prefetch_download(*drive, *biggest, seconds, connections, block_mb);
+  if (connections != 0) return bench_prefetch_download(*drive, *biggest, seconds, connections, block_mb);
   const auto opened_at = std::chrono::steady_clock::now();
   auto stream = drive->open_stream(biggest->file_id, 0, &error);
   if (!stream) {
@@ -443,8 +448,8 @@ int main(int argc, char** argv) {
   }
   if (command == "bench-prefetch") return panplay::run_prefetch_bench();
   if (command == "bench-download" && argc >= 3) {
-    return bench_download(argv[2], argc >= 4 ? std::stoi(argv[3]) : 20, argc >= 5 ? std::stoi(argv[4]) : 0,
-                          argc >= 6 ? std::stoi(argv[5]) : 4);
+    const int connections = argc < 5 ? 0 : std::string(argv[4]) == "auto" ? -1 : std::stoi(argv[4]);
+    return bench_download(argv[2], argc >= 4 ? std::stoi(argv[3]) : 20, connections, argc >= 6 ? std::stoi(argv[5]) : 8);
   }
   if (command == "self-test") {
     if (const int json = self_test()) return json;

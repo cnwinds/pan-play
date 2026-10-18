@@ -90,6 +90,11 @@ class FakeDrive final : public DrivePlugin {
   std::atomic<int> latency_ms{0};
   // 下一次打开的流读到这么多字节后断开，只生效一次。
   std::atomic<std::int64_t> break_next_stream_after{-1};
+  // 限速（KB/s，0 是不限）：每个流各自的上限（像百度按连接限速），和所有流加起来的上限（像主机的网络）。
+  std::atomic<int> stream_kbps{0};
+  std::atomic<int> total_kbps{0};
+  // 下一次打开的流读到这么多字节后慢到每秒 16 KB，只生效一次。
+  std::atomic<std::int64_t> stall_next_stream_after{-1};
 
   std::string id() const override { return "memory"; }
   std::string display_name() const override { return "内存"; }
@@ -187,16 +192,42 @@ class FakeDrive final : public DrivePlugin {
       *error = "没有这个文件";
       return nullptr;
     }
-    return std::make_unique<Stream>(it->second, offset, break_next_stream_after.exchange(-1));
+    return std::make_unique<Stream>(*this, it->second, offset, break_next_stream_after.exchange(-1),
+                                    stall_next_stream_after.exchange(-1));
   }
 
  private:
+  // 按限速给这次读排时间：每个流、所有流各有一条时间线，睡到两条都轮到为止。
+  // 允许追回 50 毫秒睡过头的时间，平均速度才准。
+  void pace(std::size_t bytes, std::chrono::steady_clock::time_point* own) {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    auto until = now;
+    const auto slot = [&](int kbps) {
+      return microseconds(static_cast<long long>(bytes) * 1000000 / (static_cast<long long>(kbps) * 1024));
+    };
+    if (const int kbps = stream_kbps.load(); kbps > 0) {
+      *own = std::max(*own, now - milliseconds(50)) + slot(kbps);
+      until = std::max(until, *own);
+    }
+    if (const int kbps = total_kbps.load(); kbps > 0) {
+      std::lock_guard<std::mutex> lock(pace_mu_);
+      total_next_ = std::max(total_next_, now - milliseconds(50)) + slot(kbps);
+      until = std::max(until, total_next_);
+    }
+    std::this_thread::sleep_until(until);
+  }
+
   class Stream final : public ByteStream {
    public:
-    Stream(const FakeFile& file, std::int64_t offset, std::int64_t break_after)
-        : file_(file), offset_(offset), break_after_(break_after) {}
+    Stream(FakeDrive& owner, const FakeFile& file, std::int64_t offset, std::int64_t break_after, std::int64_t stall_after)
+        : owner_(owner), file_(file), offset_(offset), break_after_(break_after), stall_after_(stall_after) {}
 
     std::size_t read(std::uint8_t* dst, std::size_t size, std::string* error) override {
+      if (aborted_) {
+        *error = "下载已中止";
+        return 0;
+      }
       if (break_after_ >= 0 && delivered_ >= break_after_) {
         *error = "模拟断线";
         return 0;
@@ -204,18 +235,38 @@ class FakeDrive final : public DrivePlugin {
       std::int64_t n = std::min<std::int64_t>(static_cast<std::int64_t>(size), file_.size - offset_);
       if (break_after_ >= 0) n = std::min(n, break_after_ - delivered_);
       if (n <= 0) return 0;
+      if (stall_after_ >= 0 && delivered_ >= stall_after_) {
+        n = std::min<std::int64_t>(n, 16 << 10);
+        for (int i = 0; i < 100 && !aborted_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (aborted_) {
+          *error = "下载已中止";
+          return 0;
+        }
+      } else if (owner_.stream_kbps > 0 || owner_.total_kbps > 0) {
+        n = std::min<std::int64_t>(n, 64 << 10);
+        owner_.pace(static_cast<std::size_t>(n), &next_);
+      }
       file_.fill(offset_, dst, static_cast<std::size_t>(n));
       offset_ += n;
       delivered_ += n;
       return static_cast<std::size_t>(n);
     }
 
+    void abort() override { aborted_ = true; }
+
    private:
+    FakeDrive& owner_;
     const FakeFile& file_;
     std::int64_t offset_;
     std::int64_t break_after_;
+    std::int64_t stall_after_;
     std::int64_t delivered_ = 0;
+    std::atomic<bool> aborted_{false};
+    std::chrono::steady_clock::time_point next_{};
   };
+
+  std::mutex pace_mu_;
+  std::chrono::steady_clock::time_point total_next_{};
 
   void delay() const {
     if (latency_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(latency_ms));
@@ -709,6 +760,7 @@ int prefetch_tests() {
   for (const int connections : {2, 4}) {
     PrefetchOptions multi = options;
     multi.connections = connections;
+    multi.adaptive = false;
     multi.max_blocks = static_cast<std::size_t>(connections) * 2;
     drive.stream_opens = 0;
     drive.latency_ms = 2;
@@ -756,6 +808,7 @@ int prefetch_tests() {
   for (const int connections : {1, 4}) {
     PrefetchOptions slow = options;
     slow.connections = connections;
+    slow.adaptive = false;
     const auto started = std::chrono::steady_clock::now();
     {
       PrefetchReader reader(drive, "/big.bin", size, nullptr, slow);
@@ -776,6 +829,112 @@ int prefetch_tests() {
     drive.latency_ms = 0;
     if (std::chrono::steady_clock::now() - started > std::chrono::seconds(2)) return fail("连接还没建立时跳转或关闭要等很久");
   }
+  return 0;
+}
+
+// 先单连接、一条吃不满才加（ADR 0005）：带宽限在主机这边时试过要退回 1 条，服务器按连接限速时往上加，
+// 解压器等着的那段卡住时很快重派。调速用的时间都调小了。
+int tuning_tests() {
+  FakeDrive drive;
+  const std::int64_t size = 512ll << 20;
+  const auto byte_at = [](std::int64_t offset) { return static_cast<std::uint8_t>(offset * 7 + (offset >> 20)); };
+  drive.add_generated("/tune.bin", size, [&](std::int64_t offset, std::uint8_t* dst, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) dst[i] = byte_at(offset + static_cast<std::int64_t>(i));
+  });
+  const auto base = [] {
+    PrefetchOptions options;
+    options.retry_base_ms = 1;
+    options.block_size = 1u << 20;
+    options.max_blocks = 32;
+    options.connections = 8;
+    options.settle_ms = 200;
+    options.measure_ms = 400;
+    options.review_ms = 400;
+    options.backoff_ms = 600000;
+    options.segment_ms = 300;
+    options.stall_ms = 300;
+    return options;
+  };
+  // 一直读到 limit 字节或者超时，边读边核对内容，返回读到哪。
+  const auto drain = [&](PrefetchReader& reader, std::int64_t limit, double seconds, std::string* error) {
+    std::vector<std::uint8_t> buffer(1 << 20);
+    std::int64_t at = reader.position();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+    while (at < limit && std::chrono::steady_clock::now() < until) {
+      const std::size_t got = reader.read(buffer.data(), buffer.size(), error);
+      if (!error->empty() || got == 0) break;
+      for (std::size_t i = 0; i < got; i += 4093) {
+        if (buffer[i] != byte_at(at + static_cast<std::int64_t>(i))) {
+          *error = "数据不对 @" + std::to_string(at + static_cast<std::int64_t>(i));
+          return at;
+        }
+      }
+      at += static_cast<std::int64_t>(got);
+    }
+    return at;
+  };
+  const auto reset_limits = [&] {
+    drive.total_kbps = 0;
+    drive.stream_kbps = 0;
+    drive.stall_next_stream_after = -1;
+  };
+
+  {
+    reset_limits();
+    drive.total_kbps = 24 * 1024;
+    PrefetchOptions options = base();
+    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
+    std::string error;
+    drain(reader, size, 3.0, &error);
+    if (!error.empty()) return fail("总带宽受限时读取出错: " + error);
+    int failures = 0;
+    {
+      std::lock_guard<std::mutex> lock(options.tuning->mu);
+      failures = options.tuning->failures;
+    }
+    if (failures < 1) return fail("总带宽受限、解压器一直在等时应该试过多开");
+    if (reader.connections() != 1) {
+      return fail("带宽限在主机这边时多开只是分流，应该退回 1 条，实际 " + std::to_string(reader.connections()) + " 条");
+    }
+  }
+
+  {
+    reset_limits();
+    drive.stream_kbps = 6 * 1024;
+    PrefetchOptions options = base();
+    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
+    std::string error;
+    drain(reader, size, 5.0, &error);
+    if (!error.empty()) return fail("按连接限速时读取出错: " + error);
+    if (reader.connections() < 3) {
+      return fail("服务器按连接限速时应该加到 3 条以上，实际 " + std::to_string(reader.connections()) + " 条");
+    }
+  }
+
+  for (const int connections : {1, 4}) {
+    reset_limits();
+    if (connections == 1) {
+      drive.total_kbps = 32 * 1024;
+      drive.stall_next_stream_after = 3ll << 20;
+    } else {
+      drive.stream_kbps = 4 * 1024;
+      drive.stall_next_stream_after = 256 << 10;
+    }
+    PrefetchOptions options = base();
+    options.adaptive = false;
+    options.connections = connections;
+    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    const std::int64_t got = drain(reader, 24ll << 20, 8.0, &error);
+    const double spent = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (!error.empty()) return fail("请求卡住后读取出错: " + error);
+    if (got < (24ll << 20) || spent > 5.0) {
+      return fail(std::to_string(connections) + " 条连接时请求卡住没有及时重派：" + std::to_string(spent) + " 秒读到 " +
+                  std::to_string(got >> 20) + " MB");
+    }
+  }
+  reset_limits();
   return 0;
 }
 
@@ -1871,6 +2030,7 @@ int run_install_pipeline_self_test() {
   }
 
   if (const int code = prefetch_tests()) return code;
+  if (const int code = tuning_tests()) return code;
   if (const int code = game_root_test()) return code;
   if (const int code = package_and_duplicate_test()) return code;
   if (const int code = many_files_test()) return code;
