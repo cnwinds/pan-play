@@ -813,6 +813,55 @@ std::string game_display_name(const std::string& path) {
   return name;
 }
 
+// 评价时装着哪几组：装好的游戏按完成标记，没装过的只记主游戏。
+std::vector<ReviewLayer> review_layers(const GameDetail& detail) {
+  std::vector<ReviewLayer> out;
+  const panplay::Json layers = panplay::Json::parse(detail.layers, nullptr);
+  for (const auto& layer : layers.array) {
+    const bool installed = layer.boolean_or("installed", false);
+    if (installed || (detail.installed.empty() && layer.str("role") == "main")) {
+      out.push_back({layer.str("fingerprint"), layer.str("name")});
+    }
+  }
+  return out;
+}
+
+// 装的时候发现主游戏那组是 PKG 安装包：盘游装不了，自动把这个版本记成有问题，游戏库里一眼看得出来。
+// 已经评过的不覆盖。
+void review_install_package(const std::string& path, const std::string& set_id) {
+  const AppSettings settings = load_settings();
+  std::optional<GameDetail> detail = cached_game_detail(shelf_key(settings), path);
+  if (!detail || detail->fingerprint.empty()) {
+    std::string error;
+    detail = read_game_detail(*open_drive(), settings, path, std::nullopt, &error);
+    if (!error.empty()) {
+      panplay::log_warn("没能自动标记 " + path + "：" + error);
+      return;
+    }
+  }
+  const panplay::Json layers = panplay::Json::parse(detail->layers, nullptr);
+  const bool main = std::any_of(layers.array.begin(), layers.array.end(), [&](const panplay::Json& layer) {
+    return layer.str("id") == set_id && layer.str("role") == "main";
+  });
+  if (!main || detail->fingerprint.empty() || find_review(detail->fingerprint)) return;
+  GameReview review;
+  review.fingerprint = detail->fingerprint;
+  review.title_id = panplay::find_title_id(folder_name_of(path));
+  review.name = game_display_name(path);
+  review.playable = false;
+  review.note = "是 PKG 安装包，盘游装不了（安装时自动标记）";
+#if defined(PANPLAY_PS5)
+  review.firmware = firmware_text();
+#endif
+  review.at = static_cast<std::int64_t>(std::time(nullptr));
+  review.layers = review_layers(*detail);
+  if (const std::string error = save_review(review); !error.empty()) {
+    panplay::log_warn("没能自动标记 " + review.name + "：" + error);
+    return;
+  }
+  panplay::log_info("自动评价 " + review.name + "：有问题，" + review.note);
+}
+
 #if defined(PANPLAY_PS5)
 // 主机上装到本机文件夹的游戏才能注册到主机桌面。
 std::string console_game_dir(const AppSettings& settings, const std::string& path) {
@@ -1113,6 +1162,7 @@ void queue_worker() {
 #endif
     } else {
       save_install_progress(path, progress_of(result));
+      if (!result.install_package_set.empty()) review_install_package(path, result.install_package_set);
     }
     forget_game_detail(path);
     std::lock_guard<std::mutex> lock(installs.mu);
@@ -1796,14 +1846,7 @@ void handle_client(SOCKET client, bool local_peer) {
     review.firmware = firmware_text();
 #endif
     review.at = static_cast<std::int64_t>(std::time(nullptr));
-    // 记下当时装着哪几组：装好的游戏按完成标记，没装过的只记主游戏。
-    const panplay::Json layers = panplay::Json::parse(detail->layers, nullptr);
-    for (const auto& layer : layers.array) {
-      const bool installed = layer.boolean_or("installed", false);
-      if (installed || (detail->installed.empty() && layer.str("role") == "main")) {
-        review.layers.push_back({layer.str("fingerprint"), layer.str("name")});
-      }
-    }
+    review.layers = review_layers(*detail);
     const std::string error = save_review(review);
     if (!error.empty()) {
       reply_json(client, 500, json_error(error));

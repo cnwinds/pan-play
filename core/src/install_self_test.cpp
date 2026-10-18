@@ -999,6 +999,11 @@ int package_and_duplicate_test() {
       return fail(std::string("PKG 安装包没有被认出来: ") + dir + " " + refused.message);
     }
     if (refused.retryable) return fail(std::string("PKG 安装包失败不该能重试: ") + dir);
+    std::string list_error;
+    const auto sets = group_archives(collect_archives(drive, dir, &list_error));
+    if (sets.size() != 1 || refused.install_package_set != archive_set_id(sets.front())) {
+      return fail(std::string("PKG 安装包失败要带上是哪组压缩包: ") + dir + " " + refused.install_package_set);
+    }
     if (has_pkg(sink)) return fail(std::string("认出 PKG 之前就把它写到主机上了: ") + dir);
   }
 
@@ -1031,6 +1036,7 @@ int package_and_duplicate_test() {
     return fail("内容不同的同名文件应该报重复");
   }
   if (!clash.retryable) return fail("普通失败应该能重试");
+  if (!clash.install_package_set.empty()) return fail("不是 PKG 的失败不该标成 PKG 安装包");
   return 0;
 }
 

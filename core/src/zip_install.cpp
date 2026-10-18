@@ -638,6 +638,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
                                      [](const Member& member) { return in_sce_sys(member.name); });
     for (const auto& member : source.members) {
       if (!any_sys && !member.directory && is_install_package(member.name, static_cast<std::int64_t>(member.uncomp_size))) {
+        result.install_package_set = source.id;
         return fail(install_package_error(member.name));
       }
     }
@@ -753,6 +754,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       std::vector<ListedRarEntry> listed;
       const std::string rar_error = extract_rar_entries(drive, sink, source.set->parts, options, &done, &listed);
       result.files_done = static_cast<int>(done.size());
+      if (is_install_package_error(rar_error)) result.install_package_set = source.id;
       if (!rar_error.empty()) return rar_error;
       for (const auto& entry : listed) {
         Member member;
