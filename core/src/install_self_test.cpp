@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -154,9 +155,24 @@ class FakeDrive final : public DrivePlugin {
     return result;
   }
 
+  // 每个文件被顺序读过的最小起点；没读过的不在里面。
+  std::map<std::string, std::int64_t> streamed_from() {
+    std::lock_guard<std::mutex> lock(streamed_mu_);
+    return streamed_from_;
+  }
+  void forget_streams() {
+    std::lock_guard<std::mutex> lock(streamed_mu_);
+    streamed_from_.clear();
+  }
+
   std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error,
                                           AbortSignal* abort) override {
     ++stream_opens;
+    {
+      std::lock_guard<std::mutex> lock(streamed_mu_);
+      const auto it = streamed_from_.find(file_id);
+      if (it == streamed_from_.end() || offset < it->second) streamed_from_[file_id] = offset;
+    }
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(latency_ms.load());
     while (std::chrono::steady_clock::now() < until) {
       if (abort != nullptr && abort->aborted()) {
@@ -203,6 +219,9 @@ class FakeDrive final : public DrivePlugin {
   void delay() const {
     if (latency_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(latency_ms));
   }
+
+  std::mutex streamed_mu_;
+  std::map<std::string, std::int64_t> streamed_from_;
 
   static std::string trim(std::string path) {
     while (path.size() > 1 && path.back() == '/') path.pop_back();
@@ -1479,6 +1498,31 @@ int run_install_pipeline_self_test() {
     drive.add("/apps/panplay/Split CUSA66666/" + split_volumes[i].first, split_volumes[i].second);
     if (i + 1 < split_volumes.size()) drive.add("/apps/panplay/Cut CUSA66667/" + split_volumes[i].first, split_volumes[i].second);
   }
+  // WinRAR 把目录条目都放在压缩包最后。
+  const auto many_dir = rar_dir / "Many";
+  std::filesystem::create_directories(many_dir / "pack" / "a_empty");
+  std::vector<std::vector<std::uint8_t>> many_files;
+  const auto many_name = [](int i) { return std::string(i < 3 ? "d1" : "d2") + "/f" + std::to_string(i) + ".bin"; };
+  for (int i = 0; i < 6; ++i) {
+    many_files.push_back(pattern(20000, static_cast<std::uint8_t>(20 + i)));
+    std::filesystem::create_directories(many_dir / "pack" / (i < 3 ? "d1" : "d2"));
+    std::ofstream out(many_dir / "pack" / many_name(i), std::ios::binary);
+    out.write(reinterpret_cast<const char*>(many_files.back().data()), static_cast<std::streamsize>(many_files.back().size()));
+  }
+  if (!run_rar("a -r -ep1 -idq -y -ma5 -m0 -v40k " + shell_quoted(many_dir / "many.rar") + " " +
+               shell_quoted(many_dir / "pack" / "*"))) {
+    return fail("RAR 没能生成续装点测试 RAR");
+  }
+  std::vector<std::pair<std::string, std::vector<std::uint8_t>>> many_volumes;
+  for (const auto& entry : std::filesystem::directory_iterator(many_dir)) {
+    if (entry.path().extension() != ".rar") continue;
+    std::ifstream part_in(entry.path(), std::ios::binary);
+    many_volumes.emplace_back(entry.path().filename().string(),
+                              std::vector<std::uint8_t>(std::istreambuf_iterator<char>(part_in), {}));
+  }
+  if (many_volumes.size() < 3 || many_volumes.size() > 9) return fail("续装点测试 RAR 分卷数不对");
+  std::sort(many_volumes.begin(), many_volumes.end());
+  for (const auto& volume : many_volumes) drive.add("/apps/panplay/Many CUSA55555/" + volume.first, volume.second);
   std::filesystem::remove_all(rar_dir, rar_remove);
   drive.add("/apps/panplay/Wrapped PPSA88888/game.rar", std::move(wrap_bytes));
   const std::vector<std::uint8_t> fixed_eboot{'e', 'b', 'o', 'o', 't', '-', 'f', 'i', 'x'};
@@ -1641,6 +1685,69 @@ int run_install_pipeline_self_test() {
     if (!error.empty() || got != split_data) return fail("继续安装后跨卷文件内容不对");
     error = local->read_file("/data/homebrew/CUSA66666/c.bin", &got, 1 << 20);
     if (!error.empty() || got != split_tail) return fail("继续安装后跨卷文件后面的文件不对");
+  }
+
+  // 续装时直接从上次停下的那一卷接着读，前面的卷不再读；续装点坏了时退回从第一卷核对，照样装对。
+  for (const bool spoil : {false, true}) {
+    const auto local_root = root / (spoil ? "rar-resume-spoiled" : "rar-resume-point");
+    auto local = make_local_sink(local_root.u8string());
+    InstallRequest request;
+    request.source_dir = "/apps/panplay/Many CUSA55555";
+    request.dest_prefix = "/data/homebrew";
+    request.stop_after_output_bytes = 20000 * 4 + 5000;
+    const InstallResult first = install_game(drive, *local, request);
+    if (first.status != "interrupted") return fail("多卷 RAR 没有在中途停下: " + first.status + " " + first.message);
+    std::filesystem::path journal_file;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(local_root)) {
+      if (entry.path().filename() == ".panplay-journal.jsonl") journal_file = entry.path();
+    }
+    if (journal_file.empty()) return fail("中途停下后没有进度日志");
+    std::string journal_text;
+    {
+      std::ifstream in(journal_file, std::ios::binary);
+      journal_text.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    if (journal_text.find("\"next\":") == std::string::npos) return fail("进度日志里没有记续装点");
+    // 模拟续装点之前已经走过的目录：一个包里有、续装途中还会再遇到，一个只在日志里。
+    const std::string first_file = "d1/f0.bin\"";
+    const auto first_at = journal_text.find(first_file);
+    const auto name_at = journal_text.rfind("\"name\":\"", first_at);
+    if (first_at == std::string::npos || name_at == std::string::npos) return fail("进度日志里没有第一个文件");
+    const std::string prefix = journal_text.substr(name_at + 8, first_at - name_at - 8);
+    journal_text = "{\"dir\":\"" + prefix + "a_empty\"}\n{\"dir\":\"" + prefix + "zz_journal_only\"}\n" + journal_text;
+    std::ofstream(journal_file, std::ios::binary | std::ios::trunc) << journal_text;
+    if (spoil) {
+      std::string spoiled;
+      std::size_t at = 0;
+      for (std::size_t key; (key = journal_text.find("\"next\":", at)) != std::string::npos;) {
+        const std::size_t digits = key + 7;
+        std::size_t end = digits;
+        while (end < journal_text.size() && std::isdigit(static_cast<unsigned char>(journal_text[end]))) ++end;
+        spoiled += journal_text.substr(at, digits - at) + std::to_string(std::stoll(journal_text.substr(digits, end - digits)) + 7);
+        at = end;
+      }
+      spoiled += journal_text.substr(at);
+      std::ofstream(journal_file, std::ios::binary | std::ios::trunc) << spoiled;
+    }
+    drive.forget_streams();
+    request.stop_after_output_bytes = -1;
+    const InstallResult resumed = install_game(drive, *local, request);
+    if (resumed.status != "installed") return fail("多卷 RAR 继续安装失败: " + resumed.message);
+    const bool read_first = drive.streamed_from().count("/apps/panplay/Many CUSA55555/" + many_volumes.front().first) > 0;
+    if (!spoil && read_first) return fail("续装时又从第一卷读起");
+    if (spoil && !read_first) return fail("续装点坏了却没有退回从第一卷核对");
+    std::vector<std::uint8_t> got;
+    for (int i = 0; i < 6; ++i) {
+      error = local->read_file("/data/homebrew/CUSA55555/" + many_name(i), &got, 1 << 20);
+      if (!error.empty() || got != many_files[static_cast<std::size_t>(i)]) {
+        return fail("继续安装后第 " + std::to_string(i) + " 个文件不对");
+      }
+    }
+    const auto game_dir = local_root / "data" / "homebrew" / "CUSA55555";
+    if (!std::filesystem::is_directory(game_dir / "a_empty")) return fail("继续安装后空目录没了");
+    if (!spoil && !std::filesystem::is_directory(game_dir / "zz_journal_only")) {
+      return fail("续装点之前的目录没有按进度日志补回来");
+    }
   }
 
   // 少了最后一卷时 UnRAR 只报压缩包结束，不能把已经读到的文件当作装完。

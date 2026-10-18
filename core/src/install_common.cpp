@@ -208,8 +208,9 @@ std::string OutputFile::finish() {
   return error;
 }
 
-std::vector<FinishedFile> load_journal(InstallSink& sink, const std::string& path) {
+std::vector<FinishedFile> load_journal(InstallSink& sink, const std::string& path, std::vector<std::string>* dirs) {
   std::vector<FinishedFile> done;
+  if (dirs != nullptr) dirs->clear();
   std::vector<std::uint8_t> bytes;
   if (!sink.read_file(path, &bytes, 256u << 20).empty()) return done;
   const std::string text(bytes.begin(), bytes.end());
@@ -223,6 +224,10 @@ std::vector<FinishedFile> load_journal(InstallSink& sink, const std::string& pat
     if (line.empty()) continue;
     std::string parse_error;
     const Json json = Json::parse(line, &parse_error);
+    if (parse_error.empty() && !json.str("dir").empty()) {
+      if (dirs != nullptr) dirs->push_back(json.str("dir"));
+      continue;
+    }
     FinishedFile file;
     file.name = json.str("name");
     const std::string size_text = json.str("size");
@@ -232,6 +237,11 @@ std::vector<FinishedFile> load_journal(InstallSink& sink, const std::string& pat
       try {
         file.size = std::stoll(size_text);
         file.crc = static_cast<std::uint32_t>(std::stoul(crc_text));
+        if (!json.str("vol").empty() && !json.str("next").empty() && !json.str("vsize").empty()) {
+          file.volume = std::stoi(json.str("vol"));
+          file.next = std::stoll(json.str("next"));
+          file.volume_size = std::stoll(json.str("vsize"));
+        }
       } catch (const std::exception&) {
         ok = false;
       }
@@ -248,15 +258,24 @@ std::vector<FinishedFile> load_journal(InstallSink& sink, const std::string& pat
 namespace {
 
 std::string journal_line(const FinishedFile& file) {
+  std::string resume;
+  if (file.volume >= 0) {
+    resume = ",\"vol\":" + std::to_string(file.volume) + ",\"next\":" + std::to_string(file.next) +
+             ",\"vsize\":" + std::to_string(file.volume_size);
+  }
   return "{\"crc32\":" + std::to_string(file.crc) + ",\"name\":\"" + json_escape(file.name) +
-         "\",\"size\":" + std::to_string(file.size) + "}\n";
+         "\",\"size\":" + std::to_string(file.size) + resume + "}\n";
 }
+
+std::string journal_dir_line(const std::string& name) { return "{\"dir\":\"" + json_escape(name) + "\"}\n"; }
 
 }  // namespace
 
-std::string write_journal(InstallSink& sink, const std::string& path, const std::vector<FinishedFile>& done) {
+std::string write_journal(InstallSink& sink, const std::string& path, const std::vector<FinishedFile>& done,
+                          const std::vector<std::string>& dirs) {
   if (auto error = sink.ensure_dir(parent_path(path)); !error.empty()) return error;
   std::string text;
+  for (const auto& dir : dirs) text += journal_dir_line(dir);
   for (const auto& file : done) text += journal_line(file);
   return sink.store(path, reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
 }
@@ -271,6 +290,11 @@ std::string JournalWriter::add(const FinishedFile& file) {
   const auto now = std::chrono::steady_clock::now();
   if (pending_count_ < kBatchFiles && now - last_flush_ < std::chrono::seconds(1)) return "";
   return flush();
+}
+
+std::string JournalWriter::add_dir(const std::string& name) {
+  pending_ += journal_dir_line(name);
+  return "";
 }
 
 std::string JournalWriter::flush() {

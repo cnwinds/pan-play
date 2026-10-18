@@ -66,6 +66,11 @@ struct FinishedFile {
   std::string name;
   std::int64_t size = 0;
   std::uint32_t crc = 0;
+  // RAR 的续装点：这个文件写完后下一个文件头在第几卷（volume）、卷内第几字节（next），以及那一卷的大小。
+  // 非固实 RAR 续装时直接从这里接着读，不用从第一卷走一遍。别的格式不记，volume 为 -1。
+  int volume = -1;
+  std::int64_t next = -1;
+  std::int64_t volume_size = -1;
 };
 
 class JournalWriter;
@@ -86,6 +91,8 @@ struct RarExtract {
   std::function<void(std::int64_t archive_bytes)> on_bytes;
   // 字典超过这么多字节就在解压前停下，0 是不限制。
   std::uint64_t max_dictionary = 0;
+  // 上次装到一半时已经建好的目录（带暂存前缀），从续装点接着读时用来补全条目清单。
+  const std::vector<std::string>* finished_dirs = nullptr;
 };
 
 // 一遍读完整组分卷：全部解压到暂存区，同时把压缩包里的条目按原路径记到 listed。

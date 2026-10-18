@@ -699,10 +699,11 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
     return fail(error);
   }
 
-  std::vector<FinishedFile> done = load_journal(sink, journal_path);
+  std::vector<std::string> done_dirs;
+  std::vector<FinishedFile> done = load_journal(sink, journal_path, &done_dirs);
   error.clear();
   if (sink.file_size(journal_path, &error) >= 0) {
-    if (auto write_error = write_journal(sink, journal_path, done); !write_error.empty()) return fail(write_error);
+    if (auto write_error = write_journal(sink, journal_path, done, done_dirs); !write_error.empty()) return fail(write_error);
   }
   result.files_done = static_cast<int>(done.size());
   result.files_to_check = static_cast<int>(done.size());
@@ -739,6 +740,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       options.prefetch = request.prefetch;
       options.staging_prefix = source.prefix;
       options.max_dictionary = request.max_dictionary;
+      options.finished_dirs = &done_dirs;
       options.on_file_done = [&](const std::vector<FinishedFile>& now_done) {
         result.files_done = static_cast<int>(now_done.size());
         report(phase);

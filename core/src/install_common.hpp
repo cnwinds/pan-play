@@ -94,11 +94,12 @@ class OutputFile {
   std::int64_t committed_ = 0;
 };
 
-// 进度日志每行一个已校验的文件。读不懂的最后一行是中断留下的半行，忽略；
+// 进度日志每行一个已校验的文件，或者一个建好的目录（dirs）。读不懂的最后一行是中断留下的半行，忽略；
 // 中间有坏行时整份当作空的，已完成的文件会重新解压校验。
-std::vector<FinishedFile> load_journal(InstallSink& sink, const std::string& path);
+std::vector<FinishedFile> load_journal(InstallSink& sink, const std::string& path, std::vector<std::string>* dirs = nullptr);
 // 每次开始安装时整份重写一次，去掉上次中断留下的半行，之后只追加。
-std::string write_journal(InstallSink& sink, const std::string& path, const std::vector<FinishedFile>& done);
+std::string write_journal(InstallSink& sink, const std::string& path, const std::vector<FinishedFile>& done,
+                          const std::vector<std::string>& dirs = {});
 
 // 往进度日志追加已校验的文件。在 FTP 上每次追加都要开一条数据连接，所以攒够一批
 // 或隔一秒才写一次；析构时写掉剩下的。中断时最多丢最近一批，那几个文件续装时重新解压。
@@ -109,6 +110,7 @@ class JournalWriter {
   JournalWriter(const JournalWriter&) = delete;
   JournalWriter& operator=(const JournalWriter&) = delete;
   std::string add(const FinishedFile& file);
+  std::string add_dir(const std::string& name);
   std::string flush();
 
  private:

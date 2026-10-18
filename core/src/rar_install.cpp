@@ -24,17 +24,27 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace {
 
+// pos 是给 UnRAR 看的位置。从续装点接着读时，续装点所在的那一卷被拼成：卷头（签名和主文件头，splice_at 字节）
+// 后面直接接 splice_to 之后的数据，UnRAR 读到的第一个文件就是上次没装完的那个，前面的数据一个字节都不用读。
 struct VolumeState {
   std::string name;
   std::string file_id;
   std::int64_t size = 0;
   std::int64_t pos = 0;
+  std::int64_t splice_at = -1;
+  std::int64_t splice_to = 0;
   std::unique_ptr<panplay::PrefetchReader> reader;
+
+  std::int64_t visible_size() const { return splice_at >= 0 ? size - (splice_to - splice_at) : size; }
+  std::int64_t real(std::int64_t visible) const {
+    return splice_at >= 0 && visible >= splice_at ? visible - splice_at + splice_to : visible;
+  }
 };
 
 struct RarSession {
@@ -262,7 +272,7 @@ struct SessionGuard {
   ~SessionGuard() { session = nullptr; }
 };
 
-std::string open_archive(SessionGuard& guard, unsigned int mode, HANDLE* handle) {
+std::string open_archive(SessionGuard& guard, unsigned int mode, HANDLE* handle, unsigned int* flags = nullptr) {
   if (guard.state.volumes.empty()) return "RAR 分卷是空的";
   RAROpenArchiveDataEx data{};
   data.ArcNameW = guard.state.name_buf.data();
@@ -274,6 +284,7 @@ std::string open_archive(SessionGuard& guard, unsigned int mode, HANDLE* handle)
     return guard.state.read_error.empty() ? "无法打开 RAR" : guard.state.read_error;
   }
   *handle = opened;
+  if (flags != nullptr) *flags = data.Flags;
   return "";
 }
 
@@ -284,7 +295,8 @@ std::int64_t archive_position() {
     position += session->volumes[static_cast<std::size_t>(i)].size;
   }
   if (static_cast<std::size_t>(session->index) < session->volumes.size()) {
-    position += session->volumes[static_cast<std::size_t>(session->index)].pos;
+    const VolumeState& volume = session->volumes[static_cast<std::size_t>(session->index)];
+    position += volume.real(volume.pos);
   }
   return position;
 }
@@ -311,18 +323,21 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
     return -1;
   }
   VolumeState& volume = session->volumes[static_cast<std::size_t>(session->index)];
-  if (volume.pos >= volume.size || size == 0) return 0;
+  if (volume.pos >= volume.visible_size() || size == 0) return 0;
   if (!volume.reader) {
     volume.reader = std::make_unique<panplay::PrefetchReader>(*session->drive, volume.file_id, volume.size, session->cancel,
                                                               session->prefetch);
   }
-  if (volume.reader->position() != volume.pos) {
-    if (auto error = volume.reader->seek(volume.pos); !error.empty()) {
+  if (volume.reader->position() != volume.real(volume.pos)) {
+    if (auto error = volume.reader->seek(volume.real(volume.pos)); !error.empty()) {
       session->read_error = error;
       return -1;
     }
   }
-  const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), volume.size - volume.pos));
+  // 拼过的卷在卷头和续装点之间不连续，一次只读到卷头结尾，下一次再从续装点读。
+  const std::int64_t contiguous_end =
+      volume.splice_at >= 0 && volume.pos < volume.splice_at ? volume.splice_at : volume.visible_size();
+  const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), contiguous_end - volume.pos));
   auto* out = static_cast<std::uint8_t*>(data);
   std::size_t filled = 0;
   const auto started = std::chrono::steady_clock::now();
@@ -354,9 +369,9 @@ extern "C" int panplay_unrar_seek(long long offset, int method) {
   long long next = volume.pos;
   if (method == SEEK_SET) next = offset;
   else if (method == SEEK_CUR) next = volume.pos + offset;
-  else if (method == SEEK_END) next = volume.size + offset;
+  else if (method == SEEK_END) next = volume.visible_size() + offset;
   else return 0;
-  if (next < 0 || next > volume.size) return 0;
+  if (next < 0 || next > volume.visible_size()) return 0;
   volume.pos = next;
   return 1;
 }
@@ -370,13 +385,107 @@ extern "C" long long panplay_unrar_tell(void) {
 
 namespace panplay {
 
-std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
-                                const RarExtract& options, std::vector<FinishedFile>* done,
-                                std::vector<ListedRarEntry>* listed) {
+namespace {
+
+// 续装点：上次最后写好的文件之后，下一个文件头在第 volume 卷的 offset 处；header_end 是这一卷卷头的长度。
+struct ResumeAt {
+  int volume = -1;
+  std::int64_t header_end = 0;
+  std::int64_t offset = 0;
+};
+
+// 一卷开头的签名加主文件头有多长；认不出时返回 -1。
+std::int64_t volume_header_end(const std::vector<std::uint8_t>& bytes) {
+  static const std::uint8_t rar5[] = {0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00};
+  static const std::uint8_t rar4[] = {0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00};
+  const auto vint = [&](std::size_t* at, std::uint64_t* value) {
+    *value = 0;
+    for (int shift = 0; *at < bytes.size() && shift < 64; shift += 7) {
+      const std::uint8_t byte = bytes[(*at)++];
+      *value |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+      if ((byte & 0x80) == 0) return true;
+    }
+    return false;
+  };
+  if (bytes.size() >= sizeof(rar5) && std::memcmp(bytes.data(), rar5, sizeof(rar5)) == 0) {
+    std::size_t at = sizeof(rar5) + 4;
+    std::uint64_t size = 0;
+    std::uint64_t type = 0;
+    if (!vint(&at, &size)) return -1;
+    const std::size_t body = at;
+    if (!vint(&at, &type) || type != 1 || size == 0 || size > (1u << 20)) return -1;
+    return static_cast<std::int64_t>(body + size);
+  }
+  if (bytes.size() >= 14 && std::memcmp(bytes.data(), rar4, sizeof(rar4)) == 0 && bytes[9] == 0x73) {
+    const int size = bytes[12] | (bytes[13] << 8);
+    return size >= 13 ? 7 + size : -1;
+  }
+  return -1;
+}
+
+bool strip_prefix(const std::string& name, const std::string& prefix, std::string* rest) {
+  if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) return false;
+  *rest = name.substr(prefix.size());
+  return true;
+}
+
+bool find_resume(DrivePlugin& drive, const std::vector<DriveEntry>& parts, const RarExtract& options,
+                 const std::vector<FinishedFile>& done, ResumeAt* resume) {
+  const FinishedFile* last = nullptr;
+  std::string rest;
+  for (const auto& file : done) {
+    if (file.volume >= 0 && strip_prefix(file.name, options.staging_prefix, &rest)) last = &file;
+  }
+  if (last == nullptr) return false;
+  const auto index = static_cast<std::size_t>(last->volume);
+  if (index >= parts.size() || parts[index].size != last->volume_size || last->next <= 0 ||
+      last->next > last->volume_size) {
+    return false;
+  }
+  const ReadResult head = drive.read_at(parts[index].file_id, 0, 256);
+  if (!head.error.empty()) return false;
+  const std::int64_t header_end = volume_header_end(head.bytes);
+  if (header_end <= 0 || header_end > last->next) return false;
+  *resume = ResumeAt{last->volume, header_end, last->next};
+  return true;
+}
+
+// 续装点之前的条目不再经过 UnRAR，按进度日志补回清单。
+std::vector<ListedRarEntry> entries_before(const RarExtract& options, const std::vector<FinishedFile>& done) {
+  std::vector<ListedRarEntry> entries;
+  std::string name;
+  if (options.finished_dirs != nullptr) {
+    for (const auto& dir : *options.finished_dirs) {
+      if (strip_prefix(dir, options.staging_prefix, &name)) entries.push_back(ListedRarEntry{name, true, false, 0, 0});
+    }
+  }
+  for (const auto& file : done) {
+    if (strip_prefix(file.name, options.staging_prefix, &name)) {
+      entries.push_back(ListedRarEntry{name, false, false, file.crc, static_cast<std::uint64_t>(file.size)});
+    }
+  }
+  return entries;
+}
+
+// resume 不为空时从续装点开始；续装点用不上（打不开、是固实包、第一个文件头不对）时设 *start_over 并立即返回，
+// 这时还没有写任何文件。
+std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
+                         const RarExtract& options, std::vector<FinishedFile>* done,
+                         std::vector<ListedRarEntry>* listed, const ResumeAt* resume, bool* start_over) {
   SessionGuard guard(drive, parts, options.cancel, options.prefetch);
   guard.state.on_bytes = options.on_bytes;
+  if (resume != nullptr) {
+    VolumeState& volume = guard.state.volumes[static_cast<std::size_t>(resume->volume)];
+    volume.splice_at = resume->header_end;
+    volume.splice_to = resume->offset;
+    const std::wstring wide = utf8_to_wide(volume.name);
+    guard.state.name_buf.assign(wide.begin(), wide.end());
+    guard.state.name_buf.push_back(L'\0');
+  }
   std::map<std::string, std::pair<std::int64_t, std::uint32_t>> finished_before;
   for (const auto& file : *done) finished_before[file.name] = {file.size, file.crc};
+  std::set<std::string> known_dirs;
+  if (options.finished_dirs != nullptr) known_dirs.insert(options.finished_dirs->begin(), options.finished_dirs->end());
   const auto started = std::chrono::steady_clock::now();
   struct Trace {
     RarSession& state;
@@ -395,17 +504,42 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
   } trace_end{guard.state, started};
   std::uint64_t largest_dictionary = 0;
   HANDLE handle = nullptr;
-  if (auto error = open_archive(guard, RAR_OM_EXTRACT, &handle); !error.empty()) return error;
+  unsigned int archive_flags = 0;
+  if (auto error = open_archive(guard, RAR_OM_EXTRACT, &handle, &archive_flags); !error.empty()) {
+    if (resume == nullptr) return error;
+    *start_over = true;
+    return "";
+  }
+  if (resume != nullptr && (archive_flags & ROADF_SOLID) != 0) {
+    RARCloseArchive(handle);
+    *start_over = true;
+    return "";
+  }
   RarWrite writer;
   active_write = &writer;
   std::string failure;
   bool seen_sys = false;
+  if (resume != nullptr) {
+    for (const auto& entry : entries_before(options, *done)) seen_sys = seen_sys || in_sce_sys(entry.name);
+  }
+  bool first_header = resume != nullptr;
+  const int last = static_cast<int>(guard.state.volumes.size()) - 1;
   while (failure.empty()) {
     RARHeaderDataEx header{};
     const int code = RARReadHeaderEx(handle, &header);
+    if (first_header) {
+      first_header = false;
+      const bool cancelled = options.cancel != nullptr && options.cancel->cancelled();
+      const bool clean_end = code == ERAR_END_ARCHIVE && guard.state.read_error.empty() && guard.state.index == last;
+      const bool usable =
+          code == ERAR_SUCCESS ? (header.Flags & (RHDF_SPLITBEFORE | RHDF_SOLID)) == 0 : clean_end;
+      if (!usable && !cancelled) {
+        *start_over = true;
+        break;
+      }
+    }
     // 网盘读出错、安装被取消、接不上下一卷时，UnRAR 也常常只报压缩包结束；这些都不能当作读完了。
     if (code == ERAR_END_ARCHIVE) {
-      const int last = static_cast<int>(guard.state.volumes.size()) - 1;
       if (!guard.state.read_error.empty()) {
         failure = guard.state.read_error;
       } else if (options.cancel != nullptr && options.cancel->cancelled()) {
@@ -467,8 +601,18 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       failure = install_package_error(name);
       break;
     }
-    listed->push_back(ListedRarEntry{name, directory, solid, header.FileCRC, size});
     const std::string staged = options.staging_prefix + name;
+    if (directory) {
+      // 续装时按日志补回清单的目录，在续装点之后可能又遇到一次。
+      const bool known = !known_dirs.insert(staged).second;
+      if (!known || resume == nullptr) listed->push_back(ListedRarEntry{name, directory, solid, header.FileCRC, size});
+      if (!known && options.journal != nullptr) {
+        failure = options.journal->add_dir(staged);
+        if (!failure.empty()) break;
+      }
+    } else {
+      listed->push_back(ListedRarEntry{name, directory, solid, header.FileCRC, size});
+    }
     const auto before = finished_before.find(staged);
     const bool already = before != finished_before.end() && before->second.first == static_cast<std::int64_t>(size) &&
                          before->second.second == header.FileCRC;
@@ -502,16 +646,43 @@ std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std
       failure = "校验和不符: " + name;
       break;
     }
-    const FinishedFile finished{staged, static_cast<std::int64_t>(size), header.FileCRC};
+    // 处理完一个文件后，UnRAR 停在下一个文件头（或本卷结尾）上，这就是下次的续装点。
+    FinishedFile finished{staged, static_cast<std::int64_t>(size), header.FileCRC};
+    const VolumeState& at = guard.state.volumes[static_cast<std::size_t>(guard.state.index)];
+    finished.volume = guard.state.index;
+    finished.next = at.real(at.pos);
+    finished.volume_size = at.size;
     done->push_back(finished);
     failure = options.journal->add(finished);
     if (failure.empty() && options.on_file_done) options.on_file_done(*done);
   }
-  if (failure.empty()) report_bytes(true);
+  if (failure.empty() && !*start_over) report_bytes(true);
   writer.out.reset();
   active_write = nullptr;
   RARCloseArchive(handle);
   return failure;
+}
+
+}  // namespace
+
+std::string extract_rar_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
+                                const RarExtract& options, std::vector<FinishedFile>* done,
+                                std::vector<ListedRarEntry>* listed) {
+  bool start_over = false;
+  ResumeAt resume;
+  if (!parts.empty() && find_resume(drive, parts, options, *done, &resume)) {
+    const std::size_t listed_count = listed->size();
+    const std::vector<ListedRarEntry> earlier = entries_before(options, *done);
+    listed->insert(listed->end(), earlier.begin(), earlier.end());
+    log_line(LogLevel::info, "RAR 从第 " + std::to_string(resume.volume + 1) + " 卷第 " + std::to_string(resume.offset) +
+                                 " 字节接着装，前面 " + std::to_string(earlier.size()) + " 项不再重读");
+    const std::string failure = extract_pass(drive, sink, parts, options, done, listed, &resume, &start_over);
+    if (!start_over) return failure;
+    listed->erase(listed->begin() + static_cast<std::ptrdiff_t>(listed_count), listed->end());
+    log_line(LogLevel::warn, "RAR 续装点接不上，改为从第 1 卷开始核对");
+    start_over = false;
+  }
+  return extract_pass(drive, sink, parts, options, done, listed, nullptr, &start_over);
 }
 
 }  // namespace panplay
