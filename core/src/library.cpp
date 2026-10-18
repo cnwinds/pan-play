@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
 #include <map>
 #include <set>
 
@@ -249,6 +251,31 @@ std::string archive_sets_signature(const std::vector<ArchiveSet>& sets) {
 }
 
 std::string archive_set_id(const ArchiveSet& set) { return archive_sets_signature({set}); }
+
+std::string content_fingerprint(const ArchiveSet& set) {
+  std::vector<std::string> parts;
+  bool all_hashed = !set.parts.empty();
+  for (const auto& part : set.parts) {
+    if (part.content_hash.empty()) all_hashed = false;
+    parts.push_back(part.content_hash.empty() ? "size:" + std::to_string(part.size) : part.content_hash);
+  }
+  std::sort(parts.begin(), parts.end());
+  // FNV-1a 64 位，算两遍（第二遍换初值）拼成 32 个十六进制字符，本机记评价用，撞车可以不管。
+  const auto fnv = [&](std::uint64_t hash) {
+    for (const auto& part : parts) {
+      for (const unsigned char c : part + "\n") {
+        hash ^= c;
+        hash *= 1099511628211ull;
+      }
+    }
+    return hash;
+  };
+  char text[40];
+  std::snprintf(text, sizeof(text), "%c%016llx%016llx", all_hashed ? 'm' : 's',
+                static_cast<unsigned long long>(fnv(14695981039346656037ull)),
+                static_cast<unsigned long long>(fnv(0x84222325cbf29ce4ull)));
+  return text;
+}
 
 std::string archive_folder(std::string game_dir, const std::string& archive_path) {
   while (game_dir.size() > 1 && game_dir.back() == '/') game_dir.pop_back();

@@ -1,6 +1,7 @@
 #include "server.hpp"
 
 #include "detail_cache.hpp"
+#include "reviews.hpp"
 #include "settings.hpp"
 
 #include "panplay/app_paths.hpp"
@@ -15,6 +16,7 @@
 #include "panplay/trace.hpp"
 
 #if defined(PANPLAY_PS5)
+#include "ps5_appinst.hpp"
 #include "ps5_notify.hpp"
 #include "ps5_titles.hpp"
 #endif
@@ -651,8 +653,13 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     if (chinese_only && !(store.found && (store.has_cn_sub() || store.has_cn_voice()))) continue;
     if (multi_only && !(store.found && store.players >= 2)) continue;
     const std::string shown = search_text.substr(0, search_text.find('\n'));
-    rows.push_back({folder_json(folder.name, folder.path, folder.title_id, state, meta), shown.empty() ? folder.name : shown,
-                    std::move(store)});
+    // 打开过详情、读过压缩包的才知道指纹；没读过的不查，列表不为这个多发请求。
+    std::string review_field;
+    if (const auto review = find_review(cached_game_fingerprint(listing->key, folder.path))) {
+      review_field = std::string(",\"review_state\":\"") + (review->playable ? "good" : "bad") + "\"";
+    }
+    rows.push_back({folder_json(folder.name, folder.path, folder.title_id, state, meta + review_field),
+                    shown.empty() ? folder.name : shown, std::move(store)});
   }
 
   // 没评分、没发售日的排在最后；同分时保持游戏库目录的顺序。
@@ -689,7 +696,7 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
 // 能装的每组压缩包一项，供安装前挑选补丁。主游戏是直接放在游戏目录里最大的那组（都在子目录里时取最大的），
 // 必装；子目录里的算补丁，游戏目录里其他的（多是 backport）算附加。按主游戏、补丁（自然排序）、附加的顺序列出。
 std::string layers_json(const panplay::GameFolder& game, const std::set<std::string>& skipped,
-                        const std::vector<std::string>& installed) {
+                        const std::vector<std::string>& installed, std::string* main_fingerprint = nullptr) {
   struct Layer {
     const panplay::ArchiveSet* set;
     std::string id;
@@ -719,11 +726,13 @@ std::string layers_json(const panplay::GameFolder& game, const std::set<std::str
     if (const int order = panplay::natural_compare(left.folder, right.folder); order != 0) return order < 0;
     return panplay::natural_compare(left.set->parts.front().name, right.set->parts.front().name) < 0;
   });
+  if (main_fingerprint != nullptr) *main_fingerprint = main != nullptr ? panplay::content_fingerprint(*main->set) : "";
   std::string json = "[";
   for (const auto& layer : layers) {
     if (json.size() > 1) json += ",";
     const bool is_installed = std::find(installed.begin(), installed.end(), layer.id) != installed.end();
-    json += "{\"id\":\"" + panplay::json_escape(layer.id) + "\",\"name\":\"" +
+    json += "{\"id\":\"" + panplay::json_escape(layer.id) + "\",\"fingerprint\":\"" +
+            panplay::content_fingerprint(*layer.set) + "\",\"name\":\"" +
             panplay::json_escape(layer.set->parts.front().name) + "\",\"folder\":\"" + panplay::json_escape(layer.folder) +
             "\",\"parts\":" + std::to_string(layer.set->parts.size()) + ",\"bytes\":" + std::to_string(layer.bytes) +
             ",\"role\":\"" + layer.role + "\",\"skipped\":" +
@@ -774,7 +783,7 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
       detail.state = "install";
     }
   }
-  detail.layers = layers_json(game, load_skipped_sets(path), detail.installed);
+  detail.layers = layers_json(game, load_skipped_sets(path), detail.installed, &detail.fingerprint);
   return detail;
 }
 
@@ -787,6 +796,21 @@ std::string install_location(const AppSettings& settings, const std::string& pat
   }
   if (settings.local_dir.empty()) return "";
   return (std::filesystem::u8path(settings.local_dir) / std::filesystem::u8path(folder)).u8string();
+}
+
+// 游戏界面上显示的名字：用户改过的、商店的中文名、资料库的英文名，都没有就用网盘目录名。
+std::string game_display_name(const std::string& path) {
+  const std::string name = folder_name_of(path);
+  const std::string title_id = panplay::find_title_id(name);
+  const NameOverrides overrides = load_name_overrides();
+  if (const auto custom = overrides.find(name_key(name, title_id)); custom != overrides.end()) return custom->second;
+  panplay::CatalogMatch match;
+  if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
+  panplay::StoreMeta meta;
+  if (match.found && match.entry.concept_id > 0 && store_meta != nullptr) store_meta->lookup(match.entry.concept_id, &meta);
+  if (meta.found && !meta.name.empty()) return meta.name;
+  if (match.found && !match.entry.name.empty()) return match.entry.name;
+  return name;
 }
 
 #if defined(PANPLAY_PS5)
@@ -839,21 +863,6 @@ bool register_after_install(const std::string& path, bool files_changed) {
   const std::string error = register_console_title(game_dir);
   remember_console_error(path, error);
   return error.empty();
-}
-
-// 游戏界面上显示的名字：用户改过的、商店的中文名、资料库的英文名，都没有就用网盘目录名。
-std::string game_display_name(const std::string& path) {
-  const std::string name = folder_name_of(path);
-  const std::string title_id = panplay::find_title_id(name);
-  const NameOverrides overrides = load_name_overrides();
-  if (const auto custom = overrides.find(name_key(name, title_id)); custom != overrides.end()) return custom->second;
-  panplay::CatalogMatch match;
-  if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
-  panplay::StoreMeta meta;
-  if (match.found && match.entry.concept_id > 0 && store_meta != nullptr) store_meta->lookup(match.entry.concept_id, &meta);
-  if (meta.found && !meta.name.empty()) return meta.name;
-  if (match.found && !match.entry.name.empty()) return match.entry.name;
-  return name;
 }
 
 // 新装或装了更新时在主机上弹「已安装完成」，带游戏图标。
@@ -920,6 +929,12 @@ std::string one_game_json(const std::string& path, bool cached) {
       json += ",\"console\":" + console_json(path, game_dir);
     }
 #endif
+    const auto review = find_review(detail->fingerprint);
+    json += ",\"fingerprint\":\"" + panplay::json_escape(detail->fingerprint) + "\",\"review\":" +
+            (review ? review_json(*review) : "null") + ",\"review_state\":\"" +
+            (review ? (review->playable ? "good" : "bad") : "") + "\"";
+    const auto others = reviews_of_title(title_id, detail->fingerprint);
+    json += ",\"other_review\":" + (others.empty() ? std::string("null") : review_json(others.front()));
   }
   return json + game_meta_fields(name, title_id, load_name_overrides(), true) + "}";
 }
@@ -1747,6 +1762,58 @@ void handle_client(SOCKET client, bool local_peer) {
   }
   // discard 删掉没装完的游戏已经写到存放位置的文件，uninstall 删掉整个游戏文件夹；都会把它移出队列。
   // 正在装或排队的要先取消。
+  // 记下这个版本能不能玩，或者清掉评价。按详情页上次读到的压缩包算内容指纹，所以要先打开过详情。
+  if (method == "POST" && (target == "/api/review" || target == "/api/review/remove")) {
+    std::string parse_error;
+    const panplay::Json json = panplay::Json::parse(body, &parse_error);
+    const std::string path = json.str("path");
+    if (!parse_error.empty() || path.empty()) {
+      reply_json(client, 400, json_error(parse_error.empty() ? "缺少游戏目录" : parse_error));
+      return;
+    }
+    const auto detail = cached_game_detail(shelf_key(load_settings()), path);
+    if (!detail || detail->fingerprint.empty()) {
+      reply_json(client, 400, json_error("还没读到这个游戏的压缩包，等详情页读完再评价"));
+      return;
+    }
+    if (target == "/api/review/remove") {
+      const std::string error = remove_review(detail->fingerprint);
+      reply_json(client, error.empty() ? 200 : 500, error.empty() ? "{\"review\":null}" : json_error(error));
+      return;
+    }
+    GameReview review;
+    review.fingerprint = detail->fingerprint;
+    review.title_id = panplay::find_title_id(folder_name_of(path));
+    review.name = game_display_name(path);
+    review.playable = json.boolean_or("playable", true);
+    review.note = trimmed(json.str("note"));
+    if (review.note.size() > 300) {
+      std::size_t cut = 300;
+      while (cut > 0 && (static_cast<unsigned char>(review.note[cut]) & 0xC0) == 0x80) --cut;
+      review.note.resize(cut);
+    }
+#if defined(PANPLAY_PS5)
+    review.firmware = firmware_text();
+#endif
+    review.at = static_cast<std::int64_t>(std::time(nullptr));
+    // 记下当时装着哪几组：装好的游戏按完成标记，没装过的只记主游戏。
+    const panplay::Json layers = panplay::Json::parse(detail->layers, nullptr);
+    for (const auto& layer : layers.array) {
+      const bool installed = layer.boolean_or("installed", false);
+      if (installed || (detail->installed.empty() && layer.str("role") == "main")) {
+        review.layers.push_back({layer.str("fingerprint"), layer.str("name")});
+      }
+    }
+    const std::string error = save_review(review);
+    if (!error.empty()) {
+      reply_json(client, 500, json_error(error));
+      return;
+    }
+    panplay::log_info(std::string("评价 ") + review.name + "：" + (review.playable ? "能玩" : "有问题 " + review.note) +
+                      (review.firmware.empty() ? "" : "，固件 " + review.firmware));
+    reply_json(client, 200, "{\"review\":" + review_json(review) + "}");
+    return;
+  }
 #if defined(PANPLAY_PS5)
   // 把装好的游戏重新注册到主机桌面（自动注册失败、图标被删掉、挂载丢了时用）。
   if (method == "POST" && target == "/api/console/register") {

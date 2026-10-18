@@ -36,6 +36,7 @@ void load_locked() {
     detail.archive_bytes = static_cast<std::int64_t>(node.num("archive_bytes"));
     detail.formats = node.str("formats");
     detail.layers = node.str("layers");
+    detail.fingerprint = node.str("fingerprint");
     if (const panplay::Json* installed = node.get("installed")) {
       for (const auto& id : installed->array) detail.installed.push_back(id.text);
     }
@@ -52,7 +53,8 @@ void save_locked() {
     first = false;
     json += "\"" + json_escape(path) + "\":{\"state\":\"" + json_escape(detail.state) +
             "\",\"archive_bytes\":" + std::to_string(detail.archive_bytes) + ",\"formats\":\"" +
-            json_escape(detail.formats) + "\",\"layers\":\"" + json_escape(detail.layers) + "\",\"installed\":[";
+            json_escape(detail.formats) + "\",\"layers\":\"" + json_escape(detail.layers) + "\",\"fingerprint\":\"" +
+            json_escape(detail.fingerprint) + "\",\"installed\":[";
     for (std::size_t i = 0; i < detail.installed.size(); ++i) {
       if (i > 0) json += ",";
       json += "\"" + json_escape(detail.installed[i]) + "\"";
@@ -81,6 +83,14 @@ std::optional<GameDetail> cached_game_detail(const std::string& key, const std::
   const auto it = details.find(path);
   if (it == details.end()) return std::nullopt;
   return it->second;
+}
+
+std::string cached_game_fingerprint(const std::string& key, const std::string& path) {
+  std::lock_guard<std::mutex> lock(mu);
+  load_locked();
+  if (key != cache_key) return "";
+  const auto it = details.find(path);
+  return it == details.end() ? "" : it->second.fingerprint;
 }
 
 bool store_game_detail(const std::string& key, const std::string& path, const GameDetail& detail) {

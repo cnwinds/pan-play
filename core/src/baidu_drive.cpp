@@ -373,6 +373,7 @@ class BaiduDrive final : public DrivePlugin {
         entry.name = item.str("server_filename");
         entry.path = item.str("path");
         entry.is_dir = item.num("isdir") != 0;
+        entry.content_hash = item.str("md5");
         const std::string size_text = item.str("size");
         try {
           entry.size = size_text.empty() ? 0 : std::stoll(size_text);

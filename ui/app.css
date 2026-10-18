@@ -529,6 +529,21 @@ button:disabled { cursor: default; }
 .badge.continue { color: var(--amber); }
 .badge.queued { color: var(--signal-hi); }
 
+/* 自己评价过的版本，封面左下角 */
+.review-mark {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  padding: 0.12rem 0.5rem;
+  border-radius: 6px;
+  color: #10151f;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.review-mark.good { background: var(--mint); }
+.review-mark.bad { background: var(--danger); }
+
 .tile[data-state="queued"] .art .cover,
 .tile[data-state="queued"] .art .fallback { opacity: 0.55; }
 
@@ -1008,6 +1023,92 @@ body.drawer-open { overflow: hidden; }
 .more-item:hover,
 .more-item:focus-visible { background: rgba(255, 255, 255, 0.07); outline: none; }
 .more-item.danger { color: var(--danger); }
+
+/* 评价：横幅、装好后的提问、写问题说明 */
+.review[hidden],
+.review > [hidden],
+.review .link[hidden] { display: none; }
+
+.review-banner {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.7rem 0.9rem;
+  border-left: 3px solid var(--faint);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+}
+
+.review-banner strong { font-size: 0.95rem; font-weight: 600; }
+.review-meta { font-size: 0.8rem; opacity: 0.85; }
+.review-banner[data-state="good"] { border-color: var(--mint); background: rgba(95, 211, 160, 0.1); color: var(--mint); }
+.review-banner[data-state="bad"] { border-color: var(--danger); background: rgba(255, 138, 122, 0.1); color: var(--danger); }
+
+.review-ask {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.6rem 0.6rem 0.6rem 0.9rem;
+  border-radius: 9px;
+  background: rgba(77, 139, 255, 0.1);
+}
+
+.review-question { font-size: 0.92rem; font-weight: 600; }
+
+.review-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.review .link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.review-note {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 9px;
+  background: rgba(255, 138, 122, 0.08);
+}
+
+.review-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.review-chips .chip-toggle { height: 28px; padding: 0 0.7rem; font-size: 0.82rem; }
+
+.review-note-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.review-note-row input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  padding: 0 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--night);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.88rem;
+}
 
 /* 主机桌面注册有问题时的一行提示 */
 .console-note {

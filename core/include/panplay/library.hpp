@@ -31,6 +31,9 @@ std::vector<GameFolder> scan_library(DrivePlugin& drive, const std::string& root
 std::string archive_set_id(const ArchiveSet& set);
 // 多组压缩包合起来的身份，和每组的先后无关。
 std::string archive_sets_signature(const std::vector<ArchiveSet>& sets);
+// 一组压缩包的内容指纹：只看各分卷的内容校验值，不看文件名和目录。改名、挪目录、删了再转存回来都不变，
+// 不同来源、不同打包的不一样。评价按它认。网盘没给校验值的分卷按大小算，开头写 s 表示没那么可靠，否则开头是 m。
+std::string content_fingerprint(const ArchiveSet& set);
 // 压缩包在游戏目录下的哪个子目录里，直接放在游戏目录里时为空。
 std::string archive_folder(std::string game_dir, const std::string& archive_path);
 // 不分大小写，连续数字按数值比，所以 "补丁2" 排在 "补丁10" 前面。返回负数、0、正数。

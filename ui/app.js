@@ -253,6 +253,10 @@ function paintArt(art, game) {
   if (game.state === "continue") art.append(el("span", "badge continue", "未装完"));
   if (game.state === "update") art.append(el("span", "badge continue", "有更新"));
   if (game.state === "queued") art.append(el("span", "badge queued num", "排队 " + (queuePosition(game.path) || "")));
+  // 自己评价过这个版本：左下角标出能不能玩。
+  art.querySelector(".review-mark")?.remove();
+  if (game.review_state === "good") art.append(el("span", "review-mark good", "能玩"));
+  if (game.review_state === "bad") art.append(el("span", "review-mark bad", "有问题"));
 }
 
 /* 游戏库 */
@@ -548,7 +552,7 @@ function shareDetail(source) {
   for (const game of games) {
     if (game.path !== source.path) continue;
     if (game !== source) {
-      for (const field of ["state", "archive_bytes", "formats", "layers"]) game[field] = source[field];
+      for (const field of ["state", "archive_bytes", "formats", "layers", "review_state"]) game[field] = source[field];
     }
     syncGameState(game);
     paintTile(game);
@@ -1201,7 +1205,134 @@ function openDetail(game, opener) {
   consoleAction.type = "button";
   consoleRow.append(consoleText, consoleAction);
   let consoleBusy = false;
-  install.append(actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
+
+  // 评价：自己装过的版本能不能玩。评过的显示一条横幅；装好还没评的问一句；有问题时写一句说明。
+  // 元素只建一次，paint 只改显隐和文字，队列每秒刷新时正在写的说明不会被冲掉。
+  const reviewBox = el("div", "review");
+  const reviewBanner = el("div", "review-banner");
+  const reviewText = el("strong");
+  const reviewMeta = el("span", "review-meta");
+  reviewBanner.append(reviewText, reviewMeta);
+  const reviewAsk = el("div", "review-ask");
+  const reviewQuestion = el("span", "review-question");
+  const reviewButtons = el("span", "review-buttons");
+  const reviewGood = el("button", "btn small", "能玩");
+  const reviewBad = el("button", "btn small", "有问题");
+  const reviewLater = el("button", "link", "以后再说");
+  const reviewClear = el("button", "link", "清除评价");
+  for (const button of [reviewGood, reviewBad, reviewLater, reviewClear]) button.type = "button";
+  reviewButtons.append(reviewGood, reviewBad, reviewLater, reviewClear);
+  reviewAsk.append(reviewQuestion, reviewButtons);
+  const reviewNote = el("div", "review-note");
+  const reviewChips = el("div", "review-chips");
+  const noteInput = el("input");
+  noteInput.maxLength = 100;
+  noteInput.placeholder = "一句话说明问题（可不填）";
+  for (const preset of ["进游戏黑屏", "闪退", "卡在加载", "要更高固件", "缺补丁"]) {
+    const chip = el("button", "chip-toggle", preset);
+    chip.type = "button";
+    chip.addEventListener("click", () => {
+      noteInput.value = preset;
+      noteInput.focus();
+    });
+    reviewChips.append(chip);
+  }
+  const noteRow = el("div", "review-note-row");
+  const noteSave = el("button", "btn small primary", "保存");
+  const noteCancel = el("button", "link", "取消");
+  noteSave.type = "button";
+  noteCancel.type = "button";
+  noteRow.append(noteInput, noteSave, noteCancel);
+  reviewNote.append(el("span", "review-question", "哪里有问题？"), reviewChips, noteRow);
+  reviewBox.append(reviewBanner, reviewAsk, reviewNote);
+  // reviewMode：空的时候跟着状态显示；ask 是从菜单点了「修改评价」；note 正在写问题；later 这次不问了。
+  let reviewMode = "";
+  let reviewBusy = false;
+  const reviewItem = menuItem("评价这个版本");
+  menu.insertBefore(reviewItem, discard);
+  // 评价时装的补丁组合和现在的一样吗（装好的按装着的比，没装的按选着要装的比）。
+  // 评价没记组合、或者现在不知道装了哪几组（旧版装的没记）时不提示。
+  const sameLayers = (review, installedNow) => {
+    if (!review.layers || !review.layers.length) return true;
+    const now = (game.layers || []).filter((layer) => (installedNow ? layer.installed : !layer.skipped))
+      .map((layer) => layer.fingerprint);
+    if (!now.length) return true;
+    return review.layers.map((layer) => layer.fingerprint).sort().join("|") === now.sort().join("|");
+  };
+  const reviewWhen = (review) => {
+    const date = serverClockDate(review.at * 1000);
+    return `${date.getUTCMonth() + 1} 月 ${date.getUTCDate()} 日`;
+  };
+  const paintReview = (installedNow, busy) => {
+    const review = game.review;
+    const noting = !busy && reviewMode === "note";
+    const asking = !busy && !noting && !picking && !confirm.open && Boolean(game.fingerprint) &&
+      (reviewMode === "ask" || (reviewMode === "" && !review && installedNow));
+    const shown = review || (!installedNow ? game.other_review : null);
+    reviewNote.hidden = !noting;
+    reviewAsk.hidden = !asking;
+    reviewBanner.hidden = noting || asking || !shown;
+    reviewBox.hidden = reviewNote.hidden && reviewAsk.hidden && reviewBanner.hidden;
+    for (const button of [reviewGood, reviewBad, reviewClear, noteSave]) button.disabled = reviewBusy;
+    if (asking) {
+      reviewQuestion.textContent = review ? "这个版本能正常玩吗？" : "装好了，能正常玩吗？";
+      reviewLater.textContent = review ? "取消" : "以后再说";
+      reviewClear.hidden = !review;
+    }
+    if (!reviewBanner.hidden) {
+      const own = shown === review;
+      const note = shown.note ? `：${shown.note}` : "";
+      reviewBanner.dataset.state = own ? (shown.playable ? "good" : "bad") : "info";
+      reviewText.textContent = own
+        ? (shown.playable ? "你标记过这个版本能正常玩" : `你标记过这个版本有问题${note}`)
+        : `这个游戏的另一个版本你标记过${shown.playable ? "能玩" : "有问题" + note}`;
+      const meta = [shown.firmware ? `固件 ${shown.firmware}` : "固件未知", reviewWhen(shown)];
+      if (own && !sameLayers(shown, installedNow)) meta.push("当时装的补丁和现在不同");
+      reviewMeta.textContent = meta.join(" · ");
+    }
+  };
+  const sendReview = async (endpoint, body) => {
+    reviewBusy = true;
+    paint();
+    try {
+      const data = await api(endpoint, { path: game.path, ...body });
+      game.review = data.review;
+      game.review_state = data.review ? (data.review.playable ? "good" : "bad") : "";
+      reviewMode = "";
+      noteInput.value = "";
+      shareDetail(game);
+    } catch (error) {
+      if (detail && detail.game === game) detail.fail(error.message);
+    }
+    reviewBusy = false;
+    if (detail && detail.game === game) paint();
+  };
+  reviewGood.addEventListener("click", () => sendReview("/api/review", { playable: true, note: "" }));
+  reviewBad.addEventListener("click", () => {
+    reviewMode = "note";
+    noteInput.value = game.review && !game.review.playable ? game.review.note : "";
+    paint();
+    noteInput.focus();
+  });
+  noteSave.addEventListener("click", () => sendReview("/api/review", { playable: false, note: noteInput.value.trim() }));
+  noteInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") noteSave.click();
+  });
+  noteCancel.addEventListener("click", () => {
+    reviewMode = game.review ? "" : "later";
+    paint();
+  });
+  reviewLater.addEventListener("click", () => {
+    reviewMode = game.review ? "" : "later";
+    paint();
+  });
+  reviewClear.addEventListener("click", () => sendReview("/api/review/remove", {}));
+  reviewItem.addEventListener("click", () => {
+    reviewMode = "ask";
+    paint();
+  });
+
+  install.append(reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1302,7 +1433,11 @@ function openDetail(game, opener) {
     adjust.hidden = game.state !== "installed" || busy || (game.layers || []).length < 2;
     registerItem.hidden = !onConsole || Boolean(game.console.problem) || busy || consoleBusy;
     registerItem.textContent = onConsole && onConsole.healthy ? "重新注册到主机桌面" : "注册到主机桌面";
-    moreWrap.hidden = [adjust, registerItem, discard, remove].every((item) => item.hidden);
+    const installedNow = ["installed", "update"].includes(game.state);
+    reviewItem.hidden = !game.fingerprint || busy || (!game.review && !installedNow);
+    reviewItem.textContent = game.review ? "修改评价" : "评价这个版本";
+    paintReview(installedNow, busy);
+    moreWrap.hidden = [adjust, registerItem, reviewItem, discard, remove].every((item) => item.hidden);
     if (moreWrap.hidden && menuOpen) setMenu(false);
     consoleRow.hidden = !onConsole || (onConsole.healthy && !consoleBusy) || picking || confirm.open || busy;
     if (!consoleRow.hidden) {

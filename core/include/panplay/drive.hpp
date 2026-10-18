@@ -36,6 +36,8 @@ struct DriveEntry {
   std::string path;
   bool is_dir = false;
   std::int64_t size = 0;
+  // 网盘按文件内容算的校验值（百度的 md5）：改名、挪目录、删了再从同一个分享转存都不变。网盘不给时为空。
+  std::string content_hash;
 };
 
 struct LoginChallenge {
