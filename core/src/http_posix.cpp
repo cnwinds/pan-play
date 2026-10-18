@@ -196,6 +196,14 @@ struct Connection {
   std::size_t begin = 0;
   std::size_t end = 0;
   std::chrono::steady_clock::time_point idle_since;
+  std::chrono::steady_clock::time_point opened_at = std::chrono::steady_clock::now();
+  int uses = 0;
+
+  // 日志用：这条连接发过几个请求、连了多久。看得出服务器是按次数还是按时间关连接。
+  std::string story() const {
+    const auto alive = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - opened_at);
+    return "用了 " + std::to_string(uses) + " 次，连了 " + std::to_string(alive.count()) + " 秒";
+  }
 
   Connection() { mbedtls_ssl_init(&ssl); }
   ~Connection() {
@@ -290,6 +298,7 @@ struct Pool {
     const auto now = std::chrono::steady_clock::now();
     for (auto it = idle.begin(); it != idle.end();) {
       if (now - it->second->idle_since > kIdleLifetime) {
+        PANPLAY_DEBUG("连接 " + it->first + " 空闲超过 20 秒，关掉（" + it->second->story() + "）");
         it = idle.erase(it);
       } else {
         ++it;
@@ -304,7 +313,11 @@ struct Pool {
 
   void put(std::unique_ptr<Connection> conn) {
     std::lock_guard<std::mutex> lock(mu);
-    if (idle.count(conn->key) >= kIdlePerHost) return;
+    if (idle.count(conn->key) >= kIdlePerHost) {
+      PANPLAY_DEBUG("连接 " + conn->key + " 空闲的已有 " + std::to_string(kIdlePerHost) + " 条，关掉这条（" + conn->story() +
+                    "）");
+      return;
+    }
     conn->idle_since = std::chrono::steady_clock::now();
     const std::string key = conn->key;
     idle.emplace(key, std::move(conn));
@@ -508,6 +521,23 @@ class PosixStream final : public HttpStream {
     }
   }
 
+  // 连接没还回池就在这里关掉。正常读完还回池的不记，中止、出错、没读完的记下原因。
+  ~PosixStream() override {
+    if (!conn_ || closed_noted_ || !log_enabled(LogLevel::debug)) return;
+    std::string reason;
+    if (aborted_.load()) {
+      reason = "被中止";
+    } else if (failed_) {
+      reason = "读的时候出错";
+    } else if (done_) {
+      reason = "响应没给长度，读到服务器关闭为止";
+    } else {
+      reason = "响应没读完";
+      if (mode_ == Mode::kLength) reason += "，还剩 " + std::to_string(remaining_) + " 字节";
+    }
+    PANPLAY_DEBUG("连接 " + conn_->key + " " + reason + "，关掉（" + conn_->story() + "）");
+  }
+
   int status() const override { return head_.status; }
   std::int64_t content_length() const override { return head_.chunked ? -1 : head_.content_length; }
   std::string final_url() const override { return final_url_; }
@@ -575,6 +605,7 @@ class PosixStream final : public HttpStream {
   std::size_t fail(std::string* error) {
     *error = aborted_.load() ? kAborted : "下载连接中断";
     done_ = true;
+    failed_ = true;
     return 0;
   }
 
@@ -582,7 +613,12 @@ class PosixStream final : public HttpStream {
   void finish() {
     done_ = true;
     std::lock_guard<std::mutex> lock(mu_);
-    if (aborted_.load() || !head_.keep_alive || !conn_) return;
+    if (aborted_.load() || !conn_) return;
+    if (!head_.keep_alive) {
+      closed_noted_ = true;
+      PANPLAY_DEBUG("连接 " + conn_->key + " 服务器要求读完就关（Connection: close 或 HTTP/1.0），" + conn_->story());
+      return;
+    }
     fd_ = INVALID_SOCKET;
     pool_->put(std::move(conn_));
   }
@@ -595,6 +631,8 @@ class PosixStream final : public HttpStream {
   SOCKET fd_ = INVALID_SOCKET;
   std::atomic<bool> aborted_{false};
   bool done_ = false;
+  bool failed_ = false;
+  bool closed_noted_ = false;
   Mode mode_ = Mode::kLength;
   std::int64_t remaining_ = 0;
   std::int64_t chunk_left_ = 0;
@@ -670,10 +708,16 @@ std::unique_ptr<HttpStream> HttpClient::open(const HttpRequest& request, std::st
         *error = kAborted;
         return nullptr;
       }
+      ++conn->uses;
       ok = conn->write_all(payload) && read_head(*conn, &head);
       if (!ok && (!reused || abort_state->is_aborted())) {
         *error = abort_state->is_aborted() ? kAborted : "request failed";
         return nullptr;
+      }
+      if (!ok) {
+        const auto idle = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - conn->idle_since);
+        PANPLAY_DEBUG("连接 " + conn->key + " 复用失败，应该是服务器已经关了（空闲 " + std::to_string(idle.count()) + " 秒，" +
+                      conn->story() + "），换新连接重发");
       }
     }
     if (!ok) {
@@ -685,6 +729,7 @@ std::unique_ptr<HttpStream> HttpClient::open(const HttpRequest& request, std::st
       const std::string next = resolve_location(url, location);
       // 和 WinHTTP 的默认策略一样：不从 https 跳到 http，原样返回跳转响应。
       if (!(url.tls && next.rfind("http://", 0) == 0)) {
+        PANPLAY_DEBUG("连接 " + conn->key + " 收到跳转，响应体不读，关掉（" + conn->story() + "）");
         url_text = next;
         if (head.status == 303 || ((head.status == 301 || head.status == 302) && method == "POST")) {
           method = "GET";

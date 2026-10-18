@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -11,6 +12,34 @@ namespace panplay {
 namespace {
 
 constexpr std::size_t kStepSize = 256u << 10;
+constexpr auto kStatsWindow = std::chrono::seconds(10);
+// 首字节超过这么久的请求单独记一行。
+constexpr long long kSlowOpenMs = 1000;
+
+using Clock = std::chrono::steady_clock;
+
+double ms_between(Clock::time_point from, Clock::time_point to) {
+  return std::chrono::duration<double, std::milli>(to - from).count();
+}
+
+std::string fixed(double value) {
+  char text[32];
+  std::snprintf(text, sizeof(text), "%.1f", value);
+  return text;
+}
+
+std::string mb(std::int64_t bytes) { return fixed(static_cast<double>(bytes) / (1 << 20)) + " MB"; }
+
+std::string rate(double bytes, double ms) { return ms > 0 ? fixed(bytes / (1 << 20) / (ms / 1000)) + " MB/s" : "-"; }
+
+std::string percent(double part, double whole) {
+  return whole > 0 ? std::to_string(static_cast<int>(part * 100 / whole + 0.5)) + "%" : "-";
+}
+
+int next_reader_id() {
+  static std::atomic<int> last{0};
+  return ++last;
+}
 
 class ReadAtStream final : public ByteStream {
  public:
@@ -69,7 +98,16 @@ PrefetchOptions sane(PrefetchOptions options) {
 
 PrefetchReader::PrefetchReader(DrivePlugin& drive, std::string file_id, std::int64_t size, const CancelToken* cancel,
                                PrefetchOptions options)
-    : drive_(drive), file_id_(std::move(file_id)), size_(size), cancel_(cancel), options_(sane(options)) {
+    : drive_(drive),
+      file_id_(std::move(file_id)),
+      size_(size),
+      cancel_(cancel),
+      options_(sane(options)),
+      id_(next_reader_id()),
+      detail_left_(options_.connections * 2) {
+  PANPLAY_DEBUG("预读 #" + std::to_string(id_) + "：文件 " + file_id_ + "，" + mb(size_) + "，" +
+                std::to_string(options_.connections) + " 条连接 × " + mb(static_cast<std::int64_t>(options_.block_size)) +
+                " 块，最多 " + std::to_string(options_.max_blocks) + " 块");
   const auto loop = options_.connections <= 1 ? &PrefetchReader::worker_loop : &PrefetchReader::range_worker_loop;
   for (int i = 0; i < options_.connections; ++i) workers_.emplace_back([this, loop] { run_worker(loop); });
 }
@@ -84,6 +122,70 @@ PrefetchReader::~PrefetchReader() {
   }
   cv_.notify_all();
   for (auto& worker : workers_) worker.join();
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!started_ || !log_enabled(LogLevel::debug)) return;
+  account_locked();
+  const std::int64_t received = received_.load();
+  PANPLAY_DEBUG("预读 #" + std::to_string(id_) + " 结束：共 " + fixed(total_.elapsed_ms / 1000) + " 秒，收到 " +
+                mb(received) + "，读走 " + mb(total_.delivered) + "；" + describe_locked(total_, received));
+}
+
+void PrefetchReader::account_locked() {
+  if (!started_) return;
+  const auto now = Clock::now();
+  const double dt = ms_between(accounted_at_, now);
+  accounted_at_ = now;
+  const bool multi = options_.connections > 1;
+  const std::size_t queued = blocks_.size() + pending_.size();
+  const std::size_t held = queued + (multi ? static_cast<std::size_t>(in_flight_) : 0);
+  const bool more = error_.empty() && (multi ? assign_position_ : fill_position_) < size_;
+  const bool full = more && held >= options_.max_blocks;
+  const double busy = in_flight_ * dt;
+  count_locked([&](Stats& stats) {
+    stats.elapsed_ms += dt;
+    stats.busy_ms += busy;
+    stats.queued_ms += static_cast<double>(queued) * dt;
+    if (full) stats.full_ms += dt;
+  });
+  if (now - window_at_ < kStatsWindow) return;
+  const std::int64_t received = received_.load();
+  PANPLAY_DEBUG("预读 #" + std::to_string(id_) + "：近 " + fixed(window_.elapsed_ms / 1000) + " 秒 " +
+                describe_locked(window_, received - window_received_));
+  window_ = Stats{};
+  window_received_ = received;
+  window_at_ = now;
+}
+
+std::string PrefetchReader::describe_locked(const Stats& stats, std::int64_t received) const {
+  const double elapsed = stats.elapsed_ms;
+  std::string text = "下载 " + rate(static_cast<double>(received), elapsed);
+  if (stats.busy_ms > 0) {
+    text += "（平均在下 " + fixed(stats.busy_ms / elapsed) + " 条，每条 " + rate(static_cast<double>(received), stats.busy_ms) +
+            "）";
+  }
+  text += "，读走 " + rate(static_cast<double>(stats.delivered), elapsed) + "，读取方等数据 " +
+          percent(stats.wait_ms, elapsed) + "，缓冲满 " + percent(stats.full_ms, elapsed) + "（平均存 " +
+          fixed(elapsed > 0 ? stats.queued_ms / elapsed : 0) + " 块）";
+  text += "，请求 " + std::to_string(stats.requests) + " 次";
+  if (stats.requests > 0) {
+    text += "（首字节平均 " + std::to_string(stats.open_ms / stats.requests) + " ms，最长 " +
+            std::to_string(stats.open_ms_max) + " ms）";
+  }
+  text += "，下完 " + std::to_string(stats.blocks) + " 块";
+  if (stats.blocks > 0) {
+    text += "（平均 " + fixed(static_cast<double>(stats.block_ms) / 1000 / stats.blocks) + " 秒，最长 " +
+            fixed(static_cast<double>(stats.block_ms_max) / 1000) + " 秒）";
+  }
+  if (stats.open_failures > 0) text += "，打开失败 " + std::to_string(stats.open_failures) + " 次";
+  if (stats.breaks > 0) text += "，中途断开 " + std::to_string(stats.breaks) + " 次";
+  if (stats.resets > 0) text += "，跳转重来 " + std::to_string(stats.resets) + " 次";
+  return text;
+}
+
+bool PrefetchReader::detail_locked() {
+  if (detail_left_ <= 0) return false;
+  --detail_left_;
+  return true;
 }
 
 void PrefetchReader::run_worker(void (PrefetchReader::*loop)(AbortSignal&)) {
@@ -120,6 +222,7 @@ void PrefetchReader::range_worker_loop(AbortSignal& signal) {
                        blocks_.size() + pending_.size() + static_cast<std::size_t>(in_flight_) < options_.max_blocks);
     });
     if (stop_) break;
+    account_locked();
     const std::uint64_t generation = generation_;
     const std::int64_t start = assign_position_;
     const std::int64_t length = std::min<std::int64_t>(static_cast<std::int64_t>(options_.block_size), size_ - start);
@@ -127,8 +230,11 @@ void PrefetchReader::range_worker_loop(AbortSignal& signal) {
     ++in_flight_;
     Block block;
     block.data = take_buffer_locked();
+    const bool detailed = detail_locked();
     lock.unlock();
 
+    const std::string tag = "预读 #" + std::to_string(id_) + "：块 @" + mb(start);
+    const auto block_from = Clock::now();
     block.start = start;
     block.data.resize(static_cast<std::size_t>(length));
     std::size_t filled = 0;
@@ -157,8 +263,17 @@ void PrefetchReader::range_worker_loop(AbortSignal& signal) {
         const std::int64_t at = start + static_cast<std::int64_t>(filled);
         if (!arm_open(signal, generation)) break;
         std::string open_error;
+        const auto open_from = Clock::now();
         auto opened = drive_.open_range(file_id_, at, length - static_cast<std::int64_t>(filled), &open_error, &signal);
+        const long long open_ms = ms_since(open_from);
         if (!opened) {
+          if (stale(generation)) break;
+          {
+            std::lock_guard<std::mutex> guard(mu_);
+            count_locked([](Stats& stats) { ++stats.open_failures; });
+          }
+          PANPLAY_DEBUG(tag + " 打开失败，" + std::to_string(open_ms) + " ms，第 " + std::to_string(failures + 1) +
+                        " 次：" + open_error);
           if (++failures > options_.max_retries) {
             failure = open_error.empty() ? "无法打开下载" : open_error;
             break;
@@ -167,9 +282,20 @@ void PrefetchReader::range_worker_loop(AbortSignal& signal) {
           continue;
         }
         stream = std::move(opened);
-        std::lock_guard<std::mutex> guard(mu_);
-        range_streams_.push_back(stream.get());
-        if (stop_ || generation != generation_) stream->abort();
+        {
+          std::lock_guard<std::mutex> guard(mu_);
+          range_streams_.push_back(stream.get());
+          count_locked([&](Stats& stats) {
+            ++stats.requests;
+            stats.open_ms += open_ms;
+            stats.open_ms_max = std::max(stats.open_ms_max, open_ms);
+          });
+          if (stop_ || generation != generation_) stream->abort();
+        }
+        if (detailed || failures > 0 || open_ms >= kSlowOpenMs) {
+          PANPLAY_DEBUG(tag + (filled > 0 ? " 从 @" + mb(at) + " 续传" : std::string(" 请求")) + " " +
+                        mb(length - static_cast<std::int64_t>(filled)) + "，首字节 " + std::to_string(open_ms) + " ms");
+        }
       }
       std::string read_error;
       const std::size_t want = std::min(kStepSize, block.data.size() - filled);
@@ -177,6 +303,12 @@ void PrefetchReader::range_worker_loop(AbortSignal& signal) {
       if (got == 0) {
         drop_stream();
         if (stale(generation)) break;
+        {
+          std::lock_guard<std::mutex> guard(mu_);
+          count_locked([](Stats& stats) { ++stats.breaks; });
+        }
+        PANPLAY_DEBUG(tag + " 下到 " + mb(static_cast<std::int64_t>(filled)) + " 时断开，第 " + std::to_string(failures + 1) +
+                      " 次：" + (read_error.empty() ? "连接提前结束" : read_error));
         if (++failures > options_.max_retries) {
           failure = read_error.empty() ? "下载提前结束" : read_error;
           break;
@@ -185,11 +317,14 @@ void PrefetchReader::range_worker_loop(AbortSignal& signal) {
         continue;
       }
       filled += got;
+      received_ += static_cast<std::int64_t>(got);
       failures = 0;
     }
     drop_stream();
+    const long long block_ms = ms_since(block_from);
 
     lock.lock();
+    account_locked();
     --in_flight_;
     if (stop_) break;
     if (generation != generation_) {
@@ -202,6 +337,15 @@ void PrefetchReader::range_worker_loop(AbortSignal& signal) {
       continue;
     }
     if (filled < block.data.size()) continue;
+    count_locked([&](Stats& stats) {
+      ++stats.blocks;
+      stats.block_ms += block_ms;
+      stats.block_ms_max = std::max(stats.block_ms_max, block_ms);
+    });
+    if (detailed) {
+      PANPLAY_DEBUG(tag + " 下完，用 " + fixed(static_cast<double>(block_ms) / 1000) + " 秒（" +
+                    rate(static_cast<double>(filled), static_cast<double>(block_ms)) + "）");
+    }
     pending_.emplace(start, std::move(block));
     for (auto it = pending_.find(fill_position_); it != pending_.end(); it = pending_.find(fill_position_)) {
       fill_position_ += static_cast<std::int64_t>(it->second.data.size());
@@ -271,12 +415,16 @@ void PrefetchReader::worker_loop(AbortSignal& signal) {
       return stop_ || (started_ && error_.empty() && fill_position_ < size_ && blocks_.size() < options_.max_blocks);
     });
     if (stop_) break;
+    account_locked();
     const std::uint64_t generation = generation_;
     const std::int64_t start = fill_position_;
+    ++in_flight_;
     Block block;
     block.data = take_buffer_locked();
     lock.unlock();
 
+    const std::string tag = "预读 #" + std::to_string(id_) + "：";
+    const auto block_from = Clock::now();
     block.start = start;
     block.data.resize(static_cast<std::size_t>(std::min<std::int64_t>(options_.block_size, size_ - start)));
     std::size_t filled = 0;
@@ -292,9 +440,17 @@ void PrefetchReader::worker_loop(AbortSignal& signal) {
         drop_stream();
         if (!arm_open(signal, generation)) break;
         std::string open_error;
-        PANPLAY_DEBUG("预读：打开下载 @" + std::to_string(at));
+        const auto open_from = Clock::now();
         auto opened = drive_.open_stream(file_id_, at, &open_error, &signal);
+        const long long open_ms = ms_since(open_from);
         if (!opened) {
+          if (stale(generation)) break;
+          {
+            std::lock_guard<std::mutex> guard(mu_);
+            count_locked([](Stats& stats) { ++stats.open_failures; });
+          }
+          PANPLAY_DEBUG(tag + "打开下载 @" + mb(at) + " 失败，" + std::to_string(open_ms) + " ms，第 " +
+                        std::to_string(failures + 1) + " 次：" + open_error);
           if (++failures > options_.max_retries) {
             failure = open_error.empty() ? "无法打开下载" : open_error;
             break;
@@ -302,11 +458,17 @@ void PrefetchReader::worker_loop(AbortSignal& signal) {
           if (!wait_retry(failures - 1, generation)) break;
           continue;
         }
+        PANPLAY_DEBUG(tag + "打开下载 @" + mb(at) + "，首字节 " + std::to_string(open_ms) + " ms");
         stream = std::move(opened);
         stream_position = at;
         stream_generation = generation;
         std::lock_guard<std::mutex> guard(mu_);
         active_stream_ = stream.get();
+        count_locked([&](Stats& stats) {
+          ++stats.requests;
+          stats.open_ms += open_ms;
+          stats.open_ms_max = std::max(stats.open_ms_max, open_ms);
+        });
         if (stop_ || generation != generation_) stream->abort();
       }
       std::string read_error;
@@ -315,6 +477,12 @@ void PrefetchReader::worker_loop(AbortSignal& signal) {
       if (got == 0) {
         drop_stream();
         if (stale(generation)) break;
+        {
+          std::lock_guard<std::mutex> guard(mu_);
+          count_locked([](Stats& stats) { ++stats.breaks; });
+        }
+        PANPLAY_DEBUG(tag + "下到 @" + mb(at) + " 时断开，第 " + std::to_string(failures + 1) + " 次：" +
+                      (read_error.empty() ? "连接提前结束" : read_error));
         if (++failures > options_.max_retries) {
           failure = read_error.empty() ? "下载提前结束" : read_error;
           break;
@@ -323,11 +491,15 @@ void PrefetchReader::worker_loop(AbortSignal& signal) {
         continue;
       }
       filled += got;
+      received_ += static_cast<std::int64_t>(got);
       stream_position += static_cast<std::int64_t>(got);
       failures = 0;
     }
+    const long long block_ms = ms_since(block_from);
 
     lock.lock();
+    account_locked();
+    --in_flight_;
     if (stop_) break;
     if (generation != generation_) continue;
     if (!failure.empty()) {
@@ -336,6 +508,11 @@ void PrefetchReader::worker_loop(AbortSignal& signal) {
       continue;
     }
     if (filled < block.data.size()) continue;
+    count_locked([&](Stats& stats) {
+      ++stats.blocks;
+      stats.block_ms += block_ms;
+      stats.block_ms_max = std::max(stats.block_ms_max, block_ms);
+    });
     fill_position_ = start + static_cast<std::int64_t>(filled);
     blocks_.push_back(std::move(block));
     cv_.notify_all();
@@ -349,13 +526,25 @@ std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::strin
   std::unique_lock<std::mutex> lock(mu_);
   if (!started_) {
     started_ = true;
+    accounted_at_ = window_at_ = Clock::now();
+    window_received_ = received_.load();
     cv_.notify_all();
   }
+  bool waiting = false;
+  Clock::time_point waited_from;
+  const auto note_wait = [&] {
+    if (!waiting) return;
+    const auto now = Clock::now();
+    const double ms = ms_between(waited_from, now);
+    waited_from = now;
+    count_locked([&](Stats& stats) { stats.wait_ms += ms; });
+  };
   while (true) {
     if (!blocks_.empty()) {
       Block& front = blocks_.front();
       const std::int64_t front_end = front.start + static_cast<std::int64_t>(front.data.size());
       if (front_end <= position_) {
+        account_locked();
         retire_locked(std::move(front));
         blocks_.pop_front();
         cv_.notify_all();
@@ -367,21 +556,31 @@ std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::strin
       break;
     }
     if (!error_.empty()) {
+      note_wait();
       *error = error_;
       return 0;
     }
     if (cancel_ && cancel_->cancelled()) {
+      note_wait();
       *error = "interrupted";
       return 0;
     }
+    if (!waiting) {
+      waiting = true;
+      waited_from = Clock::now();
+    }
     cv_.wait_for(lock, std::chrono::milliseconds(100));
+    note_wait();
+    account_locked();
   }
   Block& front = blocks_.front();
   const std::size_t n = std::min(size, front.data.size() - front.used);
   std::memcpy(dst, front.data.data() + front.used, n);
   front.used += n;
   position_ += static_cast<std::int64_t>(n);
+  count_locked([&](Stats& stats) { stats.delivered += static_cast<std::int64_t>(n); });
   if (front.used == front.data.size()) {
+    account_locked();
     retire_locked(std::move(front));
     blocks_.pop_front();
     cv_.notify_all();
@@ -393,6 +592,7 @@ std::string PrefetchReader::seek(std::int64_t position) {
   if (position < 0 || position > size_) return "读取位置越界";
   if (position == position_) return "";
   std::lock_guard<std::mutex> lock(mu_);
+  account_locked();
   // 往前跳不远时保留连接，read 会丢掉跳过的数据；重新连接要一秒左右，还得重新提速。
   const std::int64_t keep_reach = static_cast<std::int64_t>(options_.block_size) * 2;
   const std::int64_t requested_end = options_.connections > 1 ? std::max(buffered_end_locked(), assign_position_)
@@ -428,8 +628,15 @@ std::string PrefetchReader::seek(std::int64_t position) {
       return "";
     }
   }
-  PANPLAY_DEBUG("预读：跳转 " + std::to_string(position_) + " -> " + std::to_string(position) + "，缓冲到 " +
-                std::to_string(buffered_end_locked()));
+  if (log_enabled(LogLevel::debug)) {
+    std::int64_t dropped = 0;
+    for (const Block& block : blocks_) dropped += static_cast<std::int64_t>(block.data.size() - block.used);
+    for (const auto& entry : pending_) dropped += static_cast<std::int64_t>(entry.second.data.size());
+    PANPLAY_DEBUG("预读 #" + std::to_string(id_) + "：跳转 " + mb(position_) + " -> " + mb(position) +
+                  "，丢掉缓冲里没读的 " + mb(dropped) + "，" + std::to_string(in_flight_) + " 块正在下的作废，重新开始下载");
+  }
+  count_locked([](Stats& stats) { ++stats.resets; });
+  detail_left_ = options_.connections;
   ++generation_;
   blocks_.clear();
   pending_.clear();

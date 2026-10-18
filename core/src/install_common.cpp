@@ -1,6 +1,7 @@
 #include "install_common.hpp"
 
 #include "panplay/json.hpp"
+#include "panplay/trace.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -124,6 +125,8 @@ void VolumeStream::open_volume(std::size_t index) {
   reader_.reset();
   index_ = index;
   reader_ = std::make_unique<PrefetchReader>(drive_, volumes_[index].file_id, volumes_[index].size, cancel_, options_);
+  PANPLAY_DEBUG("第 " + std::to_string(index + 1) + "/" + std::to_string(volumes_.size()) + " 卷用预读 #" +
+                std::to_string(reader_->id()));
   position_ = volumes_[index].start;
 }
 

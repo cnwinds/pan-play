@@ -327,6 +327,7 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
   if (!volume.reader) {
     volume.reader = std::make_unique<panplay::PrefetchReader>(*session->drive, volume.file_id, volume.size, session->cancel,
                                                               session->prefetch);
+    PANPLAY_DEBUG("RAR 分卷 " + volume.name + " 用预读 #" + std::to_string(volume.reader->id()));
   }
   if (volume.reader->position() != volume.real(volume.pos)) {
     if (auto error = volume.reader->seek(volume.real(volume.pos)); !error.empty()) {
