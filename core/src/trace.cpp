@@ -1,5 +1,7 @@
 #include "panplay/trace.hpp"
 
+#include "big_memory.hpp"
+
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -291,6 +293,10 @@ std::string memory_summary() {
   rusage usage{};
   if (getrusage(RUSAGE_SELF, &usage) == 0) out = "峰值内存 " + std::to_string(usage.ru_maxrss / 1024) + " MB";
 #endif
+  if (const std::uint64_t peak = big_memory_peak(); peak > 0) {
+    out += (out.empty() ? "" : "，") + std::string("解压字典占用 ") + std::to_string(big_memory_in_use() >> 20) + " MB（最多 " +
+           std::to_string(peak >> 20) + " MB）";
+  }
 #if defined(PANPLAY_PS5)
   SceLibcMallocManagedSize heap{};
   heap.size = sizeof(heap);

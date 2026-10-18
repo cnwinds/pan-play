@@ -1,6 +1,7 @@
 #include "panplay/install.hpp"
 #include "panplay/trace.hpp"
 
+#include "big_memory.hpp"
 #include "install_common.hpp"
 
 #include "7z.h"
@@ -43,6 +44,10 @@ constexpr const char kRepack[] = "；请用 7-Zip 默认设置重新压缩，或
 void* sz_alloc(ISzAllocPtr, size_t size) { return size == 0 ? nullptr : std::malloc(size); }
 void sz_free(ISzAllocPtr, void* address) { std::free(address); }
 const ISzAlloc kAlloc = {sz_alloc, sz_free};
+// 解码器的字典可能有几 GB，用完要马上还给系统。
+void* sz_big_alloc(ISzAllocPtr, size_t size) { return size == 0 ? nullptr : big_alloc(size); }
+void sz_big_free(ISzAllocPtr, void* address) { big_free(address); }
+const ISzAlloc kDictAlloc = {sz_big_alloc, sz_big_free};
 
 void init_crc_table() {
   static std::once_flag once;
@@ -329,8 +334,8 @@ class FolderDecoder {
   }
 
   ~FolderDecoder() {
-    LzmaDec_Free(&lzma_, &kAlloc);
-    Lzma2Dec_Free(&lzma2_, &kAlloc);
+    LzmaDec_Free(&lzma_, &kDictAlloc);
+    Lzma2Dec_Free(&lzma2_, &kDictAlloc);
   }
 
   FolderDecoder(const FolderDecoder&) = delete;
@@ -346,13 +351,13 @@ class FolderDecoder {
       props[2] = static_cast<std::uint8_t>(dictionary >> 8);
       props[3] = static_cast<std::uint8_t>(dictionary >> 16);
       props[4] = static_cast<std::uint8_t>(dictionary >> 24);
-      if (LzmaDec_Allocate(&lzma_, props, LZMA_PROPS_SIZE, &kAlloc) != SZ_OK) return memory_error();
+      if (LzmaDec_Allocate(&lzma_, props, LZMA_PROPS_SIZE, &kDictAlloc) != SZ_OK) return memory_error();
       LzmaDec_Init(&lzma_);
     } else if (folder_.method == kLzma2) {
       const std::uint64_t needed = needed_dictionary(folder_);
       unsigned prop = 0;
       while (prop < folder_.props[0] && lzma2_dictionary(prop) < needed) ++prop;
-      if (Lzma2Dec_Allocate(&lzma2_, static_cast<Byte>(prop), &kAlloc) != SZ_OK) return memory_error();
+      if (Lzma2Dec_Allocate(&lzma2_, static_cast<Byte>(prop), &kDictAlloc) != SZ_OK) return memory_error();
       Lzma2Dec_Init(&lzma2_);
     }
     if (folder_.filter != 0) {
@@ -396,9 +401,7 @@ class FolderDecoder {
   static constexpr std::size_t kInputChunk = 256u << 10;
   static constexpr std::size_t kFilterChunk = 256u << 10;
 
-  std::string memory_error() const {
-    return "解压这个 7z 需要约 " + std::to_string((needed_dictionary(folder_) >> 20) + 1) + " MB 内存，分配失败";
-  }
+  std::string memory_error() const { return out_of_memory_error("7z", needed_dictionary(folder_)); }
 
   std::string refill() {
     const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(input_.size(), pack_left_));

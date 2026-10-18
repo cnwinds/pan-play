@@ -569,12 +569,15 @@ std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vecto
       failure = dictionary_refusal("RAR", dictionary, options.max_dictionary);
       break;
     }
+    const auto unpack_failure = [&](int code, const std::string& fallback) {
+      return code == ERAR_NO_MEMORY ? out_of_memory_error("RAR", dictionary) : process_failure(fallback);
+    };
     writer.out.reset();
     writer.interrupted = false;
     writer.error.clear();
     if (is_stream_entry(raw_header_name(header))) {
-      if (RARProcessFileW(handle, solid ? RAR_TEST : RAR_SKIP, nullptr, nullptr) != ERAR_SUCCESS) {
-        failure = process_failure("解压 RAR 失败");
+      if (const int code = RARProcessFileW(handle, solid ? RAR_TEST : RAR_SKIP, nullptr, nullptr); code != ERAR_SUCCESS) {
+        failure = unpack_failure(code, "解压 RAR 失败");
         break;
       }
       continue;
@@ -634,7 +637,7 @@ std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vecto
       break;
     }
     if (processed != ERAR_SUCCESS) {
-      failure = process_failure("解压 RAR 失败（错误码 " + std::to_string(processed) + "）: " + name);
+      failure = unpack_failure(processed, "解压 RAR 失败（错误码 " + std::to_string(processed) + "）: " + name);
       break;
     }
     report_bytes(false);

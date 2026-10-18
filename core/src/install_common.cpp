@@ -175,6 +175,19 @@ bool is_dictionary_refusal(const std::string& message) {
   return message.rfind("字典 ", 0) == 0 && message.find("超过上限") != std::string::npos;
 }
 
+namespace {
+
+constexpr char kOutOfMemoryPrefix[] = "内存不够：";
+
+}  // namespace
+
+std::string out_of_memory_error(const std::string& format, std::uint64_t dictionary) {
+  return kOutOfMemoryPrefix + format + " 字典要 " + std::to_string((dictionary + (1u << 20) - 1) >> 20) +
+         " MB，主机给不了。关掉其他程序后重试，或用更小的字典重新压缩";
+}
+
+bool is_out_of_memory_error(const std::string& message) { return message.rfind(kOutOfMemoryPrefix, 0) == 0; }
+
 OutputFile::OutputFile(InstallSink& sink, std::string path, std::int64_t expected, std::int64_t stop,
                        std::int64_t* written)
     : sink_(sink), path_(std::move(path)), expected_(expected), stop_(stop), written_(written),

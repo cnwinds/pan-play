@@ -1985,7 +1985,7 @@ function paintDictionaryNote() {
   const mb = chosenDictionary();
   const text = mb
     ? `字典超过 ${dictionaryText(mb)} 的 RAR / 7z 不装。WinRAR 默认字典 32 MB，7-Zip 最高压缩 64 MB，大多数游戏包都在这以内。`
-    : "再大的字典也照装。内存不够时会在解压中途失败，主机也可能变卡。";
+    : "再大的字典也照装。主机给不了那么多内存时会停下报「内存不够」，不自动重试。";
   $("#dict-note").textContent = `${text}带圆点的 ${dictionaryText(defaultDictionary)} 是这台设备的默认值。`;
 }
 

@@ -11,6 +11,14 @@ To enable, disable or check Large Memory pages manually:
 #define ALLOW_LARGE_PAGES
 #endif
 
+#ifdef RARDLL
+// panplay: the unpack window comes straight from the system and goes back
+// to it on release. The console's libc heap keeps freed memory, so a 4 GB
+// window would stay reserved and the next one would not fit.
+extern "C" void* panplay_big_alloc(size_t size);
+extern "C" void panplay_big_free(void* address);
+#endif
+
 LargePageAlloc::LargePageAlloc()
 {
   UseLargePages=false;
@@ -171,6 +179,13 @@ void* LargePageAlloc::new_large(size_t Size)
 {
   void *Allocated=nullptr;
 
+#ifdef RARDLL
+  // panplay: fail here instead of retrying the same size from the heap.
+  Allocated=panplay_big_alloc(Size);
+  if (Allocated==nullptr)
+    throw std::bad_alloc();
+#endif
+
 #ifdef ALLOW_LARGE_PAGES
   if (UseLargePages && Size>=PageSize)
   {
@@ -187,6 +202,13 @@ void* LargePageAlloc::new_large(size_t Size)
 
 bool LargePageAlloc::delete_large(void *Addr)
 {
+#ifdef RARDLL
+  if (Addr!=nullptr)
+  {
+    panplay_big_free(Addr);
+    return true;
+  }
+#endif
 #ifdef ALLOW_LARGE_PAGES
   if (Addr!=nullptr)
     for (size_t I=0;I<LargeAlloc.size();I++)

@@ -4,6 +4,7 @@
 #include "panplay/library.hpp"
 #include "panplay/prefetch.hpp"
 
+#include "big_memory.hpp"
 #include "install_common.hpp"
 
 #include <zlib.h>
@@ -1380,6 +1381,17 @@ int sevenzip_test() {
       return fail(std::string("字典超过上限的 7z 没有被拒绝: ") + test.name + " " + too_big.message);
     }
     if (!limited.files.empty()) return fail(std::string("拒绝 7z 之前写了文件: ") + test.name);
+
+    MemorySink starved_sink;
+    request.max_dictionary = 0;
+    set_big_memory_limit(1);
+    const InstallResult starved = install_game(drive, starved_sink, request);
+    set_big_memory_limit(0);
+    if (starved.status != "error" || !is_out_of_memory_error(starved.message)) {
+      return fail(std::string("7z 要不到字典内存时没有报内存不够: ") + test.name + " " + starved.message);
+    }
+    if (!starved.retryable || starved.auto_resume) return fail(std::string("7z 内存不够应该交给用户重试，不该自动再装: ") + test.name);
+    if (big_memory_in_use() != 0) return fail(std::string("7z 解压结束后字典内存没有还掉: ") + test.name);
   }
 
   // 不支持的方法在读目录时就拒绝，不写任何文件。精简版 7zr 不能压 PPMd，生成不了就跳过这一项。
@@ -1457,6 +1469,22 @@ int run_install_pipeline_self_test() {
   std::filesystem::remove(rar_file);
   if (rar_bytes.size() < 7 || std::string(rar_bytes.begin(), rar_bytes.begin() + 4) != "Rar!") return fail("测试 RAR 是空的");
   drive.add("/apps/panplay/Rar CUSA77777/game.rar", std::move(rar_bytes));
+
+  // note.txt 太小，RAR 直接存储、解压时不分配字典；这一个压缩过，测要不到字典内存。
+  std::string packed_text;
+  for (int i = 0; i < 4096; ++i) packed_text += "panplay packed line " + std::to_string(i % 7) + "\n";
+  std::ofstream(rar_dir / "packed.txt", std::ios::binary) << packed_text;
+  const auto packed_rar = rar_dir / "packed.rar";
+  if (!run_rar("a -ep -idq -y -ma5 -m3 " + shell_quoted(packed_rar) + " " + shell_quoted(rar_dir / "packed.txt"))) {
+    return fail("RAR 没能生成压缩过的测试 RAR");
+  }
+  std::vector<std::uint8_t> packed_bytes;
+  {
+    std::ifstream packed_in(packed_rar, std::ios::binary);
+    packed_bytes.assign(std::istreambuf_iterator<char>(packed_in), {});
+  }
+  if (packed_bytes.size() >= packed_text.size()) return fail("测试 RAR 没有压缩");
+  drive.add("/apps/panplay/Packed CUSA75555/game.rar", std::move(packed_bytes));
 
   const auto wrap_dir = rar_dir / "Wrap";
   std::filesystem::create_directories(wrap_dir / "PPSA88888-app0" / "sce_sys");
@@ -1660,6 +1688,27 @@ int run_install_pipeline_self_test() {
     if (!refused.retryable) return fail("字典超过上限调高后可以重试，不该标成不能重试");
     error.clear();
     if (local->file_size("/data/homebrew/CUSA77777/note.txt", &error) >= 0) return fail("字典超过上限还是装了文件");
+  }
+
+  {
+    auto local = make_local_sink((root / "rar-no-memory").u8string());
+    InstallRequest request;
+    request.source_dir = "/apps/panplay/Packed CUSA75555";
+    request.dest_prefix = "/data/homebrew";
+    set_big_memory_limit(1);
+    const InstallResult starved = install_game(drive, *local, request);
+    set_big_memory_limit(0);
+    if (starved.status != "error" || !is_out_of_memory_error(starved.message)) {
+      return fail("RAR 要不到字典内存时没有报内存不够: " + starved.status + " " + starved.message);
+    }
+    if (!starved.retryable || starved.auto_resume) return fail("RAR 内存不够应该交给用户重试，不该自动再装");
+    if (big_memory_in_use() != 0) return fail("RAR 解压结束后字典内存没有还掉");
+    const InstallResult installed = install_game(drive, *local, request);
+    if (installed.status != "installed") return fail("RAR 内存不够之后重试没装好: " + installed.message);
+    if (big_memory_in_use() != 0) return fail("RAR 装完后字典内存没有还掉");
+    std::vector<std::uint8_t> got;
+    error = local->read_file("/data/homebrew/CUSA75555/packed.txt", &got, 1 << 20);
+    if (!error.empty() || std::string(got.begin(), got.end()) != packed_text) return fail("压缩过的 RAR 解压内容不对");
   }
 
   {
