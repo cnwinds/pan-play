@@ -68,6 +68,6 @@ PS5 上要开着 FTP 服务，建议用 [zftpd](https://github.com/seregonwar/zf
 
 - 局域网访问默认开着、不要口令。想限制别人打开，在设置的「局域网访问」里关掉或设口令。
 - 设置和登录状态存在 `%APPDATA%\panplay`（Windows）或 `/data/panplay`（PS5）。其中的 `baidu-session.json` 就是你的网盘登录态，不要发给别人。
-- 运行日志是同一目录下的 `panplay.log`，平时只记启动、安装、删除和出错。遇到问题时在设置的「日志」里打开详细日志，重现一次后把 `panplay.log` 发过来。
+- 运行日志是同一目录下的 `panplay.log`，平时只记启动、安装、删除和出错。遇到问题时在设置的「日志」里打开详细日志，重现一次后点同一页的「下载日志」，把下载的文件发过来。
 - 自己编译见 [从源码构建](docs/build.md)。
 

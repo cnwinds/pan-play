@@ -225,7 +225,11 @@
               <span>每个请求、网络连接和内存占用也记下来，排查问题时打开，用完记得关掉</span>
             </label>
           </div>
-          <p class="log-path">日志文件 <span class="num" id="log-path"></span></p>
+          <div class="log-file">
+            <p class="log-path">日志文件 <span class="num" id="log-path"></span></p>
+            <button type="button" class="btn quiet small" id="log-download">下载日志</button>
+          </div>
+          <p class="note" id="log-note" role="status"></p>
         </div>
       </section>
       <footer class="panel-foot">

@@ -2133,6 +2133,44 @@ form.addEventListener("submit", async (event) => {
   }
 });
 
+async function downloadLog() {
+  let response = await fetch("/api/log");
+  if (response.status === 401) {
+    await unlock();
+    response = await fetch("/api/log");
+  }
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || "日志没有下载下来");
+  }
+  const blob = await response.blob();
+  const name = /filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") || "")?.[1] || "panplay.log";
+  const url = URL.createObjectURL(blob);
+  const link = el("a");
+  link.href = url;
+  link.download = name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+$("#log-download").addEventListener("click", async () => {
+  const button = $("#log-download");
+  const note = $("#log-note");
+  button.disabled = true;
+  note.classList.remove("error");
+  note.textContent = "";
+  try {
+    await downloadLog();
+  } catch (error) {
+    note.classList.add("error");
+    note.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 catalogReload.addEventListener("click", async () => {
   catalogReload.disabled = true;
   catalogNote.classList.remove("error");

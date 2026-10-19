@@ -1630,6 +1630,27 @@ void handle_client(SOCKET client, bool local_peer) {
     reply_json(client, 200, settings_json(load_settings()));
     return;
   }
+  // 刚换过文件时新日志只有几行，把上一份接在前面一起给。
+  if (method == "GET" && target == "/api/log") {
+    const std::filesystem::path dir = panplay::app_data_dir();
+    const std::string bytes = read_file(dir / "panplay.old.log") + read_file(dir / "panplay.log");
+    if (bytes.empty()) {
+      reply_json(client, 404, json_error("还没有日志"));
+      return;
+    }
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &now);
+#else
+    localtime_r(&now, &tm);
+#endif
+    char name[64];
+    std::strftime(name, sizeof(name), "panplay-%Y%m%d-%H%M%S.log", &tm);
+    reply(client, 200, "text/plain; charset=utf-8", bytes,
+          std::string("Content-Disposition: attachment; filename=\"") + name + "\"\r\nCache-Control: no-store\r\n");
+    return;
+  }
   if (method == "POST" && target == "/api/settings") {
     std::string parse_error;
     const panplay::Json json = panplay::Json::parse(body, &parse_error);
