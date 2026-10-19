@@ -12,6 +12,7 @@
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
 #include "panplay/socket_util.hpp"
+#include "panplay/speed_test.hpp"
 #include "panplay/store_meta.hpp"
 #include "panplay/trace.hpp"
 
@@ -357,6 +358,47 @@ std::string shelf_state(const ShelfPlacement& placement, const std::string& name
   if (placement.staging_dirs.count(folder) != 0) return "continue";
   if (placement.installed_dirs.count(folder) != 0) return "installed";
   return "install";
+}
+
+// 不析构：退出时还在测的话，析构要等后台线程收尾。
+panplay::SpeedTest& speed_test = *new panplay::SpeedTest;
+
+// 开始测速时拿来和网速比的那次安装：正在装的，没有就取最近装过、算得出速度的。
+// 记在服务端，刷新页面或换个页面看结论还是同一次。
+struct SpeedReference {
+  std::string path;
+  long long speed = 0;
+  bool running = false;
+};
+std::mutex speed_reference_mu;
+SpeedReference speed_reference;
+
+std::string speed_test_json() {
+  const panplay::SpeedTestStatus s = speed_test.status();
+  const auto rate = [](double value) { return std::to_string(static_cast<long long>(value)); };
+  const auto step = [&](const panplay::SpeedTestStep& item) {
+    return "{\"connections\":" + std::to_string(item.connections) + ",\"connected\":" + std::to_string(item.connected) +
+           ",\"rate\":" + rate(item.rate) + "}";
+  };
+  std::string install = "null";
+  {
+    std::lock_guard<std::mutex> lock(speed_reference_mu);
+    if (!speed_reference.path.empty()) {
+      install = "{\"path\":\"" + panplay::json_escape(speed_reference.path) + "\",\"speed\":" +
+                std::to_string(speed_reference.speed) + ",\"running\":" + (speed_reference.running ? "true" : "false") + "}";
+    }
+  }
+  std::string levels;
+  for (const int level : s.levels) levels += (levels.empty() ? "" : ",") + std::to_string(level);
+  std::string steps;
+  for (const auto& item : s.steps) steps += (steps.empty() ? "" : ",") + step(item);
+  return "{\"phase\":\"" + s.phase + "\",\"file\":\"" + panplay::json_escape(s.file_name) +
+         "\",\"file_size\":" + std::to_string(s.file_size) + ",\"levels\":[" + levels + "],\"steps\":[" + steps +
+         "],\"measuring\":" + (s.measuring.connections > 0 ? step(s.measuring) : "null") +
+         ",\"connections\":" + std::to_string(s.connections) + ",\"current\":" + rate(s.current) +
+         ",\"bytes\":" + std::to_string(s.bytes) + ",\"seconds\":" + std::to_string(static_cast<long long>(s.seconds)) +
+         ",\"first_byte_ms\":" + std::to_string(static_cast<long long>(s.first_byte_ms)) + ",\"ended\":\"" + s.ended +
+         "\",\"error\":\"" + panplay::json_escape(s.error) + "\",\"install\":" + install + "}";
 }
 
 std::string catalog_status_json() {
@@ -1199,15 +1241,24 @@ void load_queue() {
   start_worker_locked();
 }
 
-// 平均速度（字节/秒）、预计还要几秒、解压了几秒。正在解压时按现在算，停下后按最后一次解压进度算。
-std::string rate_fields(const InstallTask& task, bool running) {
-  if (task.rate_base < 0) return ",\"speed\":0,\"eta\":-1,\"elapsed\":0";
+// 平均速度（字节/秒），seconds 带回解压了几秒。正在解压时按现在算，停下后按最后一次解压进度算。
+double average_speed(const InstallTask& task, bool running, double* seconds) {
+  *seconds = 0;
+  if (task.rate_base < 0) return 0;
   const panplay::InstallResult& r = task.result;
   const bool live = running && r.message == "正在安装";
   const auto until = live ? std::chrono::steady_clock::now() : task.rate_last;
-  const double seconds = std::chrono::duration<double>(until - task.rate_since).count();
+  *seconds = std::chrono::duration<double>(until - task.rate_since).count();
   const std::int64_t moved = r.bytes_done - task.rate_base;
-  const double speed = seconds >= 3 && moved > 0 ? static_cast<double>(moved) / seconds : 0;
+  return *seconds >= 3 && moved > 0 ? static_cast<double>(moved) / *seconds : 0;
+}
+
+// 平均速度、预计还要几秒、解压了几秒。
+std::string rate_fields(const InstallTask& task, bool running) {
+  if (task.rate_base < 0) return ",\"speed\":0,\"eta\":-1,\"elapsed\":0";
+  const panplay::InstallResult& r = task.result;
+  double seconds = 0;
+  const double speed = average_speed(task, running, &seconds);
   const std::int64_t left = std::max<std::int64_t>(0, r.bytes_total - r.bytes_done);
   const long long eta = running && speed > 0 ? static_cast<long long>(static_cast<double>(left) / speed) : -1;
   return ",\"speed\":" + std::to_string(static_cast<long long>(speed)) + ",\"eta\":" + std::to_string(eta) +
@@ -1257,6 +1308,20 @@ std::string queue_json() {
   for (const auto& task : installs.waiting) add(task, "queued");
   for (const auto& task : installs.finished) add(task, "done");
   return "{\"tasks\":[" + items + "],\"utc_offset_min\":" + std::to_string(local_utc_offset_minutes()) + "}";
+}
+
+SpeedReference find_speed_reference() {
+  SpeedReference found;
+  std::lock_guard<std::mutex> lock(installs.mu);
+  double seconds = 0;
+  const auto pick = [&](const InstallTask& task, bool running) {
+    const double speed = average_speed(task, running, &seconds);
+    if (!found.path.empty() || !(speed > 0)) return;
+    found = {task.path, static_cast<long long>(speed), running};
+  };
+  if (installs.current) pick(*installs.current, true);
+  for (const auto& task : installs.finished) pick(task, false);
+  return found;
 }
 
 template <typename Tasks>
@@ -1500,8 +1565,9 @@ void handle_client(SOCKET client, bool local_peer) {
 
   const std::string method = request_method(header);
   const std::string target = request_target(header);
-  // 界面每秒轮询队列、每几秒查资料库状态，封面一页几十张，这些不记。
-  if (target != "/api/queue" && target != "/api/catalog" && target.rfind("/api/cover/", 0) != 0) {
+  // 界面每秒轮询队列、测速近况，每几秒查资料库状态，封面一页几十张，这些不记。
+  if (target != "/api/queue" && target != "/api/catalog" && target != "/api/speedtest" &&
+      target.rfind("/api/cover/", 0) != 0) {
     PANPLAY_DEBUG("请求 " + method + " " + target + (local_peer ? "（本机）" : "（局域网）"));
   }
   if (!local_peer && !lan.enabled) {
@@ -1670,6 +1736,39 @@ void handle_client(SOCKET client, bool local_peer) {
       panplay::log_info(std::string("详细日志已") + (settings.verbose_log ? "打开" : "关闭"));
     }
     reply_json(client, error.empty() ? 200 : 500, error.empty() ? "{\"ok\":true}" : json_error(error));
+    return;
+  }
+  // 下载测速在后台跑，界面轮询近况；装游戏时也能测，两边会分带宽。
+  if (method == "GET" && target == "/api/speedtest") {
+    reply_json(client, 200, speed_test_json());
+    return;
+  }
+  if (method == "POST" && target == "/api/speedtest/start") {
+    auto drive = open_drive();
+    if (!drive->session_valid()) {
+      reply_json(client, 400, json_error("先登录网盘"));
+      return;
+    }
+    SpeedReference reference = find_speed_reference();
+    const std::string library_path = load_settings().library_path();
+    std::string error;
+    {
+      // 拿着锁开始，轮询不会在新测速里读到上一次的参照。
+      std::lock_guard<std::mutex> lock(speed_reference_mu);
+      error = speed_test.start(drive, library_path);
+      if (error.empty()) speed_reference = std::move(reference);
+    }
+    if (!error.empty()) {
+      reply_json(client, 409, json_error(error));
+      return;
+    }
+    panplay::log_info("开始下载测速");
+    reply_json(client, 200, speed_test_json());
+    return;
+  }
+  if (method == "POST" && target == "/api/speedtest/stop") {
+    speed_test.stop();
+    reply_json(client, 200, speed_test_json());
     return;
   }
   if (method == "GET" && target == "/api/session") {

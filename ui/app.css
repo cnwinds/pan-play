@@ -2091,6 +2091,106 @@ body.drawer-open { overflow: hidden; }
 
 .log-file .btn { flex-shrink: 0; }
 
+/* 下载测速：大数字是现在的总速度（测完是最快那档），下面一档一行，正在量的那行跟着涨 */
+.speedtest {
+  display: grid;
+  gap: 1rem;
+  max-width: 580px;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--line);
+}
+
+.speedtest-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.speedtest-head > div { flex: 1; min-width: 0; }
+.speedtest-head h3 { font-size: 0.95rem; font-weight: 600; }
+
+.speedtest-head p {
+  margin-top: 0.3rem;
+  color: var(--faint);
+  font-size: 0.82rem;
+}
+
+.speedtest-head .btn { flex: none; min-width: 6.5em; }
+
+.speedtest-board {
+  display: grid;
+  gap: 1rem;
+  padding: 1.1rem 1.2rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--night);
+}
+
+.speedtest-figure {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  color: var(--muted);
+}
+
+.speedtest-figure .num {
+  color: var(--text);
+  font-size: 2.6rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.speedtest-label { margin-left: auto; font-size: 0.85rem; }
+
+.speedtest-ladder {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.speedtest-step {
+  display: grid;
+  grid-template-columns: 3em minmax(0, 1fr) 6.5em;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--faint);
+  font-size: 0.85rem;
+}
+
+.speedtest-step b { font-weight: 500; text-align: right; white-space: nowrap; }
+.speedtest-step .meter > span { background: var(--faint); transition: width 0.45s ease; }
+.speedtest-step.done,
+.speedtest-step.best,
+.speedtest-step.live { color: var(--muted); }
+.speedtest-step.done b,
+.speedtest-step.live b { color: var(--text); }
+.speedtest-step.done .meter > span { background: var(--signal); }
+.speedtest-step.best b { color: var(--mint); }
+.speedtest-step.best .meter > span { background: var(--mint); }
+.speedtest-step.live .meter > span { background: var(--signal-hi); animation: speed-pulse 1.2s ease-in-out infinite; }
+
+@keyframes speed-pulse { 50% { opacity: 0.55; } }
+
+.speedtest-meta {
+  color: var(--faint);
+  font-size: 0.82rem;
+  word-break: break-all;
+}
+
+.speedtest-verdict {
+  padding: 0.8rem 1rem;
+  border-left: 3px solid var(--signal);
+  border-radius: 0 8px 8px 0;
+  background: rgba(77, 139, 255, 0.08);
+  font-size: 0.88rem;
+  line-height: 1.65;
+}
+
+.speedtest .note:empty { display: none; }
+.speedtest .note.warn { color: var(--amber); }
+
 @media (max-width: 760px) {
   .bar-inner {
     flex-wrap: wrap;

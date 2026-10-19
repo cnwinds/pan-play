@@ -2028,6 +2028,8 @@ async function loadSettings() {
   renderDrive(settings.drive);
 
   const targets = settings.targets || [];
+  savedTarget = settings.target;
+  runsOnConsole = !targets.includes("ftp");
   $("#target-choice").hidden = targets.length < 2;
   for (const radio of form.querySelectorAll('input[name="target"]')) {
     radio.closest(".choice-card").hidden = !targets.includes(radio.value);
@@ -2039,7 +2041,7 @@ async function loadSettings() {
   form.elements.verbose_log.checked = Boolean(settings.verbose_log);
   $("#log-path").textContent = settings.log_path || "";
   summarizeSettings();
-  await Promise.all([loadAccess(), loadCatalogStatus()]);
+  await Promise.all([loadAccess(), loadCatalogStatus(), pollSpeedtest()]);
 }
 
 /* 局域网访问 */
@@ -2124,6 +2126,7 @@ form.addEventListener("submit", async (event) => {
   settingsNote.classList.remove("error");
   try {
     await api("/api/settings", body);
+    savedTarget = body.target;
     settingsNote.textContent = "已保存。";
     summarizeSettings();
     if (loggedIn) loadGames();
@@ -2168,6 +2171,185 @@ $("#log-download").addEventListener("click", async () => {
     note.textContent = error.message;
   } finally {
     button.disabled = false;
+  }
+});
+
+/* 下载测速：测速在运行盘游的设备上跑，这里只轮询近况 */
+
+const speedRun = $("#speedtest-run");
+const speedNote = $("#speedtest-note");
+let speedTimer = 0;
+let speedState = null;
+let savedTarget = "";
+let runsOnConsole = false;
+
+function mbps(rate) {
+  const value = rate / 1048576;
+  return value >= 100 ? value.toFixed(0) : value.toFixed(1);
+}
+
+// 拿来比较的那次安装，服务端在测速开始时记下。
+function speedReference(s) {
+  if (!s.install) return null;
+  const task = tasks.find((item) => item.path === s.install.path);
+  const name = task ? displayName(task) : s.install.path.slice(s.install.path.lastIndexOf("/") + 1);
+  return { name, speed: s.install.speed, running: s.install.running };
+}
+
+function stepLinks(step) {
+  return step.connected > 0 && step.connected < step.connections ? step.connected : step.connections;
+}
+
+function speedBusy(s) {
+  return s.phase === "finding" || s.phase === "testing";
+}
+
+function bestStep(s) {
+  return s.steps.reduce((best, step) => (!best || step.rate > best.rate ? step : best), null);
+}
+
+// 先说网盘是不是按连接限速，再拿安装速度比：安装进度按压缩包字节算，和下载速度是同一个口径。
+function speedVerdict(s) {
+  const best = bestStep(s);
+  if (!best || !(best.rate > 0)) return "";
+  const single = (s.steps.find((step) => step.connections === 1) || best).rate;
+  const write = savedTarget === "ftp" ? "解压或经 FTP 写进主机" : "解压或写盘";
+  const parts = [];
+  if (s.steps.length > 1) {
+    parts.push(best.rate >= single * 1.3
+      ? `网盘按连接限速：一条 ${mbps(single)} MB/s，${stepLinks(best)} 条一起能到 ${mbps(best.rate)} MB/s。`
+      : `多开连接没有更快，总速度上限约 ${mbps(best.rate)} MB/s，卡在${runsOnConsole ? "主机" : "这台电脑"}的网络或网盘给这个账号的速度上。`);
+  }
+  const ref = speedReference(s);
+  if (!ref) {
+    parts.push(`装游戏时明显慢于 ${mbps(single)} MB/s，就是慢在${write}；接近 ${mbps(best.rate)} MB/s，就是慢在下载。`);
+    return parts.join("");
+  }
+  const install = `「${ref.name}」安装平均 ${mbps(ref.speed)} MB/s`;
+  if (ref.running) {
+    parts.push(single >= ref.speed * 1.5
+      ? `${install}，测速时它还在装，另开的连接仍能跑到 ${mbps(single)} MB/s：下载跟得上，慢在${write}。`
+      : `测速时「${ref.name}」还在安装，两边分带宽，测出来偏低；等装完或取消后再测一次更准。`);
+  } else if (ref.speed >= best.rate * 0.75) {
+    parts.push(`${install}，已经接近网速上限：慢在下载。`);
+  } else if (ref.speed < single * 0.5) {
+    parts.push(`${install}，单连接就能跑 ${mbps(single)} MB/s：慢在${write}，不在下载。`);
+  } else if (best.rate >= single * 1.3 && ref.speed < single * 1.2) {
+    parts.push(`${install}，和单连接差不多。盘游只在解压等数据时才多开连接，所以多半慢在${write}。`);
+  } else {
+    parts.push(`${install}，是网速上限的 ${Math.round((ref.speed / best.rate) * 100)}%：下载和${write}都可能在拖。`);
+  }
+  return parts.join("");
+}
+
+function speedLadder(s) {
+  const busy = speedBusy(s);
+  const best = bestStep(s);
+  const live = s.measuring;
+  const top = Math.max(1, ...s.steps.map((step) => step.rate), live ? live.rate : 0);
+  return s.levels.map((level) => {
+    const step = s.steps.find((item) => item.connections === level);
+    const row = el("li", "speedtest-step");
+    const meter = el("span", "meter");
+    meter.append(el("span"));
+    const value = el("b", "num");
+    let rate = 0;
+    if (step) {
+      rate = step.rate;
+      row.classList.add(step === best && s.steps.length > 1 ? "best" : "done");
+      value.textContent = `${mbps(rate)} MB/s`;
+    } else if (busy && live && live.connections === level) {
+      rate = live.rate;
+      row.classList.add("live");
+      value.textContent = `${mbps(rate)} MB/s`;
+    } else if (busy && s.connections === level) {
+      row.classList.add("live");
+      value.textContent = "连接中…";
+    } else if (!busy) {
+      value.textContent = "—";
+    }
+    meter.style.setProperty("--p", Math.min(1, rate / top));
+    const counted = step || (busy && live && live.connections === level ? live : null);
+    const short = counted && stepLinks(counted) < level;
+    const label = el("span", "", short ? `${counted.connected}/${level} 条` : `${level} 条`);
+    if (short) label.title = `这一档只连上 ${counted.connected} 条，其余一直没收到数据`;
+    row.append(label, meter, value);
+    return row;
+  });
+}
+
+function paintSpeedtest(s) {
+  speedState = s;
+  const busy = speedBusy(s);
+  speedRun.disabled = false;
+  speedRun.textContent = busy ? "停止" : s.phase === "idle" ? "开始测速" : "再测一次";
+  const best = bestStep(s);
+  $("#speedtest-board").hidden = !(s.phase === "testing" || s.steps.length);
+  if (busy) {
+    $("#speedtest-speed").textContent = mbps(s.current);
+    $("#speedtest-label").textContent = s.connections ? `${s.connections} 条连接同时读` : "";
+  } else {
+    $("#speedtest-speed").textContent = best ? mbps(best.rate) : "0";
+    $("#speedtest-label").textContent = best ? `最快，${stepLinks(best)} 条连接` : "";
+  }
+  $("#speedtest-ladder").replaceChildren(...speedLadder(s));
+  const meta = [s.file];
+  if (s.bytes) meta.push(busy ? `已读 ${formatBytes(s.bytes)}` : `${s.seconds} 秒读了 ${formatBytes(s.bytes)}`);
+  if (s.first_byte_ms) meta.push(`首字节 ${(s.first_byte_ms / 1000).toFixed(2)} 秒`);
+  $("#speedtest-meta").textContent = meta.filter(Boolean).join(" · ");
+
+  const ref = speedReference(s);
+  const verdict = s.phase === "done" ? speedVerdict(s) : "";
+  $("#speedtest-verdict").hidden = !verdict;
+  $("#speedtest-verdict").textContent = verdict;
+
+  speedNote.classList.remove("error", "warn");
+  if (s.phase === "finding") {
+    speedNote.textContent = "正在游戏库里找个大文件来测…";
+  } else if (s.phase === "error") {
+    speedNote.classList.add("error");
+    speedNote.textContent = `测速没有完成：${s.error}`;
+  } else if (busy && ref && ref.running) {
+    speedNote.classList.add("warn");
+    speedNote.textContent = "正在安装，测速和安装会分带宽。";
+  } else if (s.phase === "done" && s.ended === "stopped") {
+    speedNote.textContent = s.steps.length ? "已停止，上面是停下前量到的。" : "已停止。";
+  } else {
+    speedNote.textContent = "";
+  }
+}
+
+async function pollSpeedtest() {
+  window.clearTimeout(speedTimer);
+  speedTimer = 0;
+  let status;
+  try {
+    status = await api("/api/speedtest");
+  } catch (error) {
+    speedTimer = window.setTimeout(pollSpeedtest, 2000);
+    return;
+  }
+  paintSpeedtest(status);
+  if (speedBusy(status)) speedTimer = window.setTimeout(pollSpeedtest, 500);
+}
+
+speedRun.addEventListener("click", async () => {
+  speedRun.disabled = true;
+  try {
+    if (speedState && speedBusy(speedState)) {
+      paintSpeedtest(await api("/api/speedtest/stop", {}));
+    } else {
+      paintSpeedtest(await api("/api/speedtest/start", {}));
+    }
+    pollSpeedtest();
+  } catch (error) {
+    speedRun.disabled = false;
+    speedNote.classList.remove("warn");
+    speedNote.classList.add("error");
+    speedNote.textContent = error.message;
+    // 别的页面已经开始测了，就接着显示那一次。
+    const status = await api("/api/speedtest").catch(() => null);
+    if (status && speedBusy(status)) pollSpeedtest();
   }
 });
 

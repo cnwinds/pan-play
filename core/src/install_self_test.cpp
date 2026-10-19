@@ -3,6 +3,7 @@
 #include "panplay/dummy_ftp.hpp"
 #include "panplay/library.hpp"
 #include "panplay/prefetch.hpp"
+#include "panplay/speed_test.hpp"
 
 #include "big_memory.hpp"
 #include "install_common.hpp"
@@ -935,6 +936,85 @@ int tuning_tests() {
     }
   }
   reset_limits();
+  return 0;
+}
+
+// 下载测速：每档都量；服务器按连接限速时 8 条比 1 条快得多，带宽限在本机这边时多开不更快；中途停下很快结束。
+int speed_test_tests() {
+  auto drive = std::make_shared<FakeDrive>();
+  const auto fill = [](std::int64_t, std::uint8_t* dst, std::size_t n) { std::memset(dst, 7, n); };
+  drive->add_generated("/lib/Game PPSA00001/big.part1.rar", 256ll << 20, fill);
+  drive->add_generated("/lib/Game PPSA00001/big.part2.rar", 64ll << 20, fill);
+  drive->add_generated("/lib/readme.txt", 1 << 10, fill);
+  SpeedTestOptions options;
+  options.settle_ms = 100;
+  options.single_ms = 600;
+  options.step_ms = 400;
+  options.connect_ms = 2000;
+  const auto finish = [](SpeedTest& test, double seconds) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+    while (test.running() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    return !test.running();
+  };
+
+  {
+    drive->stream_kbps = 4 * 1024;
+    SpeedTest test;
+    if (const std::string error = test.start(drive, "/lib", options); !error.empty()) return fail(error);
+    if (!finish(test, 15)) return fail("测速没有按时结束");
+    const SpeedTestStatus status = test.status();
+    if (!status.error.empty()) return fail("按连接限速时测速出错: " + status.error);
+    if (status.file_name != "big.part1.rar") return fail("测速没有挑最大的文件，挑了 " + status.file_name);
+    if (status.steps.size() != 4 || !status.ended.empty()) {
+      return fail("按连接限速时应该一直加到 8 条，实际量了 " + std::to_string(status.steps.size()) + " 档");
+    }
+    if (status.steps.back().rate < status.steps.front().rate * 4) return fail("按连接限速时 8 条应该比 1 条快得多");
+    for (const auto& step : status.steps) {
+      if (step.connected != step.connections) return fail("测速的连接没有全部连上: " + std::to_string(step.connections) + " 条档");
+    }
+  }
+
+  {
+    drive->stream_kbps = 0;
+    drive->total_kbps = 8 * 1024;
+    SpeedTest test;
+    if (const std::string error = test.start(drive, "/lib", options); !error.empty()) return fail(error);
+    if (!finish(test, 15)) return fail("测速没有按时结束");
+    const SpeedTestStatus status = test.status();
+    if (!status.error.empty()) return fail("总带宽受限时测速出错: " + status.error);
+    if (status.steps.size() != 4) return fail("总带宽受限时也要每档都量，实际量了 " + std::to_string(status.steps.size()) + " 档");
+    if (status.steps.back().rate > status.steps.front().rate * 1.3) return fail("总带宽受限时多开不该更快");
+  }
+
+  {
+    drive->total_kbps = 16 * 1024;
+    SpeedTest test;
+    if (const std::string error = test.start(drive, "/lib", options); !error.empty()) return fail(error);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    if (test.start(drive, "/lib", options).empty()) return fail("测速进行中又开了一次");
+    test.stop();
+    if (!finish(test, 1)) return fail("停下测速后没有很快结束");
+    if (test.status().ended != "stopped") return fail("停下的测速没有标成中途停下");
+  }
+  drive->total_kbps = 0;
+
+  {
+    SpeedTest test;
+    if (const std::string error = test.start(drive, "/lib", options); !error.empty()) return fail(error);
+    test.stop();
+    if (!finish(test, 1)) return fail("找文件时停下测速后没有很快结束");
+    const SpeedTestStatus status = test.status();
+    if (status.phase != "done" || status.ended != "stopped" || !status.error.empty()) {
+      return fail("刚开始就停下的测速应该标成中途停下，实际 " + status.phase + " " + status.error);
+    }
+  }
+
+  {
+    SpeedTest test;
+    if (const std::string error = test.start(drive, "/nothing", options); !error.empty()) return fail(error);
+    if (!finish(test, 5)) return fail("测速没有按时结束");
+    if (test.status().phase != "error") return fail("游戏库里没有文件时测速应该报错");
+  }
   return 0;
 }
 
@@ -2031,6 +2111,7 @@ int run_install_pipeline_self_test() {
 
   if (const int code = prefetch_tests()) return code;
   if (const int code = tuning_tests()) return code;
+  if (const int code = speed_test_tests()) return code;
   if (const int code = game_root_test()) return code;
   if (const int code = package_and_duplicate_test()) return code;
   if (const int code = many_files_test()) return code;

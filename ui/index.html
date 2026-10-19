@@ -154,6 +154,25 @@
             <input name="library_path" placeholder="/游戏资源/PS5" spellcheck="false">
             <span class="hint">网盘里放游戏文件夹的目录，每个子文件夹算一个游戏。</span>
           </label>
+          <section class="speedtest" aria-labelledby="speedtest-title">
+            <div class="speedtest-head">
+              <div>
+                <h3 id="speedtest-title">下载测速</h3>
+                <p>从游戏库里挑个大文件读，读到的数据直接丢掉，不解压也不写盘。先用一条连接，再加到 2、4、8 条同时读，看单连接和总带宽各能跑多快，和安装速度一比就知道慢在哪。约半分钟。</p>
+              </div>
+              <button type="button" class="btn quiet small" id="speedtest-run">开始测速</button>
+            </div>
+            <div class="speedtest-board" id="speedtest-board" hidden>
+              <p class="speedtest-figure">
+                <span class="num" id="speedtest-speed">0</span><span>MB/s</span>
+                <span class="speedtest-label" id="speedtest-label"></span>
+              </p>
+              <ol class="speedtest-ladder" id="speedtest-ladder" aria-label="各档连接数的速度"></ol>
+              <p class="speedtest-meta" id="speedtest-meta"></p>
+            </div>
+            <p class="speedtest-verdict" id="speedtest-verdict" hidden></p>
+            <p class="note" id="speedtest-note" role="status"></p>
+          </section>
         </div>
       </section>
       <section id="panel-target" role="tabpanel" aria-labelledby="head-target" hidden>
