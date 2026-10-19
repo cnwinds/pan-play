@@ -1,5 +1,6 @@
 #include "panplay/install.hpp"
 
+#include "install_clock.hpp"
 #include "install_common.hpp"
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
@@ -521,7 +522,9 @@ std::string uninstall_game(InstallSink& sink, const std::string& dest_prefix, co
 
 std::string install_folder_name(const std::string& source_dir) { return install_folder(source_dir); }
 
-InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request) {
+namespace {
+
+InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request) {
   InstallResult result;
   const std::string folder = install_folder(request.source_dir);
   const std::string title_id = find_title_id(base_name(request.source_dir));
@@ -723,6 +726,7 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
   for (const auto& file : done) context.finished_before[file.name] = {file.size, file.crc};
   // 解压一层到暂存区。进度按要解压的压缩包字节算，所以开始解压时才把这层的大小加进总数。
   const auto extract = [&](Source& source) -> std::string {
+    PhaseScope decoding(InstallPhase::decode);
     source.extracted = true;
     source.start = result.bytes_total;
     for (const auto& part : source.set->parts) result.bytes_total += part.size;
@@ -932,6 +936,20 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
                    (patch_only ? "叠上 " + std::to_string(layers.size() - keep) + " 层、写入 " : std::string()) +
                    std::to_string(result.files_done) + " 个文件";
   if (outside > 0) result.message += "（游戏目录外的 " + std::to_string(outside) + " 个文件没有装）";
+  return result;
+}
+
+}  // namespace
+
+// 三种格式、本机和 FTP 都在这里统一记安装时间花在哪，结束时写一行总账。
+InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request) {
+  InstallClock clock;
+  const auto timed = timed_sink(sink);
+  const InstallResult result = install_layers(drive, *timed, request);
+  const std::string summary = clock.summary(base_name(request.source_dir), result.status == "installed"     ? "已装好"
+                                                                         : result.status == "interrupted" ? "中断"
+                                                                                                          : "出错");
+  if (!summary.empty()) log_info(summary);
   return result;
 }
 

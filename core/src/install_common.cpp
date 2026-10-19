@@ -1,5 +1,6 @@
 #include "install_common.hpp"
 
+#include "install_clock.hpp"
 #include "panplay/json.hpp"
 #include "panplay/trace.hpp"
 
@@ -58,6 +59,7 @@ std::vector<ArchiveVolume> archive_volumes(const std::vector<DriveEntry>& parts)
 
 std::string read_span(DrivePlugin& drive, const std::vector<ArchiveVolume>& volumes, std::int64_t position, std::size_t size,
                       std::vector<std::uint8_t>* out) {
+  PhaseScope waiting(InstallPhase::download);
   out->clear();
   out->reserve(size);
   for (const auto& volume : volumes) {

@@ -6,6 +6,7 @@
 #include "panplay/speed_test.hpp"
 
 #include "big_memory.hpp"
+#include "install_clock.hpp"
 #include "install_common.hpp"
 
 #include <zlib.h>
@@ -1015,6 +1016,52 @@ int speed_test_tests() {
     if (!finish(test, 5)) return fail("测速没有按时结束");
     if (test.status().phase != "error") return fail("游戏库里没有文件时测速应该报错");
   }
+  return 0;
+}
+
+// 安装耗时：嵌套时只记最里面那项，别的线程不记，写入经 timed_sink 记到写入、新建文件记到开关文件，没开始解压时没有总账。
+int install_clock_test() {
+  const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+  {
+    InstallClock idle;
+    PhaseScope listing(InstallPhase::download);
+    if (!idle.summary("空", "出错").empty()) return fail("没开始解压就有了安装耗时总账");
+  }
+  const auto root = std::filesystem::temp_directory_path() / "panplay-clock-test";
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  auto local = make_local_sink(root.u8string());
+  InstallClock clock;
+  {
+    const auto sink = timed_sink(*local);
+    PhaseScope decoding(InstallPhase::decode);
+    nap(60);
+    {
+      PhaseScope waiting(InstallPhase::download);
+      nap(200);
+      std::thread other([] {
+        PhaseScope elsewhere(InstallPhase::write);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      });
+      other.join();
+    }
+    std::string error;
+    auto writer = sink->open_writer("/a.bin", 4, &error);
+    if (!writer) return fail("计时的 sink 开不了文件: " + error);
+    const std::uint8_t bytes[4] = {1, 2, 3, 4};
+    if (!writer->write(bytes, sizeof(bytes)).empty() || !writer->finish().empty()) return fail("计时的 sink 写不进去");
+  }
+  std::filesystem::remove_all(root, ec);
+  const std::string line = clock.summary("测试", "已装好");
+  const auto percent = [&](const std::string& name) {
+    const auto at = line.find("，" + name + " ");
+    return at == std::string::npos ? -1 : std::atoi(line.c_str() + at + std::strlen("，") + name.size() + 1);
+  };
+  if (line.find("时间大多花在等下载") == std::string::npos || line.find("新建 1 个文件") == std::string::npos ||
+      line.find("写了 1 KB") == std::string::npos) {
+    return fail("安装耗时总账不对: " + line);
+  }
+  if (percent("等下载") < 60 || percent("等下载") > 85 || percent("解压") < 12) return fail("安装耗时占比不对: " + line);
   return 0;
 }
 
@@ -2112,6 +2159,7 @@ int run_install_pipeline_self_test() {
   if (const int code = prefetch_tests()) return code;
   if (const int code = tuning_tests()) return code;
   if (const int code = speed_test_tests()) return code;
+  if (const int code = install_clock_test()) return code;
   if (const int code = game_root_test()) return code;
   if (const int code = package_and_duplicate_test()) return code;
   if (const int code = many_files_test()) return code;

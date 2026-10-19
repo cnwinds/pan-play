@@ -1,6 +1,8 @@
 #include "panplay/prefetch.hpp"
 #include "panplay/trace.hpp"
 
+#include "install_clock.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -957,6 +959,7 @@ bool PrefetchReader::detail_locked() {
 
 std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::string* error) {
   if (size == 0 || position_ >= size_) return 0;
+  PhaseScope timing(InstallPhase::download);
   std::unique_lock<std::mutex> lock(mu_);
   if (!started_) {
     started_ = true;
