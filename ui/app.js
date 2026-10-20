@@ -1284,10 +1284,11 @@ function openDetail(game, opener) {
     if (!reviewBanner.hidden) {
       const own = shown === review;
       const note = shown.note ? `：${shown.note}` : "";
+      const who = shown.device ? `你在${shown.device}上` : "你";
       reviewBanner.dataset.state = own ? (shown.playable ? "good" : "bad") : "info";
       reviewText.textContent = own
-        ? (shown.playable ? "你标记过这个版本能正常玩" : `你标记过这个版本有问题${note}`)
-        : `这个游戏的另一个版本你标记过${shown.playable ? "能玩" : "有问题" + note}`;
+        ? (shown.playable ? `${who}标记过这个版本能正常玩` : `${who}标记过这个版本有问题${note}`)
+        : `这个游戏的另一个版本${who}标记过${shown.playable ? "能玩" : "有问题" + note}`;
       const meta = [shown.firmware ? `固件 ${shown.firmware}` : "固件未知", reviewWhen(shown)];
       if (own && !sameLayers(shown, installedNow)) meta.push("当时装的补丁和现在不同");
       reviewMeta.textContent = meta.join(" · ");

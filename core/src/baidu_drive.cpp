@@ -432,6 +432,31 @@ class BaiduDrive final : public DrivePlugin {
     return open_bytes(file_id, offset, length, error, abort);
   }
 
+  // 小文件一次 multipart 传完，带登录 cookie 就行；ondup=overwrite 覆盖同名文件，上级目录没有时自动建。
+  std::string write_small_file(const std::string& path, const std::string& bytes) override {
+    const std::string cookie = pan_cookie();
+    if (cookie.empty()) return "百度未登录";
+    const std::string boundary = "----panplay" + now_ms_text();
+    const std::string name = path.substr(path.rfind('/') + 1);
+    const std::string body = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + name +
+                             "\"\r\nContent-Type: application/octet-stream\r\n\r\n" + bytes + "\r\n--" + boundary +
+                             "--\r\n";
+    const HttpResponse response =
+        client_.send({"https://d.pcs.baidu.com/rest/2.0/pcs/file?method=upload&app_id=250528&ondup=overwrite&path=" +
+                          url_encode(path),
+                      "POST",
+                      body,
+                      {{"User-Agent", kPanUa},
+                       {"Cookie", cookie},
+                       {"Content-Type", "multipart/form-data; boundary=" + boundary}}});
+    if (!response.error.empty()) return response.error;
+    const Json json = Json::parse(response.body, nullptr);
+    if (response.status == 200 && !json.str("fs_id").empty()) return "";
+    const int code = static_cast<int>(json.num("error_code"));
+    if (code == 110 || code == 111 || json.num("errno") == kErrnoNotLoggedIn) return signed_out();
+    return "上传失败，状态 " + std::to_string(response.status) + (code != 0 ? " error_code=" + std::to_string(code) : "");
+  }
+
  private:
   std::unique_ptr<ByteStream> open_bytes(const std::string& file_id, std::int64_t offset, std::int64_t length,
                                          std::string* error, AbortSignal* abort) {

@@ -1,6 +1,7 @@
 #include "server.hpp"
 
 #include "detail_cache.hpp"
+#include "review_sync.hpp"
 #include "reviews.hpp"
 #include "settings.hpp"
 
@@ -779,7 +780,19 @@ std::string layers_json(const panplay::GameFolder& game, const std::set<std::str
             "\",\"parts\":" + std::to_string(layer.set->parts.size()) + ",\"bytes\":" + std::to_string(layer.bytes) +
             ",\"role\":\"" + layer.role + "\",\"skipped\":" +
             (layer.role != "main" && skipped.count(layer.id) != 0 ? "true" : "false") +
-            ",\"installed\":" + (is_installed ? "true" : "false") + "}";
+            ",\"installed\":" + (is_installed ? "true" : "false");
+    // 主游戏各分卷的 md5 随评价同步出去，盘架拿分享里的文件按它认出同一份资源。
+    if (layer.role == "main") {
+      json += ",\"volumes\":[";
+      for (std::size_t i = 0; i < layer.set->parts.size(); ++i) {
+        const auto& part = layer.set->parts[i];
+        if (i > 0) json += ",";
+        json += "{\"md5\":\"" + panplay::json_escape(part.content_hash) + "\",\"size\":" + std::to_string(part.size) +
+                ",\"name\":\"" + panplay::json_escape(part.name) + "\"}";
+      }
+      json += "]";
+    }
+    json += "}";
   }
   return json + "]";
 }
@@ -868,6 +881,21 @@ std::vector<ReviewLayer> review_layers(const GameDetail& detail) {
   return out;
 }
 
+// 主游戏那组的各分卷。旧版存的详情缓存里没有，为空。
+std::vector<ReviewPart> review_parts(const GameDetail& detail) {
+  std::vector<ReviewPart> out;
+  const panplay::Json layers = panplay::Json::parse(detail.layers, nullptr);
+  for (const auto& layer : layers.array) {
+    if (layer.str("role") != "main") continue;
+    if (const panplay::Json* parts = layer.get("volumes")) {
+      for (const auto& part : parts->array) {
+        out.push_back({part.str("md5"), static_cast<std::int64_t>(part.num("size")), part.str("name")});
+      }
+    }
+  }
+  return out;
+}
+
 // 装的时候发现主游戏那组是 PKG 安装包：盘游装不了，自动把这个版本记成有问题，游戏库里一眼看得出来。
 // 已经评过的不覆盖。
 void review_install_package(const std::string& path, const std::string& set_id) {
@@ -897,10 +925,12 @@ void review_install_package(const std::string& path, const std::string& set_id) 
 #endif
   review.at = static_cast<std::int64_t>(std::time(nullptr));
   review.layers = review_layers(*detail);
+  review.parts = review_parts(*detail);
   if (const std::string error = save_review(review); !error.empty()) {
     panplay::log_warn("没能自动标记 " + review.name + "：" + error);
     return;
   }
+  review_changed();
   panplay::log_info("自动评价 " + review.name + "：有问题，" + review.note);
 }
 
@@ -990,6 +1020,7 @@ std::string one_game_json(const std::string& path, bool cached) {
     const GameDetail live = read_game_detail(*open_drive(), settings, path, detail, &error);
     if (!error.empty()) return json_error(error);
     store_game_detail(key, path, live);
+    if (fill_review_parts(live.fingerprint, review_parts(live))) review_changed();
     sync_shelf_state(key, name, title_id, live.state);
     // 暂存区已经没了（在别处删掉或装完），下次就是从头装，旧记录取较大值会把进度显示高。
     if (live.state == "install" || live.state == "installed" || live.state == "update") forget_install_progress(path);
@@ -1851,6 +1882,7 @@ void handle_client(SOCKET client, bool local_peer) {
     return;
   }
   if (method == "GET" && (target == "/api/games" || target.rfind("/api/games?", 0) == 0)) {
+    refresh_reviews_if_stale();
     auto drive = open_drive();
     const auto mark = target.find('?');
     const std::string json = games_json(*drive, mark == std::string::npos ? "" : target.substr(mark + 1));
@@ -1948,6 +1980,7 @@ void handle_client(SOCKET client, bool local_peer) {
     }
     if (target == "/api/review/remove") {
       const std::string error = remove_review(detail->fingerprint);
+      if (error.empty()) review_changed();
       reply_json(client, error.empty() ? 200 : 500, error.empty() ? "{\"review\":null}" : json_error(error));
       return;
     }
@@ -1967,14 +2000,16 @@ void handle_client(SOCKET client, bool local_peer) {
 #endif
     review.at = static_cast<std::int64_t>(std::time(nullptr));
     review.layers = review_layers(*detail);
+    review.parts = review_parts(*detail);
     const std::string error = save_review(review);
     if (!error.empty()) {
       reply_json(client, 500, json_error(error));
       return;
     }
+    review_changed();
     panplay::log_info(std::string("评价 ") + review.name + "：" + (review.playable ? "能玩" : "有问题 " + review.note) +
                       (review.firmware.empty() ? "" : "，固件 " + review.firmware));
-    reply_json(client, 200, "{\"review\":" + review_json(review) + "}");
+    reply_json(client, 200, "{\"review\":" + review_json(find_review(review.fingerprint).value_or(review)) + "}");
     return;
   }
 #if defined(PANPLAY_PS5)
@@ -2192,6 +2227,7 @@ int run_server(const ServerOptions& options) {
 #endif
   if (options.on_ready) options.on_ready(local_url, other_url, code);
   load_queue();
+  start_review_sync(open_drive);
   PANPLAY_DEBUG("安装队列恢复完，开始接受连接");
   while (true) {
     sockaddr_in peer{};

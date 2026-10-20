@@ -106,6 +106,8 @@ std::unique_ptr<ByteStream> DrivePlugin::open_range(const std::string& file_id, 
   return open_stream(file_id, offset, error, abort);
 }
 
+std::string DrivePlugin::write_small_file(const std::string&, const std::string&) { return "这个网盘不支持写文件"; }
+
 namespace {
 
 PrefetchOptions sane(PrefetchOptions options) {

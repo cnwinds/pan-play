@@ -84,6 +84,8 @@ class DrivePlugin {
   // 只读 [offset, offset + length)。读完整段后连接可以复用。默认实现直接用 open_stream，由调用方只读到 length。
   virtual std::unique_ptr<ByteStream> open_range(const std::string& file_id, std::int64_t offset, std::int64_t length,
                                                  std::string* error, AbortSignal* abort = nullptr);
+  // 写一个几 KB 的小文件（评价同步用），已有的覆盖，上级目录没有时网盘自己建。返回出错原因。
+  virtual std::string write_small_file(const std::string& path, const std::string& bytes);
 };
 
 struct BaiduConfig {
