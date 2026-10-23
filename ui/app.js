@@ -1891,7 +1891,8 @@ function renderCatalogStatus(info) {
     : formatTime(info.file_mtime) || formatTime(sync.last_success);
   const meta = [];
   if (updated) meta.push(`上次更新 ${updated}。`);
-  if (info.stale) meta.push(`已超过 ${sync.stale_days || 7} 天，会自动重新同步。`);
+  if (info.builtin) meta.push(`用的是程序内置的资料库，启动 ${sync.check_interval_hours || 24} 小时后检查时自动更新。`);
+  else if (info.stale) meta.push(`已超过 ${sync.stale_days || 7} 天，下次检查时自动更新。`);
   if (meta.length) parts.push(el("p", "catalog-meta", meta.join("")));
   if (sync.last_error) parts.push(el("p", "catalog-meta error", `最近一次同步失败：${sync.last_error}`));
   catalogStatus.replaceChildren(...parts);

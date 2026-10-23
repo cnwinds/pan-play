@@ -232,10 +232,13 @@ void CatalogSync::sync_once() {
   }
 }
 
+// 启动时不下载：有同步过的或内置的资料库就先用着，到下一次检查时再看要不要更新，
+// 免得一开机就和安装抢网速、抢内存。一份都没有时（编译时没打包资料库）才马上下载，不然只能显示目录名。
 void CatalogSync::run_loop() {
-  const bool update = needs_update();
-  PANPLAY_DEBUG(std::string("资料库同步线程启动，") + (update ? "资料库过期，马上同步" : "资料库够新，暂不同步"));
-  if (update) sync_once();
+  const bool missing = !GameCatalog::instance().loaded();
+  PANPLAY_DEBUG(std::string("资料库同步线程启动，") +
+                (missing ? "没有资料库，马上同步" : std::to_string(check_interval_hours_) + " 小时后检查要不要更新"));
+  if (missing) sync_once();
 
   while (!stop_) {
     std::this_thread::sleep_for(std::chrono::hours(check_interval_hours_));

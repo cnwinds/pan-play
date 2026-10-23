@@ -403,7 +403,8 @@ std::string catalog_status_json() {
   const panplay::CatalogMeta meta = catalog.meta();
   const panplay::CatalogSyncInfo sync = panplay::CatalogSync::instance().info();
   const char* phase = sync.phase == panplay::CatalogSyncPhase::updating ? "updating" : "idle";
-  return std::string("{\"loaded\":") + (catalog.loaded() ? "true" : "false") + ",\"count\":" +
+  return std::string("{\"loaded\":") + (catalog.loaded() ? "true" : "false") +
+         ",\"builtin\":" + (meta.builtin ? "true" : "false") + ",\"count\":" +
          std::to_string(catalog.size()) + ",\"stale\":" + (catalog.is_stale(sync.stale_days) ? "true" : "false") +
          ",\"version\":" + std::to_string(meta.version) + ",\"path\":\"" + panplay::json_escape(meta.path) +
          "\",\"source\":\"" + panplay::json_escape(meta.source) + "\",\"generated_at\":\"" +

@@ -164,7 +164,7 @@ flowchart TD
 ## 9. 依赖与风险
 
 - 百度插件依赖网盘网页版的 passport 扫码登录接口和 `/api/filemetas`、`xpan/file?method=list` 的 cookie 鉴权，这些不是公开承诺的接口，百度改版时要跟着调整；登录、列目录、取下载地址集中在 `baidu_drive.cpp`。
-- 依赖 `PlayStation-Titles` 数据。它由个人维护，停更后新游戏查不到 `conceptId`；本机始终保留最后一份可用数据，同步地址可用环境变量 `PANPLAY_CATALOG_URL` 换成镜像。
+- 依赖 `PlayStation-Titles` 数据。它由个人维护，停更后新游戏查不到 `conceptId`；本机始终保留最后一份可用数据，同步地址可用环境变量 `PANPLAY_CATALOG_URL` 换成镜像。启动时不下载，先用上次同步的那份或程序内置的那份；每 24 小时检查一次，用的是内置的或已超过 7 天时才重新下载。一份都没有时才在启动时马上下载。
 - 依赖 PlayStation 商店概念页的内嵌数据结构。结构变化时只影响中文名和封面，解析集中在一处并有自检覆盖。
 - 风险：港服未上架的游戏只有英文名。处理是手动改名。
 - 依赖 PC 或 PS5 能访问百度下载地址；PS5 侧还依赖自制 ELF 加载环境。
