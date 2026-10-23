@@ -47,6 +47,24 @@ std::string lower(std::string value) {
   return value;
 }
 
+#if defined(PANPLAY_PS5)
+// 单条连接最快约是接收窗口 ÷ 往返时间：PS5 默认的接收缓冲小，到百度往返 25 ms 时一条连接只有 2.5 MB/s 左右，
+// 同一网络下 PC 能到 25 MB/s。窗口在建连接时就和服务器商定了，要在 connect 之前设；系统上限更小时设不上，逐级减半。
+// Linux 不设：手动设了会关掉系统的自动调大。
+void widen_receive_buffer(SOCKET fd) {
+  constexpr int kWanted = 8 << 20;
+  int size = kWanted;
+  while (size >= (256 << 10) && setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) != 0) size /= 2;
+  static std::atomic<bool> logged{false};
+  if (logged.exchange(true)) return;
+  int got = 0;
+  socklen_t length = sizeof(got);
+  getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &length);
+  log_info("下载连接的 TCP 接收缓冲：要 " + std::to_string(kWanted >> 20) + " MB，系统给了 " +
+           std::to_string(got >> 10) + " KB");
+}
+#endif
+
 std::string tls_error_text(int code) {
   char text[160]{};
   mbedtls_strerror(code, text, sizeof(text));
@@ -386,6 +404,9 @@ std::unique_ptr<Connection> open_connection(const Url& url, int receive_timeout_
   for (addrinfo* it = found; it != nullptr; it = it->ai_next) {
     SOCKET fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
     if (fd == INVALID_SOCKET) continue;
+#if defined(PANPLAY_PS5)
+    widen_receive_buffer(fd);
+#endif
     if (!abort.watch(fd)) {
       closesocket(fd);
       break;
