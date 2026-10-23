@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 
 namespace {
@@ -28,6 +29,14 @@ struct AppInstUtil {
 AppInstUtil util;
 std::atomic<bool> util_ready{false};
 std::mutex auth_mu;
+
+struct RunningApp {
+  bool resolved = false;
+  int (*app_id)() = nullptr;
+  int (*title_id)(int, char*) = nullptr;
+};
+
+RunningApp running;
 
 unsigned bcd(unsigned value) { return ((value >> 4) & 0xFu) * 10u + (value & 0xFu); }
 
@@ -97,6 +106,26 @@ std::string load_app_inst_util() {
   const std::string error = load();
   util_ready = error.empty();
   return error;
+}
+
+std::string running_app_title_id() {
+  std::lock_guard<std::mutex> lock(auth_mu);
+  if (!running.resolved) {
+    running.resolved = true;
+    if (void* lib = dlopen("libSceSystemService.sprx", RTLD_LAZY); lib != nullptr) {
+      running.app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceSystemServiceGetAppIdOfRunningBigApp"));
+      running.title_id = reinterpret_cast<int (*)(int, char*)>(dlsym(lib, "sceSystemServiceGetAppTitleId"));
+    }
+    if (running.app_id == nullptr || running.title_id == nullptr) {
+      panplay::log_warn("这个固件上查不了正在运行的游戏，删除前不检查游戏开没开着");
+    }
+  }
+  if (running.app_id == nullptr || running.title_id == nullptr) return "";
+  const int app = running.app_id();
+  if (app <= 0) return "";
+  char id[32] = {};
+  if (running.title_id(app, id) != 0) return "";
+  return std::string(id, strnlen(id, sizeof(id)));
 }
 
 std::string with_privileged_auth(const std::function<std::string()>& action) {

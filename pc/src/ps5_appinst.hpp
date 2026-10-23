@@ -16,6 +16,10 @@ std::string hex_code(int code);
 // 它和 with_privileged_auth 拿同一把锁，所以别的线程换着身份时这里会等着，不会撞上。
 std::string load_app_inst_util();
 
+// 正在运行的游戏（全屏应用）的 Title ID；没有游戏在运行、或者这个固件上查不了时为空。
+// 和 load_app_inst_util 一样不能在 with_privileged_auth 里调用。
+std::string running_app_title_id();
+
 // 把进程身份临时换成能注册应用、挂载目录的特权身份，执行完换回。同一时间只有一个在执行。
 std::string with_privileged_auth(const std::function<std::string()>& action);
 

@@ -160,7 +160,7 @@ std::string unmount_nullfs(const std::string& id, bool force) {
     if (top.type.empty()) return "";
     if (top.type != "nullfs") return target + " 上挂的是 " + top.type + "，不是盘游挂的，先不动";
     if (unmount(target.c_str(), 0) == 0) continue;
-    if (errno == EBUSY && !force) return "游戏正在运行，先关掉游戏再试";
+    if (errno == EBUSY && !force) return kTitleBusyError;
     if (!force || unmount(target.c_str(), MNT_FORCE) != 0) return "卸不掉 " + target + " 上的挂载：" + errno_text();
   }
   return mount_top(target).type.empty() ? "" : target + " 上叠了太多层挂载，先不动";
@@ -335,6 +335,16 @@ std::string title_linked_to(const std::string& game_dir) {
 }
 
 }  // namespace
+
+const char* const kTitleBusyError = "游戏正在运行，先关掉游戏再试";
+
+bool console_title_running(const std::string& game_dir) {
+  std::string problem;
+  std::string id = read_title_id(game_dir, &problem);
+  if (id.empty()) id = title_linked_to(game_dir);
+  if (id.empty() || official_install(id)) return false;
+  return running_app_title_id() == id;
+}
 
 bool shadowmount_running() {
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};

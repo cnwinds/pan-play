@@ -25,6 +25,13 @@ std::string register_console_title(const std::string& game_dir);
 // 没注册到这个目录、主机上是正式版、ShadowMountPlus 在运行时不动主机那边。返回错误，成功为空。
 std::string unregister_console_title(const std::string& game_dir);
 
+// 游戏正在运行、卸不掉挂载时 unregister_console_title 返回的就是这句。
+extern const char* const kTitleBusyError;
+
+// 这个目录里的游戏正在主机上运行。读不到 Title ID、主机上运行的是同一游戏的正式版、固件上查不了时都算没在运行。
+// 不能在 with_privileged_auth 里调用。
+bool console_title_running(const std::string& game_dir);
+
 // 盘游启动时按 /user/app/*/mount.lnk 把还没挂上的游戏目录挂回去。
 void restore_console_mounts();
 

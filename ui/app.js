@@ -1181,15 +1181,24 @@ function openDetail(game, opener) {
   const actionRow = el("div", "action-row");
   actionRow.append(action, moreWrap);
   const confirm = buildConfirm();
-  // 删除成功后的一句提示；队列里有这款游戏的结果时以队列为准。
+  // 删除成功后的一句提示；队列里有这款游戏的结果时以队列为准。noticeWarn 时是出错的原因，比队列里的结果优先，
+  // 留到下一次操作；不然安装队列每秒刷新一次详情，错误刚显示就被冲掉了。
   let notice = "";
+  let noticeWarn = false;
+  const say = (text) => {
+    notice = text;
+    noticeWarn = false;
+  };
+  const clearFailure = () => {
+    if (noticeWarn) say("");
+  };
   // picking：选择面板开着；waitingLayers：点了安装但压缩包列表还没读到，读到后再决定要不要先选。
   let picking = false;
   let waitingLayers = false;
   const picker = buildLayerPicker((skip) => {
     picking = false;
     status.hidden = true;
-    notice = "";
+    say("");
     startInstall(game, skip);
     paint();
   }, () => {
@@ -1296,6 +1305,7 @@ function openDetail(game, opener) {
   };
   const sendReview = async (endpoint, body) => {
     reviewBusy = true;
+    clearFailure();
     paint();
     try {
       const data = await api(endpoint, { path: game.path, ...body });
@@ -1474,11 +1484,12 @@ function openDetail(game, opener) {
       first.hidden = position <= 1;
     }
     const finished = task && task.state === "done";
-    if (running || queued) notice = "";
-    status.hidden = !finished && !notice;
-    status.className = "status-text" + (finished && settledState(task) !== "installed" ? " warn" : "");
-    if (finished) status.textContent = jobText(task);
-    else if (notice) status.textContent = notice;
+    if (running || queued) say("");
+    const failed = Boolean(notice) && noticeWarn;
+    status.hidden = !failed && !finished && !notice;
+    status.className = "status-text" + (failed || (finished && settledState(task) !== "installed") ? " warn" : "");
+    if (failed || !finished) status.textContent = notice;
+    else status.textContent = jobText(task);
 
     desc.textContent = game.description || "";
     desc.hidden = !game.description;
@@ -1511,6 +1522,7 @@ function openDetail(game, opener) {
   const openPicker = () => {
     picking = true;
     status.hidden = true;
+    clearFailure();
     paint();
     picker.open(game.layers);
   };
@@ -1520,7 +1532,7 @@ function openDetail(game, opener) {
       return;
     }
     status.hidden = true;
-    notice = "";
+    say("");
     startInstall(game);
   };
   action.addEventListener("click", () => {
@@ -1538,10 +1550,11 @@ function openDetail(game, opener) {
   adjust.addEventListener("click", openPicker);
   const registerConsole = async () => {
     consoleBusy = true;
+    clearFailure();
     paint();
     try {
       game.console = (await api("/api/console/register", { path: game.path })).console;
-      notice = "已注册到主机桌面。";
+      say("已注册到主机桌面。");
     } catch (error) {
       game.console = { ...game.console, error: error.message };
     }
@@ -1556,6 +1569,7 @@ function openDetail(game, opener) {
     if (refreshing) return;
     refreshing = true;
     refreshResult = "";
+    clearFailure();
     paint();
     const current = () => detail && detail.game === game;
     try {
@@ -1586,7 +1600,7 @@ function openDetail(game, opener) {
     const error = await removeInstall(game, endpoint);
     if (!detail || detail.game !== game) return;
     confirm.close();
-    notice = error ? "" : done;
+    say(error ? "" : done);
     paint();
     if (error) detail.fail(error);
     else reload();
@@ -1594,6 +1608,7 @@ function openDetail(game, opener) {
   };
   const askRemove = (steps, endpoint, done, focusAfter) => {
     status.hidden = true;
+    clearFailure();
     confirm.ask({
       steps,
       busy: "正在删除…",
@@ -1646,6 +1661,7 @@ function openDetail(game, opener) {
     if (!detail || detail.game !== game) return;
     Object.assign(game, data);
     archivesRead = true;
+    clearFailure();
     const pending = waitingLayers;
     waitingLayers = false;
     paint();
@@ -1666,6 +1682,8 @@ function openDetail(game, opener) {
     paint,
     reload,
     fail(message) {
+      notice = message;
+      noticeWarn = true;
       status.hidden = false;
       status.className = "status-text warn";
       status.textContent = message;

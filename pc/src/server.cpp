@@ -2086,17 +2086,23 @@ void handle_client(SOCKET client, bool local_peer) {
       }
     }
     std::string error;
+    bool running = false;
     try {
       const AppSettings settings = load_settings();
       if (auto sink = open_sink(settings, &error)) {
         panplay::log_info(std::string(whole ? "删除游戏 " : "删除没装完的文件 ") + path);
 #if defined(PANPLAY_PS5)
+        // 游戏开着时删文件，游戏会崩；ShadowMountPlus 管着、主机上没挂盘游的挂载时，卸挂载那一步也拦不住，所以先查一次。
+        const std::string game_dir = console_game_dir(settings, path);
+        running = !game_dir.empty() && console_title_running(game_dir);
         // 先从主机注销、卸掉挂载，注销不成就不删文件，免得留下打不开的图标。
-        if (const std::string game_dir = console_game_dir(settings, path); whole && !game_dir.empty()) {
+        if (!running && whole && !game_dir.empty()) {
           error = unregister_console_title(game_dir);
+          running = error == kTitleBusyError;
           if (!error.empty()) error = "没能从主机注销，先不删除：" + error;
           remember_console_error(path, "");
         }
+        if (running) error = "「" + game_display_name(path) + "」正在主机上运行，先在主机上关掉游戏再删除";
 #endif
         if (error.empty()) {
           error = whole ? panplay::uninstall_game(*sink, settings.prefix(), path)
@@ -2114,7 +2120,7 @@ void handle_client(SOCKET client, bool local_peer) {
     }
     if (error.empty()) forget_install_progress(path);
     if (!error.empty()) {
-      reply_json(client, 500, json_error(error));
+      reply_json(client, running ? 409 : 500, json_error(error));
       return;
     }
     forget_game_detail(path);
