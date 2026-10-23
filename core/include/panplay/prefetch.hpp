@@ -88,15 +88,19 @@ class PrefetchReader {
     // 卡住或拖后腿：断开，没下的部分放回去重新派。
     bool restart = false;
     bool connected = false;
+    // 缓冲满了在等读取方腾地方：这时不收数据不是网慢，不量速度。held 是这段里等过。
+    bool blocked = false;
+    bool held = false;
     Clock::time_point began;
     Clock::time_point first_byte;
     std::int64_t connect_at = 0;
     ByteStream* stream = nullptr;
     ChunkPtr chunk;
-    // 卡住检查：每 stall_ms 量一次这段时间的速度（字节/毫秒），-1 是还没量过。
+    // 卡住检查：每 stall_ms 量一次这段时间的速度（字节/毫秒），-1 是还没量过。peak_rate 是这个请求量到过的最快。
     std::int64_t check_at = 0;
     Clock::time_point check_time;
     double check_rate = -1;
+    double peak_rate = 0;
   };
   struct Worker {
     Lease lease;
@@ -156,6 +160,7 @@ class PrefetchReader {
   void account_locked();
   void tune_locked(Clock::time_point now);
   void check_stalls_locked(Clock::time_point now);
+  void note_lane_rate_locked(double rate);
   void start_tune_locked(Tune direction, int level, double base_rate, Clock::time_point now);
   void set_want_locked(int connections, Clock::time_point now);
   // 把定下来的连接数记到各卷共用的 tuning 上；failed 时记一次失败，返回要退避多少毫秒。
@@ -201,6 +206,14 @@ class PrefetchReader {
   double open_ms_avg_ = 200;
   Clock::time_point waiting_since_{};
   bool waiting_ = false;
+  // 读取方最近一个检查期（stall_ms）里有一半以上时间在等数据。慢慢来数据的那段隔一会儿交一点，
+  // 读取方不会连续等很久，只看连续等了多久认不出它。
+  bool starving_ = false;
+  Clock::time_point starve_from_{};
+  double starve_wait_ms_ = 0;
+  // 读取方不缺数据时量到的单条连接速度（字节/毫秒）。卡住时总速度跟着掉、其他连接被缓冲堵着，
+  // 拿它们比认不出卡住的那段，要和卡住之前的正常速度比。
+  double lane_rate_ = 0;
 
   // 调速状态。
   int want_ = 1;

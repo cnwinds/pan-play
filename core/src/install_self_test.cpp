@@ -95,8 +95,10 @@ class FakeDrive final : public DrivePlugin {
   // 限速（KB/s，0 是不限）：每个流各自的上限（像百度按连接限速），和所有流加起来的上限（像主机的网络）。
   std::atomic<int> stream_kbps{0};
   std::atomic<int> total_kbps{0};
-  // 下一次打开的流读到这么多字节后慢到每秒 16 KB，只生效一次。
+  // 下一次打开的流读到这么多字节后每 stall_piece_ms 毫秒只给 16 KB，只生效一次。
+  // 默认每秒 16 KB 是卡住；间隔短时是一直有数据、只是很慢。
   std::atomic<std::int64_t> stall_next_stream_after{-1};
+  std::atomic<int> stall_piece_ms{1000};
 
   std::string id() const override { return "memory"; }
   std::string display_name() const override { return "内存"; }
@@ -239,7 +241,8 @@ class FakeDrive final : public DrivePlugin {
       if (n <= 0) return 0;
       if (stall_after_ >= 0 && delivered_ >= stall_after_) {
         n = std::min<std::int64_t>(n, 16 << 10);
-        for (int i = 0; i < 100 && !aborted_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const int slices = std::max(1, owner_.stall_piece_ms.load() / 10);
+        for (int i = 0; i < slices && !aborted_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (aborted_) {
           *error = "下载已中止";
           return 0;
@@ -879,6 +882,7 @@ int tuning_tests() {
     drive.total_kbps = 0;
     drive.stream_kbps = 0;
     drive.stall_next_stream_after = -1;
+    drive.stall_piece_ms = 1000;
   };
 
   {
@@ -913,27 +917,32 @@ int tuning_tests() {
     }
   }
 
-  for (const int connections : {1, 4}) {
-    reset_limits();
-    if (connections == 1) {
-      drive.total_kbps = 32 * 1024;
-      drive.stall_next_stream_after = 3ll << 20;
-    } else {
-      drive.stream_kbps = 4 * 1024;
-      drive.stall_next_stream_after = 256 << 10;
-    }
-    PrefetchOptions options = base();
-    options.adaptive = false;
-    options.connections = connections;
-    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
-    std::string error;
-    const auto started = std::chrono::steady_clock::now();
-    const std::int64_t got = drain(reader, 24ll << 20, 8.0, &error);
-    const double spent = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    if (!error.empty()) return fail("请求卡住后读取出错: " + error);
-    if (got < (24ll << 20) || spent > 5.0) {
-      return fail(std::to_string(connections) + " 条连接时请求卡住没有及时重派：" + std::to_string(spent) + " 秒读到 " +
-                  std::to_string(got >> 20) + " MB");
+  // 卡住（每秒 16 KB）和一直有数据但很慢（每 40 毫秒 16 KB，400 KB/s，高于卡住的下限）：
+  // 很慢的那段每次只交一点，解压器拿到一点又等，不能只看它连续等了多久。
+  for (const int piece_ms : {1000, 40}) {
+    for (const int connections : {1, 4}) {
+      reset_limits();
+      drive.stall_piece_ms = piece_ms;
+      if (connections == 1) {
+        drive.total_kbps = 32 * 1024;
+        drive.stall_next_stream_after = 3ll << 20;
+      } else {
+        drive.stream_kbps = 4 * 1024;
+        drive.stall_next_stream_after = 256 << 10;
+      }
+      PrefetchOptions options = base();
+      options.adaptive = false;
+      options.connections = connections;
+      PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
+      std::string error;
+      const auto started = std::chrono::steady_clock::now();
+      const std::int64_t got = drain(reader, 24ll << 20, 8.0, &error);
+      const double spent = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+      const std::string what = std::to_string(connections) + " 条连接时请求" + (piece_ms < 1000 ? "很慢" : "卡住");
+      if (!error.empty()) return fail(what + "后读取出错: " + error);
+      if (got < (24ll << 20) || spent > 5.0) {
+        return fail(what + "没有及时重派：" + std::to_string(spent) + " 秒读到 " + std::to_string(got >> 20) + " MB");
+      }
     }
   }
   reset_limits();

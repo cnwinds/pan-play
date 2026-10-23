@@ -235,11 +235,13 @@ void PrefetchReader::worker_loop(int index, AbortSignal& signal) {
     Lease& lease = worker.lease;
     if (lease.generation == generation_) {
       const auto now = Clock::now();
-      if (lease.connected && lease.at > lease.connect_at) {
+      if (lease.connected && !lease.held && lease.at > lease.connect_at) {
         const double spent = ms_between(lease.first_byte, now);
         if (spent >= 200) {
           const double speed = static_cast<double>(lease.at - lease.connect_at) / spent;
           worker.speed = worker.speed > 0 ? (worker.speed + speed) / 2 : speed;
+          // 缓冲边上领的零头段太短，量不准。
+          if (!starving_ && lease.at - lease.connect_at >= kMinSegment / 4) note_lane_rate_locked(speed);
         }
       }
       if (lease.at >= lease.end) {
@@ -372,12 +374,15 @@ void PrefetchReader::run_lease(int index, AbortSignal& signal, bool detailed) {
         // 缓冲满了先不读，服务器那边靠 TCP 流量控制停着。
         if (lease.at > position_ && lease.at + length - position_ > budget_) {
           waited = true;
+          lease.blocked = true;
+          lease.held = true;
           cv_.wait(lock);
           continue;
         }
         lease.chunk = new_chunk_locked(lease.at, length);
         break;
       }
+      lease.blocked = false;
       if (waited) {
         // 等缓冲腾地方的时间不算慢。
         lease.check_at = lease.at;
@@ -621,6 +626,11 @@ void PrefetchReader::add_wait_locked(double ms) {
   count_locked([&](Stats& stats) { stats.wait_ms += ms; });
   review_wait_ms_ += ms;
   measure_wait_ms_ += ms;
+  starve_wait_ms_ += ms;
+}
+
+void PrefetchReader::note_lane_rate_locked(double rate) {
+  lane_rate_ = lane_rate_ > 0 ? (lane_rate_ + rate) / 2 : rate;
 }
 
 void PrefetchReader::account_locked() {
@@ -885,17 +895,31 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
 
 // 解压器在等的那段如果卡住或明显拖后腿，断开它，没下的部分放回去马上重新派。
 void PrefetchReader::check_stalls_locked(Clock::time_point now) {
+  if (const double span = ms_between(starve_from_, now); span >= options_.stall_ms) {
+    starving_ = starve_wait_ms_ >= span / 2;
+    starve_from_ = now;
+    starve_wait_ms_ = 0;
+  }
   for (auto& worker : workers_state_) {
     Lease& lease = worker.lease;
     if (!lease.active || lease.generation != generation_ || !lease.connected || lease.restart) continue;
+    if (lease.blocked) {
+      lease.check_at = lease.at;
+      lease.check_time = now;
+      lease.check_rate = -1;
+      continue;
+    }
     const double span = ms_between(lease.check_time, now);
     if (span >= options_.stall_ms) {
       lease.check_rate = static_cast<double>(lease.at - lease.check_at) / span;
       lease.check_at = lease.at;
       lease.check_time = now;
+      lease.peak_rate = std::max(lease.peak_rate, lease.check_rate);
+      if (!starving_) note_lane_rate_locked(lease.check_rate);
     }
   }
-  if (!waiting_ || ms_between(waiting_since_, now) < std::min(1000.0, options_.stall_ms / 2.0)) return;
+  if (!waiting_) return;
+  if (!starving_ && ms_between(waiting_since_, now) < std::min(1000.0, options_.stall_ms / 2.0)) return;
   std::int64_t need = position_;
   if (const ChunkPtr chunk = chunk_at_locked(position_)) need = chunk->filled_end();
   Lease* slow = nullptr;
@@ -910,12 +934,18 @@ void PrefetchReader::check_stalls_locked(Clock::time_point now) {
     }
   }
   if (slow == nullptr || slow->check_rate < 0) return;
+  // 先和正在下的其他连接比；没有（单连接，或者其他连接都被缓冲堵着）就和卡住之前的单条速度、
+  // 这个请求自己之前的速度比，都没有才退到总速度。
   double normal = rate_avg_;
+  double limit = 0.10;
   if (!others.empty()) {
     std::nth_element(others.begin(), others.begin() + static_cast<std::ptrdiff_t>(others.size() / 2), others.end());
     normal = others[others.size() / 2];
+    limit = 0.25;
+  } else if (lane_rate_ > 0 || slow->peak_rate > 0) {
+    normal = std::max(lane_rate_, slow->peak_rate);
+    limit = 0.25;
   }
-  const double limit = others.empty() ? 0.10 : 0.25;
   if (slow->check_rate >= kStuckBytesPerMs && (normal <= 0 || slow->check_rate >= limit * normal)) return;
   PANPLAY_DEBUG("预读 #" + std::to_string(id_) + "：段 @" + mb(slow->start) + " 下到 @" + mb(slow->at) + " 时只有 " +
                 per_second(slow->check_rate) + (normal > 0 ? "（正常 " + per_second(normal) + "）" : std::string()) +
@@ -966,7 +996,7 @@ std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::strin
   if (!started_) {
     started_ = true;
     const auto now = Clock::now();
-    accounted_at_ = window_at_ = review_from_ = changed_at_ = tuned_at_ = multi_since_ = now;
+    accounted_at_ = window_at_ = review_from_ = changed_at_ = tuned_at_ = multi_since_ = starve_from_ = now;
     window_received_ = review_received_ = received_.load();
     cv_.notify_all();
   }
@@ -1057,6 +1087,9 @@ std::string PrefetchReader::seek(std::int64_t position) {
     measuring_ = false;
   }
   changed_at_ = now;
+  starving_ = false;
+  starve_from_ = now;
+  starve_wait_ms_ = 0;
   ++generation_;
   chunks_.clear();
   holes_.clear();
