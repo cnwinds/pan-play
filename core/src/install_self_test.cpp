@@ -2072,8 +2072,24 @@ int run_install_pipeline_self_test() {
     }
     drive.forget_streams();
     request.stop_after_output_bytes = -1;
+    // 安装速度从第一次报“正在安装”算起，那之后涨的字节只能是这次真正解压的文件，续装点之前的不能算进去。
+    std::int64_t install_from = -1;
+    std::int64_t files_left = 0;
+    std::int64_t last_bytes = 0;
+    request.on_progress = [&](const InstallResult& snapshot) {
+      if (install_from < 0 && snapshot.message == "正在安装") {
+        install_from = snapshot.bytes_done;
+        files_left = 6 - snapshot.files_done;
+      }
+      last_bytes = snapshot.bytes_done;
+    };
     const InstallResult resumed = install_game(drive, *local, request);
+    request.on_progress = nullptr;
     if (resumed.status != "installed") return fail("多卷 RAR 继续安装失败: " + resumed.message);
+    if (install_from < 0 || last_bytes - install_from > files_left * 20000 + 4096) {
+      return fail("续装时开始解压前的进度没跟上，已装的部分会算进安装速度: 从 " + std::to_string(install_from) + " 到 " +
+                  std::to_string(last_bytes) + "，要装 " + std::to_string(files_left) + " 个文件");
+    }
     const bool read_first = drive.streamed_from().count("/apps/panplay/Many CUSA55555/" + many_volumes.front().first) > 0;
     if (!spoil && read_first) return fail("续装时又从第一卷读起");
     if (spoil && !read_first) return fail("续装点坏了却没有退回从第一卷核对");

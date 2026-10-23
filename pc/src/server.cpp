@@ -1224,7 +1224,10 @@ void queue_worker() {
       cancel = installs.current->cancel;
     }
     panplay::log_info("开始安装 " + path);
-    const panplay::InstallResult result = install_with_auto_resume(path, *cancel);
+    panplay::InstallResult result = install_with_auto_resume(path, *cancel);
+    if (result.status == "interrupted" && cancel->cancelled()) {
+      result.message = "已暂停，已装好 " + std::to_string(result.files_done) + " 个文件，点继续接着装";
+    }
     panplay::log_line(result.status == "error" ? panplay::LogLevel::warn : panplay::LogLevel::info,
                       "安装结束 " + path + "：" + result.status + " " + result.message + "，" + panplay::memory_summary());
     if (result.status == "installed" || result.status == "already") {
@@ -1950,7 +1953,7 @@ void handle_client(SOCKET client, bool local_peer) {
         installs.waiting.push_front(std::move(task));
       } else if (running) {
         installs.current->cancel->cancel();
-        installs.current->result.message = "正在取消…";
+        installs.current->result.message = "正在暂停…";
       } else if (waiting != installs.waiting.end()) {
         installs.waiting.erase(waiting);
       } else if (!erase_path(installs.finished, path)) {

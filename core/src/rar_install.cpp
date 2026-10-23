@@ -524,6 +524,7 @@ std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vecto
     for (const auto& entry : entries_before(options, *done)) seen_sys = seen_sys || in_sce_sys(entry.name);
   }
   bool first_header = resume != nullptr;
+  bool checking = !finished_before.empty();
   const int last = static_cast<int>(guard.state.volumes.size()) - 1;
   while (failure.empty()) {
     RARHeaderDataEx header{};
@@ -620,6 +621,10 @@ std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vecto
     const auto before = finished_before.find(staged);
     const bool already = before != finished_before.end() && before->second.first == static_cast<std::int64_t>(size) &&
                          before->second.second == header.FileCRC;
+    // 核对完已装文件、开始解压前先报一次读到的位置：直接跳到续装点、或刚跳过一串已装文件时，
+    // 节流的进度还停在前面，不报的话这段跳过的量会被算进安装速度。
+    if (!directory && !already && checking) report_bytes(true);
+    if (!directory) checking = already;
     if (!directory && options.on_entry) options.on_entry(already);
     if (!directory && !already) {
       writer.out = std::make_unique<OutputFile>(sink, join_storage_path(options.staging_root, staged),

@@ -510,7 +510,7 @@ function taskPace(task) {
 function jobText(current, inDetail = false) {
   if (current.state === "queued") return `排队中，第 ${queuePosition(current.path)} 个`;
   if (current.state === "running") {
-    if (current.message === "正在取消…" || current.message === "正在注册到主机桌面…" ||
+    if (current.message === "正在暂停…" || current.message === "正在注册到主机桌面…" ||
       (current.message || "").startsWith("安装中断")) return current.message;
     if (current.message === "正在收尾") return `正在收尾，共 ${current.files_total} 个文件`;
     if (current.message === "正在核对") return `核对已装文件 ${current.files_checked} / ${current.files_to_check}`;
@@ -686,8 +686,8 @@ function paintDock() {
   }
   dockMeter.style.setProperty("--p", summary.p);
   dockAction.hidden = !running && queueBusy();
-  dockAction.textContent = running ? "取消" : "关闭";
-  dockAction.disabled = Boolean(running && running.message === "正在取消…");
+  dockAction.textContent = running ? "暂停安装" : "关闭";
+  dockAction.disabled = Boolean(running && running.message === "正在暂停…");
   dockToggle.setAttribute("aria-expanded", String(dockOpen));
   dockToggle.setAttribute("aria-label", dockOpen ? "收起安装队列" : "展开安装队列");
   dockPanel.hidden = !dockOpen;
@@ -705,8 +705,8 @@ function queueButton(text, onClick, className) {
 function queueRowActions(task) {
   const remove = () => queueAction("/api/queue/remove", { path: task.path });
   if (task.state === "running") {
-    const cancel = queueButton("取消", remove, "danger");
-    cancel.disabled = task.message === "正在取消…";
+    const cancel = queueButton("暂停安装", remove);
+    cancel.disabled = task.message === "正在暂停…";
     return [cancel];
   }
   if (task.state === "queued") {
@@ -766,7 +766,7 @@ function paintQueueList() {
     }
     row.meter.hidden = task.state !== "running";
     row.meter.style.setProperty("--p", taskFraction(task));
-    const actionKey = [task.state, task.status, task.retryable, task.message === "正在取消…", queuePosition(task.path) > 1].join("|");
+    const actionKey = [task.state, task.status, task.retryable, task.message === "正在暂停…", queuePosition(task.path) > 1].join("|");
     if (row.actionKey !== actionKey) {
       row.actionKey = actionKey;
       row.actions.replaceChildren(...queueRowActions(task));
@@ -1108,7 +1108,7 @@ function openDetail(game, opener) {
   const progressRow = el("div", "progress-row");
   const progressText = el("span");
   progressText.setAttribute("role", "status");
-  const cancel = el("button", "link", "取消安装");
+  const cancel = el("button", "link", "暂停安装");
   cancel.type = "button";
   progressRow.append(progressText, cancel);
   const meter = el("span", "meter");
@@ -1461,7 +1461,7 @@ function openDetail(game, opener) {
     if (running) {
       progressText.textContent = jobText(task, true);
       meter.style.setProperty("--p", taskFraction(task));
-      cancel.disabled = task.message === "正在取消…";
+      cancel.disabled = task.message === "正在暂停…";
       const pace = taskPace(task);
       progressTop.hidden = !taskStarted(task);
       progressPct.textContent = Math.round(taskFraction(task) * 100) + "%";
@@ -2230,7 +2230,7 @@ function speedVerdict(s) {
   if (ref.running) {
     parts.push(single >= ref.speed * 1.5
       ? `${install}，测速时它还在装，另开的连接仍能跑到 ${mbps(single)} MB/s：下载跟得上，慢在${write}。`
-      : `测速时「${ref.name}」还在安装，两边分带宽，测出来偏低；等装完或取消后再测一次更准。`);
+      : `测速时「${ref.name}」还在安装，两边分带宽，测出来偏低；等装完或暂停后再测一次更准。`);
   } else if (ref.speed >= best.rate * 0.75) {
     parts.push(`${install}，已经接近网速上限：慢在下载。`);
   } else if (ref.speed < single * 0.5) {
