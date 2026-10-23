@@ -4,8 +4,6 @@ project(panplay LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# PS5 工具链（ps5-payload-sdk 的 prospero.cmake）会设置 PS5。
-option(PANPLAY_EMBED_UI "把 ui/ 打包进程序" ${PS5})
 option(PANPLAY_EMBED_CATALOG "把 data/panplay-catalog.json 压缩后打包进程序，找不到资料库文件时兜底" ON)
 set(PANPLAY_CA_BUNDLE "" CACHE FILEPATH "PEM 根证书包；为空时下载 curl.se 的 cacert.pem（非 Windows）")
 
@@ -162,22 +160,20 @@ else()
   target_link_libraries(panplay PRIVATE panplay_zlib mbedtls mbedx509 mbedcrypto Threads::Threads)
 endif()
 
-if(PANPLAY_EMBED_UI)
-  set(UI_NAMES index.html app.css app.js)
-  set(UI_FILES ${UI_NAMES})
-  list(TRANSFORM UI_FILES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/ui/")
-  set(UI_CPP "${CMAKE_BINARY_DIR}/generated/embedded_ui.cpp")
-  # 自定义命令里的分号会被拆开，列表改用 | 分隔传给脚本。
-  string(REPLACE ";" "|" UI_FILES_ARG "${UI_FILES}")
-  string(REPLACE ";" "|" UI_NAMES_ARG "${UI_NAMES}")
-  add_custom_command(OUTPUT "${UI_CPP}"
-    COMMAND ${CMAKE_COMMAND} "-DOUTPUT=${UI_CPP}" -DMODE=ui "-DFILES=${UI_FILES_ARG}" "-DNAMES=${UI_NAMES_ARG}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake"
-    DEPENDS ${UI_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake"
-    VERBATIM)
-  target_sources(panplay PRIVATE "${UI_CPP}")
-  target_compile_definitions(panplay PRIVATE PANPLAY_EMBED_UI)
-endif()
+# 界面总是打包进程序，单独一个文件拷到哪都能用；磁盘上有 ui/ 时运行时优先用它。
+set(UI_NAMES index.html app.css app.js)
+set(UI_FILES ${UI_NAMES})
+list(TRANSFORM UI_FILES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/ui/")
+set(UI_CPP "${CMAKE_BINARY_DIR}/generated/embedded_ui.cpp")
+# 自定义命令里的分号会被拆开，列表改用 | 分隔传给脚本。
+string(REPLACE ";" "|" UI_FILES_ARG "${UI_FILES}")
+string(REPLACE ";" "|" UI_NAMES_ARG "${UI_NAMES}")
+add_custom_command(OUTPUT "${UI_CPP}"
+  COMMAND ${CMAKE_COMMAND} "-DOUTPUT=${UI_CPP}" -DMODE=ui "-DFILES=${UI_FILES_ARG}" "-DNAMES=${UI_NAMES_ARG}"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake"
+  DEPENDS ${UI_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake"
+  VERBATIM)
+target_sources(panplay PRIVATE "${UI_CPP}")
 
 if(PANPLAY_EMBED_CATALOG)
   set(CATALOG_JSON "${CMAKE_CURRENT_SOURCE_DIR}/data/panplay-catalog.json")

@@ -23,9 +23,7 @@
 #include "ps5_titles.hpp"
 #endif
 
-#if defined(PANPLAY_EMBED_UI)
 #include "embedded_ui.hpp"
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -179,14 +177,12 @@ std::string read_file(const std::filesystem::path& path) {
 // 磁盘上有 ui/ 目录时优先用它，改界面不用重新编译；没有时用打包进程序的那份。
 std::string ui_file(const std::string& name) {
   std::string bytes = read_file(ui_root() / name);
-#if defined(PANPLAY_EMBED_UI)
   if (bytes.empty()) {
     for (std::size_t i = 0; i < panplay_embedded::file_count; ++i) {
       const auto& file = panplay_embedded::files[i];
       if (name == file.name) return std::string(reinterpret_cast<const char*>(file.data), file.size);
     }
   }
-#endif
   return bytes;
 }
 

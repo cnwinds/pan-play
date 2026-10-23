@@ -94,11 +94,10 @@ jobs:
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-zlib
 
-      # 界面打包进 exe，发出去只有一个文件。
       - name: 编译
         run: |
           set -o pipefail
-          { cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DPANPLAY_EMBED_UI=ON \
+          { cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
               && cmake --build build-win; } 2>&1 | tee build.log \
             || { .github/report-errors.sh build.log; exit 1; }
 

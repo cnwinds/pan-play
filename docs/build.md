@@ -2,6 +2,8 @@
 
 日常使用下载 [Releases](https://github.com/cnwinds/pan-play/releases) 即可，这里是自己编译时用的。
 
+各平台编出来的程序都把 `ui/` 打包在里面，单独一个文件拷到哪都能用；程序旁边（或上一两级目录、当前目录）有 `ui/` 时优先用它，改界面不用重新编译。
+
 ## Windows
 
 装了 CMake：
@@ -30,7 +32,17 @@ $lzma = @(
   & "D:\tools\msys64\mingw64\bin\gcc.exe" -c -O2 "third_party/lzma/$_.c" -o "build/lzma/$_.o"
   "build/lzma/$_.o"
 }
-$src = @(Get-ChildItem core\src\*.cpp, pc\src\*.cpp | ForEach-Object { $_.FullName }) + $unrar + $lzma
+# 界面打包进程序，和 cmake/embed_files.cmake 生成的一样。
+$ui = "index.html","app.css","app.js"
+$body = "#include `"embedded_ui.hpp`"`nnamespace panplay_embedded {`nnamespace {`n"
+for ($i = 0; $i -lt $ui.Count; $i++) {
+  $hex = ([IO.File]::ReadAllBytes("$PWD\ui\$($ui[$i])") | ForEach-Object { "0x{0:x2}," -f $_ }) -join ""
+  $body += "const unsigned char file_$i[] = {${hex}0x00};`n"
+}
+$table = (0..($ui.Count - 1) | ForEach-Object { "  {`"$($ui[$_])`", file_$_, sizeof(file_$_) - 1}," }) -join "`n"
+$body += "}  // namespace`nconst File files[] = {`n$table`n};`nconst std::size_t file_count = $($ui.Count);`n}  // namespace panplay_embedded`n"
+[IO.File]::WriteAllText("$PWD\build\embedded_ui.cpp", $body)
+$src = @(Get-ChildItem core\src\*.cpp, pc\src\*.cpp | ForEach-Object { $_.FullName }) + "build/embedded_ui.cpp" + $unrar + $lzma
 & "D:\tools\msys64\mingw64\bin\g++.exe" -static -std=c++17 -O2 -DRARDLL -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -I core/include -I pc/src -I third_party/unrar -I third_party/lzma @src -lwinhttp -lws2_32 -lz -lole32 -luuid -ladvapi32 -lpowrprof -lshell32 -o build/panplay.exe
 .\build\panplay.exe self-test
 ```
@@ -43,7 +55,7 @@ cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build b
 
 ## PS5
 
-需要 [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk)（clang/lld 18 以上），产物是 `panplay.elf`，界面文件打包在里面：
+需要 [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk)（clang/lld 18 以上），产物是 `panplay.elf`：
 
 ```bash
 export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk

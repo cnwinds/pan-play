@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-// 编译时打包进程序的界面文件。只有定义了 PANPLAY_EMBED_UI 才会链接进来。
+// 编译时打包进程序的界面文件，由 cmake/embed_files.cmake 生成。
 namespace panplay_embedded {
 
 struct File {
