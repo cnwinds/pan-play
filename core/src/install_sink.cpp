@@ -39,7 +39,11 @@ void open_up(const std::filesystem::path& path) {
 
 class LocalWriter final : public FileWriter {
  public:
-  explicit LocalWriter(const std::filesystem::path& path) : out_(path, std::ios::binary | std::ios::trunc) {
+  // libc++ 的 ofstream 默认缓冲只有 4 KB，大块数据也被拆成 4 KB 一次的系统调用；PS5 上这样只能写 25 MB/s。
+  // 缓冲要在 open 之前设才生效。
+  explicit LocalWriter(const std::filesystem::path& path) : buffer_(kBufferBytes) {
+    out_.rdbuf()->pubsetbuf(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+    out_.open(path, std::ios::binary | std::ios::trunc);
     if (out_) open_up(path);
   }
   bool ok() const { return static_cast<bool>(out_); }
@@ -55,6 +59,8 @@ class LocalWriter final : public FileWriter {
   }
 
  private:
+  static constexpr std::size_t kBufferBytes = 4 << 20;
+  std::vector<char> buffer_;
   std::ofstream out_;
 };
 
