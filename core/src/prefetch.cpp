@@ -1026,7 +1026,8 @@ void PrefetchReader::start_locked() {
 
 bool PrefetchReader::fully_assigned() {
   std::lock_guard<std::mutex> lock(mu_);
-  return started_ && error_.empty() && lowest_unassigned_locked() >= size_;
+  // 单条连接时一段直接派到文件尾，派完不代表快下完：还要读到离文件尾不到一个缓冲。
+  return started_ && error_.empty() && lowest_unassigned_locked() >= size_ && size_ - position_ <= budget_;
 }
 
 std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::string* error) {
