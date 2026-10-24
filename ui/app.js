@@ -1736,9 +1736,9 @@ function openDetail(game, opener) {
   });
   unshelve.addEventListener("click", () => {
     const installedNow = ["installed", "update"].includes(game.state);
-    // 按格式分了的游戏只删这一种格式，别的格式还在游戏库里。
+    // 按格式分了的游戏只删这一种格式，别的格式还在游戏库里。没分格式的那份就是游戏目录本身，删它会连别的格式一起删掉。
     const others = (game.variants || []).filter((item) => item.path !== game.path);
-    const oneFormat = Boolean(others.length);
+    const oneFormat = Boolean(others.length) && game.path !== game.game_dir;
     const body = [
       el("p", "", oneFormat ? `会删掉网盘里这个游戏的「${variantLabel(game.variant)}」这种格式：` : "会删掉网盘里这个游戏的整个文件夹："),
       el("code", "confirm-path", game.path),
