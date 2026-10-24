@@ -254,6 +254,8 @@ struct InstallTask {
   std::int64_t rate_base = -1;
   std::chrono::steady_clock::time_point rate_since;
   std::chrono::steady_clock::time_point rate_last;
+  // 全部暂停时停下的：装完这一轮回到队首，不进已完成。
+  bool pausing = false;
 };
 
 // 安装队列：一次只装一个，装完自动接着装下一个。正在装的和排队的会存到磁盘，程序重开后接着装。
@@ -265,6 +267,8 @@ struct InstallQueue {
   std::deque<InstallTask> finished;
   // 正在删除文件（没装完的或整个游戏）的游戏，删完之前不能再加入队列。
   std::set<std::string> discarding;
+  // 全部暂停：排队的不开始，用户点继续之前一直停着；存到磁盘，重开程序后还是暂停的。
+  bool paused = false;
   bool worker_running = false;
   std::thread worker;
 };
@@ -1099,7 +1103,9 @@ void publish_progress(const panplay::InstallResult& snapshot) {
 std::filesystem::path queue_file() { return panplay::app_data_dir() / "install-queue.json"; }
 
 void save_queue_locked() {
-  std::string json = "{\"paths\":[";
+  // 队列空了暂停就没意义了，留着会让之后加入的游戏莫名不开始。
+  if (!installs.current && installs.waiting.empty()) installs.paused = false;
+  std::string json = std::string("{\"paused\":") + (installs.paused ? "true" : "false") + ",\"paths\":[";
   bool first = true;
   const auto add = [&](const InstallTask& task) {
     if (!first) json += ",";
@@ -1208,7 +1214,7 @@ void queue_worker() {
     std::shared_ptr<panplay::CancelToken> cancel;
     {
       std::lock_guard<std::mutex> lock(installs.mu);
-      if (installs.waiting.empty()) {
+      if (installs.waiting.empty() || installs.paused) {
         installs.worker_running = false;
         return;
       }
@@ -1216,6 +1222,8 @@ void queue_worker() {
       installs.waiting.pop_front();
       installs.current->cancel = std::make_shared<panplay::CancelToken>();
       installs.current->result = {};
+      installs.current->rate_base = -1;
+      installs.current->pausing = false;
       installs.current->result.message = "正在读取压缩包…";
       path = installs.current->path;
       cancel = installs.current->cancel;
@@ -1243,14 +1251,19 @@ void queue_worker() {
     installs.current.reset();
     done.result = result;
     done.cancel.reset();
-    installs.finished.push_front(std::move(done));
-    if (installs.finished.size() > kFinishedKept) installs.finished.pop_back();
+    if (done.pausing && result.status == "interrupted") {
+      done.result.message = "已暂停";
+      installs.waiting.push_front(std::move(done));
+    } else {
+      installs.finished.push_front(std::move(done));
+      if (installs.finished.size() > kFinishedKept) installs.finished.pop_back();
+    }
     save_queue_locked();
   }
 }
 
 void start_worker_locked() {
-  if (installs.worker_running || installs.waiting.empty()) return;
+  if (installs.worker_running || installs.paused || installs.waiting.empty()) return;
   if (installs.worker.joinable()) installs.worker.join();
   installs.worker_running = true;
   installs.worker = std::thread(queue_worker);
@@ -1268,7 +1281,11 @@ void load_queue() {
     task.path = item.text;
     installs.waiting.push_back(std::move(task));
   }
-  if (!installs.waiting.empty()) panplay::log_info("上次没装完的队列有 " + std::to_string(installs.waiting.size()) + " 个，接着装");
+  installs.paused = json.boolean_or("paused", false);
+  if (!installs.waiting.empty()) {
+    panplay::log_info("上次没装完的队列有 " + std::to_string(installs.waiting.size()) + " 个，" +
+                      (installs.paused ? "队列是暂停的，等点继续" : "接着装"));
+  }
   start_worker_locked();
 }
 
@@ -1338,7 +1355,8 @@ std::string queue_json() {
   if (installs.current) add(*installs.current, "running");
   for (const auto& task : installs.waiting) add(task, "queued");
   for (const auto& task : installs.finished) add(task, "done");
-  return "{\"tasks\":[" + items + "],\"utc_offset_min\":" + std::to_string(local_utc_offset_minutes()) + "}";
+  return "{\"tasks\":[" + items + "],\"paused\":" + (installs.paused ? "true" : "false") +
+         ",\"utc_offset_min\":" + std::to_string(local_utc_offset_minutes()) + "}";
 }
 
 SpeedReference find_speed_reference() {
@@ -1898,6 +1916,24 @@ void handle_client(SOCKET client, bool local_peer) {
       std::lock_guard<std::mutex> lock(installs.mu);
       installs.finished.clear();
     }
+    reply_json(client, 200, queue_json());
+    return;
+  }
+  // 全部暂停：正在装的停在能续装的地方、回到队首，排队的都不开始；全部继续：从队首接着装。
+  if (method == "POST" && (target == "/api/queue/pause" || target == "/api/queue/resume")) {
+    const bool pause = target == "/api/queue/pause";
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      installs.paused = pause;
+      if (pause && installs.current && installs.current->cancel) {
+        installs.current->pausing = true;
+        installs.current->cancel->cancel();
+        installs.current->result.message = "正在暂停…";
+      }
+      start_worker_locked();
+      save_queue_locked();
+    }
+    panplay::log_info(pause ? "安装队列全部暂停" : "安装队列全部继续");
     reply_json(client, 200, queue_json());
     return;
   }

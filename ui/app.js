@@ -30,6 +30,7 @@ const dockAction = $("#dock-action");
 const dockToggle = $("#dock-toggle");
 const dockPanel = $("#dock-panel");
 const dockClear = $("#dock-clear");
+const dockHeading = $("#dock-heading");
 const queueList = $("#queue-list");
 const form = $("#settings-form");
 const settingsNote = $("#settings-note");
@@ -71,6 +72,8 @@ let loginTimer = 0;
 let metaTimer = 0;
 let metaRounds = 0;
 let tasks = [];
+// 全部暂停：排队的游戏都不开始，等用户点全部继续。
+let queuePaused = false;
 let queueTimer = 0;
 let dockOpen = false;
 let detail = null;
@@ -508,7 +511,11 @@ function taskPace(task) {
 // inDetail：详情页上方已经有百分比和预计几点装完，这一行只写进度和速度；底部进度栏没有，写剩余时间。
 // 文字要短：PS5 自带浏览器里这行太长会把整个抽屉撑宽，每秒变一次就跟着晃。
 function jobText(current, inDetail = false) {
-  if (current.state === "queued") return `排队中，第 ${queuePosition(current.path)} 个`;
+  if (current.state === "queued") {
+    const position = queuePosition(current.path);
+    if (!queuePaused) return `排队中，第 ${position} 个`;
+    return taskStarted(current) ? `已暂停，装到 ${Math.floor(taskFraction(current) * 100)}%` : `已暂停，第 ${position} 个`;
+  }
   if (current.state === "running") {
     if (current.message === "正在暂停…" || current.message === "正在注册到主机桌面…" ||
       (current.message || "").startsWith("安装中断")) return current.message;
@@ -575,6 +582,7 @@ function applyQueue() {
 function setQueue(data) {
   const active = new Set(tasks.filter((task) => task.state !== "done").map((task) => task.path));
   tasks = data.tasks || [];
+  queuePaused = Boolean(data.paused);
   if (Number.isFinite(data.utc_offset_min)) serverUtcOffset = data.utc_offset_min;
   const settled = tasks.filter((task) => task.state === "done" && active.has(task.path)).map((task) => task.path);
   applyQueue();
@@ -659,6 +667,13 @@ function dockSummary() {
   const done = tasks.filter((task) => task.state === "done");
   const waitText = queued.length ? ` · 还有 ${queued.length} 个排队` : "";
   if (running) return { head: running, state: "installing", text: jobText(running) + waitText, p: taskFraction(running) };
+  if (queued.length && queuePaused) {
+    const head = queued[0];
+    const parts = ["已暂停"];
+    if (taskStarted(head)) parts.push(`装到 ${Math.floor(taskFraction(head) * 100)}%`);
+    if (queued.length > 1) parts.push(`还有 ${queued.length - 1} 个等待`);
+    return { head, state: "paused", text: parts.join(" · "), p: taskFraction(head) };
+  }
   if (queued.length) return { head: queued[0], state: "installing", text: "准备安装下一个" + waitText, p: 0 };
   const failed = done.filter((task) => settledState(task) !== "installed").length;
   let text = jobText(done[0]);
@@ -685,9 +700,19 @@ function paintDock() {
     dockArt.replaceChildren(buildArt(summary.head));
   }
   dockMeter.style.setProperty("--p", summary.p);
-  dockAction.hidden = !running && queueBusy();
-  dockAction.textContent = running ? "暂停安装" : "关闭";
-  dockAction.disabled = Boolean(running && running.message === "正在暂停…");
+  // 一个按钮在暂停和继续之间切换，管的是整个队列；只暂停正在装的这一个在展开的列表和详情页里。
+  const pending = tasks.filter((task) => task.state !== "done").length;
+  const pausing = Boolean(running && running.message === "正在暂停…");
+  const resume = !running && queuePaused && pending > 0;
+  let label = "关闭";
+  if (pausing) label = "正在暂停…";
+  else if (resume) label = pending > 1 ? "全部继续" : "继续";
+  else if (pending) label = pending > 1 ? "全部暂停" : "暂停";
+  dockAction.textContent = label;
+  dockAction.className = "btn small " + (resume ? "primary" : "quiet");
+  dockAction.disabled = pausing;
+  dockAction.title = pending && !resume && !pausing ? "正在装的停在能续装的地方，排队的都先不开始" : "";
+  dockHeading.textContent = queuePaused && pending ? "安装队列 · 已暂停" : "安装队列";
   dockToggle.setAttribute("aria-expanded", String(dockOpen));
   dockToggle.setAttribute("aria-label", dockOpen ? "收起安装队列" : "展开安装队列");
   dockPanel.hidden = !dockOpen;
@@ -756,7 +781,7 @@ function paintQueueList() {
       queueRows.set(task.path, row);
     }
     row.task = task;
-    row.item.dataset.state = task.state === "done" ? settledState(task) : task.state;
+    row.item.dataset.state = task.state === "done" ? settledState(task) : task.state === "queued" && queuePaused ? "paused" : task.state;
     row.name.textContent = displayName(task);
     row.status.textContent = jobText(task);
     const artKey = task.cover_url || "";
@@ -781,9 +806,9 @@ function paintQueueList() {
 }
 
 dockAction.addEventListener("click", () => {
-  const running = runningTask();
-  if (running) queueAction("/api/queue/remove", { path: running.path });
-  else queueAction("/api/queue/clear", {});
+  if (!queueBusy()) queueAction("/api/queue/clear", {});
+  else if (!runningTask() && queuePaused) queueAction("/api/queue/resume", {});
+  else queueAction("/api/queue/pause", {});
 });
 
 $("#dock-open").addEventListener("click", () => {
@@ -1123,11 +1148,13 @@ function openDetail(game, opener) {
   const queueText = el("span");
   queueText.setAttribute("role", "status");
   const queueLinks = el("span", "queue-links");
+  const resumeAll = el("button", "link", "全部继续");
+  resumeAll.type = "button";
   const first = el("button", "link", "先装这个");
   first.type = "button";
   const leave = el("button", "link", "移出队列");
   leave.type = "button";
-  queueLinks.append(first, leave);
+  queueLinks.append(resumeAll, first, leave);
   queueRow.append(queueText, queueLinks);
   const status = el("p", "status-text");
   status.setAttribute("role", "status");
@@ -1422,7 +1449,7 @@ function openDetail(game, opener) {
     const position = queued ? queuePosition(game.path) : 0;
     const refused = task && task.state === "done" && task.retryable === false;
     let label = actionText[game.state] || "安装到主机";
-    if (queued) label = "已加入安装队列";
+    if (queued) label = queuePaused ? "已暂停" : "已加入安装队列";
     else if (refused) label = "不能直接安装";
     else if (queueBusy() && ["install", "continue", "update"].includes(game.state)) {
       label = { continue: "排队继续安装", update: "排队安装更新" }[game.state] || "加入安装队列";
@@ -1480,7 +1507,9 @@ function openDetail(game, opener) {
     }
     queueRow.hidden = !queued;
     if (queued) {
-      queueText.textContent = position === 1 ? "排在第 1 个，当前这个装完就开始" : `排在第 ${position} 个`;
+      if (queuePaused) queueText.textContent = `安装队列已暂停，这个排在第 ${position} 个`;
+      else queueText.textContent = position === 1 ? "排在第 1 个，当前这个装完就开始" : `排在第 ${position} 个`;
+      resumeAll.hidden = !queuePaused;
       first.hidden = position <= 1;
     }
     const finished = task && task.state === "done";
@@ -1642,6 +1671,7 @@ function openDetail(game, opener) {
       },
     ], "/api/uninstall", "已从存放位置删除。", more);
   });
+  resumeAll.addEventListener("click", () => queueAction("/api/queue/resume", {}));
   first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));
   leave.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
 

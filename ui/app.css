@@ -1640,7 +1640,8 @@ body.drawer-open { overflow: hidden; }
 
 .queue-item[data-state="installed"] .queue-text span { color: var(--mint); }
 .queue-item[data-state="install"] .queue-text span,
-.queue-item[data-state="continue"] .queue-text span { color: var(--amber); }
+.queue-item[data-state="continue"] .queue-text span,
+.queue-item[data-state="paused"] .queue-text span { color: var(--amber); }
 
 .queue-actions { display: flex; gap: 0.35rem; }
 
@@ -1692,6 +1693,8 @@ body.drawer-open { overflow: hidden; }
 #dock-action { grid-column: 3; grid-row: 1; }
 .dock[data-state="installed"] .dock-meter > span { background: var(--mint); }
 .dock[data-state="error"] .dock-meter > span { background: var(--danger); }
+.dock[data-state="paused"] .dock-meter > span { background: var(--amber); }
+.dock[data-state="paused"] #dock-status { color: var(--amber); }
 
 /* 设置 */
 .settings > h1 {
