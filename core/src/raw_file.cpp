@@ -30,6 +30,8 @@ long long write_some(int fd, const void* data, std::size_t size) {
 }
 int sync_fd(int fd) { return _commit(fd); }
 int close_fd(int fd) { return _close(fd); }
+bool seek_ahead(int fd, std::uint64_t size) { return _lseeki64(fd, static_cast<__int64>(size), SEEK_CUR) >= 0; }
+bool resize_fd(int fd, std::uint64_t size) { return _chsize_s(fd, static_cast<__int64>(size)) == 0; }
 #else
 int open_for_write(const std::filesystem::path& path, bool truncate) {
   return ::open(path.c_str(), O_WRONLY | (truncate ? O_CREAT | O_TRUNC : 0), 0666);
@@ -37,6 +39,8 @@ int open_for_write(const std::filesystem::path& path, bool truncate) {
 long long write_some(int fd, const void* data, std::size_t size) { return ::write(fd, data, size); }
 int sync_fd(int fd) { return ::fsync(fd); }
 int close_fd(int fd) { return ::close(fd); }
+bool seek_ahead(int fd, std::uint64_t size) { return ::lseek(fd, static_cast<off_t>(size), SEEK_CUR) >= 0; }
+bool resize_fd(int fd, std::uint64_t size) { return ::ftruncate(fd, static_cast<off_t>(size)) == 0; }
 #endif
 
 }  // namespace
@@ -58,6 +62,10 @@ bool RawFileOut::write_all(const void* data, std::size_t size) {
   }
   return true;
 }
+
+bool RawFileOut::skip(std::uint64_t size) { return fd_ >= 0 && seek_ahead(fd_, size); }
+
+bool RawFileOut::set_size(std::uint64_t size) { return fd_ >= 0 && resize_fd(fd_, size); }
 
 bool RawFileOut::sync() { return fd_ >= 0 && sync_fd(fd_) == 0; }
 

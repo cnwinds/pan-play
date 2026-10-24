@@ -1383,6 +1383,126 @@ int zip64_split_test() {
   return 0;
 }
 
+int variant_test() {
+  if (variant_format("/apps/panplay/Var PPSA41000/@exfat") != "exfat" || !variant_format("/apps/panplay/Var PPSA41000").empty() ||
+      !variant_format("/apps/panplay/@exfat/Var PPSA41000").empty()) {
+    return fail("认不出格式子目录");
+  }
+  if (game_dir_of("/apps/panplay/Var PPSA41000/@folder") != "/apps/panplay/Var PPSA41000" ||
+      game_dir_of("/apps/panplay/Var PPSA41000") != "/apps/panplay/Var PPSA41000") {
+    return fail("格式子目录找不回游戏目录");
+  }
+  if (is_variant_dir("@") || is_variant_dir("@ExFAT") || !is_variant_dir("@other")) return fail("格式子目录的命名规则不对");
+  if (install_folder_name("/apps/panplay/Var PPSA41000/@exfat") != "PPSA41000") return fail("格式子目录装到了别的文件夹");
+
+  const auto image = pattern(5000, 21);
+  const auto folder = pattern(3000, 22);
+  FakeDrive drive;
+  drive.add("/apps/panplay/Var PPSA41000/@folder/game.zip", make_zip({{"eboot.bin", folder, true}}, {}).front());
+  drive.add("/apps/panplay/Var PPSA41000/@exfat/game.zip", make_zip({{"PPSA41000.exfat", image, false}}, {}).front());
+  drive.add("/apps/panplay/Var PPSA41000/@other/game.zip", make_zip({{"x.bin", folder, false}}, {}).front());
+  std::string error;
+  const auto variants = list_variants(drive, "/apps/panplay/Var PPSA41000", &error);
+  if (!error.empty() || variants.size() != 3 || variants[0].format != "exfat" || variants[1].format != "folder" ||
+      variants[2].format != "other" || variants[0].path != "/apps/panplay/Var PPSA41000/@exfat") {
+    return fail("格式子目录列得不对: " + error);
+  }
+  if (!collect_archives(drive, "/apps/panplay/Var PPSA41000", &error).empty()) return fail("游戏目录把格式子目录里的压缩包也算进来了");
+  if (!list_variants(drive, "/apps/panplay/Var PPSA41000/@exfat", &error).empty()) return fail("格式子目录里又列出了格式");
+
+  drive.add("/apps/panplay/Var PPSA41000/loose.zip", make_zip({{"y.bin", folder, false}}, {}).front());
+  const auto with_loose = list_variants(drive, "/apps/panplay/Var PPSA41000", &error);
+  if (with_loose.size() != 4 || !with_loose.back().format.empty() || with_loose.back().path != "/apps/panplay/Var PPSA41000") {
+    return fail("游戏目录里直接放的压缩包没有算成一个变体");
+  }
+
+  MemorySink sink;
+  InstallRequest request;
+  request.source_dir = "/apps/panplay/Var PPSA41000/@exfat";
+  const InstallResult installed = install_game(drive, sink, request);
+  if (installed.status != "installed") return fail("exFAT 格式没有装上: " + installed.message);
+  if (sink.files["/data/homebrew/PPSA41000/PPSA41000.exfat"].bytes != image) return fail("exFAT 镜像内容不对");
+  const auto marker = sink.files["/data/homebrew/PPSA41000/.panplay-done.json"].bytes;
+  if (std::string(marker.begin(), marker.end()).find("\"variant\":\"exfat\"") == std::string::npos) return fail("完成标记没记格式");
+  if (installed_variant(sink, "/data/homebrew", "/apps/panplay/Var PPSA41000/@folder") != std::optional<std::string>("exfat")) {
+    return fail("读不出装好的是哪种格式");
+  }
+  if (install_game(drive, sink, request).status != "already") return fail("exFAT 格式装完后没有显示已安装");
+
+  request.source_dir = "/apps/panplay/Var PPSA41000/@folder";
+  const InstallResult other = install_game(drive, sink, request);
+  if (other.status != "error" || other.message.find("先删除") == std::string::npos || other.retryable) {
+    return fail("装了 exFAT 后又装文件夹版没有被拦住: " + other.message);
+  }
+  if (sink.files.count("/data/homebrew/PPSA41000/eboot.bin") != 0) return fail("拦住另一种格式之前写了文件");
+  std::string list_error;
+  const auto folder_sets = group_archives(collect_archives(drive, request.source_dir, &list_error));
+  if (install_outdated(sink, "/data/homebrew", request.source_dir, folder_sets)) return fail("另一种格式不该显示有更新");
+
+  if (!uninstall_game(sink, "/data/homebrew", request.source_dir).empty()) return fail("从另一种格式删除已装的游戏失败");
+  if (installed_variant(sink, "/data/homebrew", request.source_dir).has_value()) return fail("删除后还认为装着 exFAT");
+  if (install_game(drive, sink, request).status != "installed") return fail("删掉 exFAT 后装不上文件夹版");
+  if (sink.files["/data/homebrew/PPSA41000/eboot.bin"].bytes != folder) return fail("文件夹版内容不对");
+
+  // 旧版本装的完成标记没有 variant，认作和哪种格式都对得上。
+  MemorySink legacy;
+  request.source_dir = "/apps/panplay/Var PPSA41000/@folder";
+  if (install_game(drive, legacy, request).status != "installed") return fail("文件夹版没装上");
+  auto& done = legacy.files["/data/homebrew/PPSA41000/.panplay-done.json"];
+  std::string text(done.bytes.begin(), done.bytes.end());
+  const auto at = text.find(",\"variant\":\"folder\"");
+  if (at == std::string::npos) return fail("完成标记里找不到文件夹版的格式");
+  text.erase(at, std::strlen(",\"variant\":\"folder\""));
+  done.bytes.assign(text.begin(), text.end());
+  done.size = static_cast<std::int64_t>(text.size());
+  if (installed_variant(legacy, "/data/homebrew", request.source_dir).has_value()) return fail("没记格式的完成标记读出了格式");
+  if (install_game(drive, legacy, request).status != "already") return fail("没记格式的旧安装没有显示已安装");
+  return 0;
+}
+
+int sparse_write_test() {
+  // 镜像里大段全零的 4 MB 块跳过不写，文件结尾是空洞时要把文件补到原来的大小。
+  constexpr std::size_t kBlock = 4u << 20;
+  const auto root = std::filesystem::temp_directory_path() / "panplay-sparse-test";
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  auto local = make_local_sink(root.u8string());
+  const auto data = pattern(kBlock, 31);
+  const std::vector<std::uint8_t> zeros(kBlock, 0);
+  std::vector<std::uint8_t> almost(kBlock, 0);
+  almost.back() = 7;
+  struct Case {
+    const char* name;
+    std::vector<const std::vector<std::uint8_t>*> blocks;
+  };
+  const std::vector<Case> cases = {{"head", {&zeros, &data}}, {"tail", {&data, &zeros, &zeros}}, {"mid", {&data, &zeros, &almost}},
+                                   {"all", {&zeros, &zeros}}};
+  for (const auto& test : cases) {
+    std::vector<std::uint8_t> expect;
+    for (const auto* block : test.blocks) expect.insert(expect.end(), block->begin(), block->end());
+    std::string error;
+    const std::string path = std::string("/") + test.name + ".exfat";
+    auto writer = local->open_writer(path, static_cast<std::int64_t>(expect.size()), &error);
+    if (!writer) return fail("稀疏写开不了文件: " + error);
+    for (const auto* block : test.blocks) {
+      // 分两半写，全零块也可能被拆开送进来。
+      const std::size_t half = block->size() / 2;
+      if (!writer->write(block->data(), half).empty() || !writer->write(block->data() + half, block->size() - half).empty()) {
+        return fail(std::string("稀疏写写不进去: ") + test.name);
+      }
+    }
+    if (!writer->finish().empty()) return fail(std::string("稀疏写收尾失败: ") + test.name);
+    writer.reset();
+    std::ifstream in(root / (std::string(test.name) + ".exfat"), std::ios::binary);
+    const std::vector<std::uint8_t> got(std::istreambuf_iterator<char>(in), {});
+    if (got.size() != expect.size()) return fail(std::string("稀疏写后文件大小不对: ") + test.name);
+    if (got != expect) return fail(std::string("稀疏写后文件内容不对: ") + test.name);
+  }
+  local.reset();
+  std::filesystem::remove_all(root, ec);
+  return 0;
+}
+
 int large_file_test() {
   // 一个超过 4 GB 的文件，存储方式，ZIP64。内容是重复的 1 MB 块，CRC 用 crc32_combine 直接算。
   constexpr std::int64_t kBlock = 1 << 20;
@@ -2189,6 +2309,8 @@ int run_install_pipeline_self_test() {
   if (const int code = package_and_duplicate_test()) return code;
   if (const int code = many_files_test()) return code;
   if (const int code = zip64_split_test()) return code;
+  if (const int code = variant_test()) return code;
+  if (const int code = sparse_write_test()) return code;
   if (const int code = cancel_install_test()) return code;
   if (const int code = large_file_test()) return code;
   if (const int code = sevenzip_test()) return code;

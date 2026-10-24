@@ -9,6 +9,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -166,11 +167,14 @@ std::string extract_7z_entries(DrivePlugin& drive, InstallSink& sink, const std:
                                std::vector<FinishedFile>* done);
 
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request);
-// 游戏已经装好，但网盘目录里（除去 skip_sets）的压缩包和装的时候不一样了（比如多了补丁）。没装好时返回 false。
+// 游戏已经装好，但网盘目录里（除去 skip_sets）的压缩包和装的时候不一样了（比如多了补丁）。
+// 没装好、装的是这款游戏的另一种格式时返回 false。
 bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
                       const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets = {});
 // 已装好的游戏按顺序叠了哪些压缩包组（archive_set_id）。没装好或旧版本装的返回空。
 std::vector<std::string> installed_sets(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
+// 这款游戏装好的是哪种格式（variant_format）。没装好时为空 optional；旧版本装的、完成标记里没记格式的也为空 optional。
+std::optional<std::string> installed_variant(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 // 删掉没装完的游戏留在暂存区的全部文件，之后只能从头装。已经装好的游戏不受影响。
 std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 // 从存放位置删掉这个游戏的整个文件夹，连同没装完时留下的暂存文件。

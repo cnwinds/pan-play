@@ -283,8 +283,15 @@ constexpr std::size_t kFinishedKept = 50;
 std::map<std::string, std::string> queue_states() {
   std::lock_guard<std::mutex> lock(installs.mu);
   std::map<std::string, std::string> states;
-  if (installs.current) states[installs.current->path] = "installing";
-  for (const auto& task : installs.waiting) states[task.path] = "queued";
+  // 装的是某种格式（变体目录）时，游戏库列表里按游戏目录也显示出来。
+  for (auto task = installs.waiting.rbegin(); task != installs.waiting.rend(); ++task) {
+    states[panplay::game_dir_of(task->path)] = "queued";
+    states[task->path] = "queued";
+  }
+  if (installs.current) {
+    states[panplay::game_dir_of(installs.current->path)] = "installing";
+    states[installs.current->path] = "installing";
+  }
   return states;
 }
 
@@ -542,9 +549,17 @@ std::string folder_json(const std::string& name, const std::string& path, const 
          meta_fields + "}";
 }
 
+// 游戏目录名。path 是按格式分的变体目录（…/PPSA01234/@exfat）时取上一层。
 std::string folder_name_of(const std::string& path) {
-  const auto slash = path.find_last_of('/');
-  return slash == std::string::npos ? path : path.substr(slash + 1);
+  const std::string game_dir = panplay::game_dir_of(path);
+  const auto slash = game_dir.find_last_of('/');
+  return slash == std::string::npos ? game_dir : game_dir.substr(slash + 1);
+}
+
+// 评价、盘架里格式的叫法：变体目录 @other 在盘架里叫 unknown。
+std::string review_format(const std::string& path) {
+  const std::string format = panplay::variant_format(path);
+  return format == "other" ? "unknown" : format;
 }
 
 std::string image_type(const std::string& bytes) {
@@ -665,6 +680,22 @@ std::string ascii_lower(std::string text) {
   return text;
 }
 
+// 游戏库格子上显示哪个版本的评价：游戏目录按格式分了的，取装着的那种格式，没装就取第一个评过的。
+std::string listed_fingerprint(const std::string& key, const std::string& path) {
+  const std::string own = cached_game_fingerprint(key, path);
+  if (!own.empty()) return own;
+  const auto detail = cached_game_detail(key, path);
+  if (!detail || detail->variants.empty()) return "";
+  std::string first;
+  for (const auto& variant : panplay::Json::parse(detail->variants, nullptr).array) {
+    const std::string fingerprint = cached_game_fingerprint(key, variant.str("path"));
+    if (fingerprint.empty() || !find_review(fingerprint)) continue;
+    if (variant.str("format") == detail->installed_variant) return fingerprint;
+    if (first.empty()) first = fingerprint;
+  }
+  return first;
+}
+
 // 一页游戏。filter 是 all/installed/continue（装到一半）/todo（没装过），q 匹配目录名、Title ID、展示名和英文名。
 // cn=1 只留商店标了中文字幕或语音的，multi=1 只留支持两人以上的；sort 是 rating/release/name，不传按目录顺序。
 // total 是符合筛选的总数，all/installed 是整个游戏库的数量。
@@ -719,7 +750,7 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     const std::string shown = search_text.substr(0, search_text.find('\n'));
     // 打开过详情、读过压缩包的才知道指纹；没读过的不查，列表不为这个多发请求。
     std::string review_field;
-    if (const auto review = find_review(cached_game_fingerprint(listing->key, folder.path))) {
+    if (const auto review = find_review(listed_fingerprint(listing->key, folder.path))) {
       review_field = std::string(",\"review_state\":\"") + (review->playable ? "good" : "bad") + "\"";
     }
     rows.push_back({folder_json(folder.name, folder.path, folder.title_id, state, meta + review_field),
@@ -822,6 +853,17 @@ std::string layers_json(const panplay::GameFolder& game, const std::set<std::str
 GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& path,
                             const std::optional<GameDetail>& fallback, std::string* error) {
   GameDetail detail;
+  const auto variants = panplay::list_variants(drive, panplay::game_dir_of(path), error);
+  if (!error->empty()) return detail;
+  if (!variants.empty()) {
+    detail.variants = "[";
+    for (const auto& variant : variants) {
+      if (detail.variants.size() > 1) detail.variants += ",";
+      detail.variants += "{\"format\":\"" + panplay::json_escape(variant.format) + "\",\"path\":\"" +
+                         panplay::json_escape(variant.path) + "\"}";
+    }
+    detail.variants += "]";
+  }
   const auto files = panplay::collect_archives(drive, path, error);
   if (!error->empty()) return detail;
   panplay::GameFolder game;
@@ -839,20 +881,34 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
   const std::string dest = settings.dest();
   if (!dest.empty() && panplay::parse_destination(dest, &destination, &dest_error)) {
     detail.state = archive_problem(game);
+    // 按格式分了的游戏目录本身没有压缩包；详情页要知道主机上装的是哪种格式，默认打开那一种。
+    if (detail.state == "empty" && !variants.empty()) {
+      if (auto sink = panplay::open_destination(destination, &dest_error)) {
+        detail.installed_variant = panplay::installed_variant(*sink, settings.prefix(), path).value_or("");
+      }
+    }
   }
   if (detail.state.empty()) {
     if (auto sink = panplay::open_destination(destination, &dest_error)) {
       detail.state = game_state(*sink, settings.prefix(), game);
       // 装好之后网盘里又放了补丁（或改了要装哪些）：读一下这款游戏的完成标记，和现在要装的压缩包对一下。
       if (detail.state == "installed") {
-        if (panplay::install_outdated(*sink, settings.prefix(), path, game.sets, load_skipped_sets(path))) {
-          detail.state = "update";
+        const auto installed_variant = panplay::installed_variant(*sink, settings.prefix(), path);
+        detail.installed_variant = installed_variant.value_or("");
+        // 主机上装的是这款游戏的另一种格式。
+        if (!variants.empty() && installed_variant && *installed_variant != panplay::variant_format(path)) {
+          detail.state = "other";
+        } else {
+          if (panplay::install_outdated(*sink, settings.prefix(), path, game.sets, load_skipped_sets(path))) {
+            detail.state = "update";
+          }
+          detail.installed = panplay::installed_sets(*sink, settings.prefix(), path);
         }
-        detail.installed = panplay::installed_sets(*sink, settings.prefix(), path);
       }
     } else if (fallback && fallback->state != "need-settings") {
       detail.state = fallback->state;
       detail.installed = fallback->installed;
+      detail.installed_variant = fallback->installed_variant;
     } else if (const auto listing = cached_shelf(settings); listing && listing->sink_ready) {
       detail.state = shelf_state(listing->placement, game.name, game.title_id, path);
     } else {
@@ -939,6 +995,7 @@ void review_install_package(const std::string& path, const std::string& set_id) 
   review.fingerprint = detail->fingerprint;
   review.title_id = panplay::find_title_id(folder_name_of(path));
   review.name = game_display_name(path);
+  review.format = review_format(path);
   review.playable = false;
   review.note = "是 PKG 安装包，盘游装不了（安装时自动标记）";
 #if defined(PANPLAY_PS5)
@@ -1030,11 +1087,12 @@ std::string one_game_json(const std::string& path, bool cached) {
   std::string state = detail ? detail->state : "";
   if (cached && detail) {
     // 是否装在主机上以列表读到的为准（和格子上显示的一致），详情缓存只补上列表不知道的“有更新”。
-    const bool placement = state == "install" || state == "continue" || state == "installed" || state == "update";
+    const bool placement = state == "install" || state == "continue" || state == "installed" || state == "update" ||
+                           state == "other";
     const auto listing = cached_shelf(settings);
     if (placement && listing && listing->sink_ready) {
       const std::string listed = shelf_state(listing->placement, name, title_id, path);
-      state = listed == "installed" && state == "update" ? "update" : listed;
+      state = listed == "installed" && (state == "update" || state == "other") ? state : listed;
     }
   } else if (!cached) {
     std::string error;
@@ -1050,8 +1108,12 @@ std::string one_game_json(const std::string& path, bool cached) {
     state = live.state;
   }
   std::string json = "{\"name\":\"" + panplay::json_escape(name) + "\",\"path\":\"" + panplay::json_escape(path) +
-                     "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\",\"source\":\"" + source + "\"";
+                     "\",\"game_dir\":\"" + panplay::json_escape(panplay::game_dir_of(path)) + "\",\"variant\":\"" +
+                     panplay::json_escape(panplay::variant_format(path)) + "\",\"title_id\":\"" +
+                     panplay::json_escape(title_id) + "\",\"source\":\"" + source + "\"";
   if (detail) {
+    json += ",\"variants\":" + (detail->variants.empty() ? std::string("[]") : detail->variants) +
+            ",\"installed_variant\":\"" + panplay::json_escape(detail->installed_variant) + "\"";
     std::string resume = "null";
     if (state == "continue") {
       if (const auto progress = load_install_progress(path)) {
@@ -1379,11 +1441,13 @@ std::string rate_fields(const InstallTask& task, bool running) {
 }
 
 std::string task_json(const InstallTask& task, const char* state, const NameOverrides& overrides) {
-  const std::string name = task.path.substr(task.path.find_last_of('/') + 1);
+  const std::string name = folder_name_of(task.path);
   const std::string title_id = panplay::find_title_id(name);
   const panplay::InstallResult& r = task.result;
   return std::string("{\"path\":\"") + panplay::json_escape(task.path) + "\",\"name\":\"" + panplay::json_escape(name) +
-         "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\",\"state\":\"" + state + "\",\"status\":\"" +
+         "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\",\"game_dir\":\"" +
+         panplay::json_escape(panplay::game_dir_of(task.path)) + "\",\"variant\":\"" +
+         panplay::json_escape(panplay::variant_format(task.path)) + "\",\"state\":\"" + state + "\",\"status\":\"" +
          panplay::json_escape(r.status) + "\",\"message\":\"" + panplay::json_escape(r.message) +
          "\",\"files_done\":" + std::to_string(r.files_done) + ",\"files_total\":" + std::to_string(r.files_total) +
          ",\"bytes_done\":" + std::to_string(r.bytes_done) + ",\"bytes_total\":" + std::to_string(r.bytes_total) +
@@ -2133,6 +2197,7 @@ void handle_client(SOCKET client, bool local_peer) {
     review.fingerprint = detail->fingerprint;
     review.title_id = panplay::find_title_id(folder_name_of(path));
     review.name = game_display_name(path);
+    review.format = review_format(path);
     review.playable = json.boolean_or("playable", true);
     review.note = trimmed(json.str("note"));
     if (review.note.size() > 300) {
@@ -2221,8 +2286,10 @@ void handle_client(SOCKET client, bool local_peer) {
       reply_json(client, 500, json_error(error));
       return;
     }
+    // 按格式分了的游戏可以只删一种格式（变体目录）。
+    const std::string game_dir = panplay::game_dir_of(path);
     const auto folder = std::find_if(listing->folders.begin(), listing->folders.end(),
-                                     [&](const ShelfListing::Folder& item) { return item.path == path; });
+                                     [&](const ShelfListing::Folder& item) { return item.path == game_dir; });
     if (folder == listing->folders.end()) {
       reply_json(client, 400, json_error("游戏库目录里没有这个文件夹，可能已经从网盘删掉了"));
       return;
@@ -2238,9 +2305,12 @@ void handle_client(SOCKET client, bool local_peer) {
     }
     {
       std::lock_guard<std::mutex> lock(installs.mu);
-      const bool queued = (installs.current && installs.current->path == path) ||
+      const auto hit = [&](const std::string& task_path) {
+        return task_path == path || panplay::game_dir_of(task_path) == path;
+      };
+      const bool queued = (installs.current && hit(installs.current->path)) ||
                           std::any_of(installs.waiting.begin(), installs.waiting.end(),
-                                      [&](const InstallTask& task) { return task.path == path; });
+                                      [&](const InstallTask& task) { return hit(task.path); });
       if (queued) {
         reply_json(client, 409, json_error("这个游戏还在安装队列里，先取消再从网盘删除"));
         return;
@@ -2284,9 +2354,11 @@ void handle_client(SOCKET client, bool local_peer) {
     }
     {
       std::lock_guard<std::mutex> lock(installs.mu);
-      const bool queued = (installs.current && installs.current->path == path) ||
+      // 几种格式装在同一个文件夹，另一种格式在排队也不能删。
+      const auto same_game = [&](const std::string& other) { return panplay::game_dir_of(other) == panplay::game_dir_of(path); };
+      const bool queued = (installs.current && same_game(installs.current->path)) ||
                           std::any_of(installs.waiting.begin(), installs.waiting.end(),
-                                      [&](const InstallTask& task) { return task.path == path; });
+                                      [&](const InstallTask& task) { return same_game(task.path); });
       if (queued) {
         reply_json(client, 409, json_error("这个游戏还在安装队列里，先取消再删除"));
         return;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 
 namespace panplay {
@@ -18,6 +19,9 @@ class RawFileOut {
   bool open(const std::filesystem::path& path);  // 新建或清空
   bool ok() const { return fd_ >= 0; }
   bool write_all(const void* data, std::size_t size);
+  // 往后跳过 size 字节不写，留成空洞（读出来是 0）。跳到结尾时要 set_size 把文件撑到那么长。
+  bool skip(std::uint64_t size);
+  bool set_size(std::uint64_t size);
   bool sync();
   bool close();
 

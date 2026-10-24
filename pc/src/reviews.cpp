@@ -60,6 +60,7 @@ GameReview parse_review(const panplay::Json& node) {
   review.playable = node.boolean_or("playable", true);
   review.note = node.str("note");
   review.firmware = node.str("firmware");
+  review.format = node.str("format");
   review.at = static_cast<std::int64_t>(node.num("at"));
   review.removed = node.boolean_or("removed", false);
   if (const panplay::Json* layers = node.get("layers")) {
@@ -241,6 +242,7 @@ std::string review_json(const GameReview& review) {
             ",\"name\":\"" + json_escape(review.parts[i].name) + "\"}";
   }
   json += "]";
+  if (!review.format.empty()) json += ",\"format\":\"" + json_escape(review.format) + "\"";
   if (review.removed) json += ",\"removed\":true";
   if (!review.device.empty()) json += ",\"device\":\"" + json_escape(review.device) + "\"";
   return json + "}";

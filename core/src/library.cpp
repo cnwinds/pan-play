@@ -129,6 +129,30 @@ std::string find_title_id(const std::string& name) {
   return "";
 }
 
+bool is_variant_dir(const std::string& name) {
+  if (name.size() < 2 || name[0] != '@') return false;
+  return std::all_of(name.begin() + 1, name.end(), [](char ch) {
+    return std::islower(static_cast<unsigned char>(ch)) || std::isdigit(static_cast<unsigned char>(ch));
+  });
+}
+
+std::string variant_format(const std::string& path) {
+  std::string trimmed = path;
+  while (trimmed.size() > 1 && trimmed.back() == '/') trimmed.pop_back();
+  const auto slash = trimmed.rfind('/');
+  const std::string name = slash == std::string::npos ? trimmed : trimmed.substr(slash + 1);
+  return is_variant_dir(name) ? name.substr(1) : "";
+}
+
+std::string game_dir_of(const std::string& path) {
+  if (variant_format(path).empty()) return path;
+  std::string trimmed = path;
+  while (trimmed.size() > 1 && trimmed.back() == '/') trimmed.pop_back();
+  const auto slash = trimmed.rfind('/');
+  if (slash == std::string::npos) return path;
+  return slash == 0 ? "/" : trimmed.substr(0, slash);
+}
+
 std::vector<ArchiveSet> group_archives(const std::vector<DriveEntry>& files) {
   std::set<std::string> z_stems;
   std::set<std::string> old_rar_stems;
@@ -220,6 +244,7 @@ std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& 
   for (const auto& entry : entries) {
     const std::string path = entry.path.empty() ? join_storage_path(dir, entry.name) : entry.path;
     if (entry.is_dir) {
+      if (is_variant_dir(entry.name)) continue;
       const auto nested = drive.list(path, error);
       if (error && !error->empty()) return {};
       for (auto nested_entry : nested) {
@@ -234,6 +259,28 @@ std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& 
     }
   }
   return files;
+}
+
+std::vector<GameVariant> list_variants(DrivePlugin& drive, const std::string& game_dir, std::string* error) {
+  std::vector<GameVariant> variants;
+  const auto entries = drive.list(game_dir, error);
+  if (error && !error->empty()) return {};
+  bool loose = false;
+  for (const auto& entry : entries) {
+    if (!entry.is_dir) {
+      loose = loose || is_archive_name(entry.name);
+      continue;
+    }
+    if (!is_variant_dir(entry.name)) continue;
+    variants.push_back({entry.name.substr(1), entry.path.empty() ? join_storage_path(game_dir, entry.name) : entry.path});
+  }
+  const auto rank = [](const std::string& format) { return format == "exfat" ? 0 : format == "folder" ? 1 : 2; };
+  std::sort(variants.begin(), variants.end(), [&](const GameVariant& left, const GameVariant& right) {
+    if (rank(left.format) != rank(right.format)) return rank(left.format) < rank(right.format);
+    return left.format < right.format;
+  });
+  if (!variants.empty() && loose) variants.push_back({"", game_dir});
+  return variants;
 }
 
 std::string archive_sets_signature(const std::vector<ArchiveSet>& sets) {

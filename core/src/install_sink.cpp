@@ -59,10 +59,9 @@ class LocalWriter final : public FileWriter {
     if (failed_) return "写入中断";
     while (size > 0) {
       if (buffer_.empty() && size >= kBufferBytes) {
-        const std::size_t whole = size - size % kBufferBytes;
-        if (!out_.write_all(data, whole)) return fail();
-        data += whole;
-        size -= whole;
+        if (!put(data, kBufferBytes)) return fail();
+        data += kBufferBytes;
+        size -= kBufferBytes;
         continue;
       }
       const std::size_t take = std::min(size, kBufferBytes - buffer_.size());
@@ -75,7 +74,8 @@ class LocalWriter final : public FileWriter {
   }
 
   std::string finish() override {
-    const bool flushed = !failed_ && flush();
+    bool flushed = !failed_ && flush();
+    if (flushed && ends_in_hole_) flushed = out_.set_size(total_);
     const bool closed = out_.close();
     return flushed && closed ? "" : "写入中断";
   }
@@ -85,9 +85,20 @@ class LocalWriter final : public FileWriter {
     if (buffer_.empty()) return true;
     // finish、析构时补写的最后一块也算写入，不算开关文件。
     PhaseScope timing(InstallPhase::write);
-    const bool written = out_.write_all(buffer_.data(), buffer_.size());
+    const bool written = put(buffer_.data(), buffer_.size());
     buffer_.clear();
     return written;
+  }
+  // 整块都是 0 的跳过不写，留成空洞：exFAT 镜像里大半是没用到的空间，解出来上百 GB 的 0，
+  // 跳过既省写盘时间，也不占主机空间。不支持空洞的文件系统会自己补 0，读出来一样。
+  bool put(const std::uint8_t* data, std::size_t size) {
+    total_ += size;
+    if (size == kBufferBytes && data[0] == 0 && std::memcmp(data, data + 1, size - 1) == 0) {
+      ends_in_hole_ = true;
+      return out_.skip(size);
+    }
+    ends_in_hole_ = false;
+    return out_.write_all(data, size);
   }
   std::string fail() {
     failed_ = true;
@@ -97,6 +108,8 @@ class LocalWriter final : public FileWriter {
   static constexpr std::size_t kBufferBytes = 4 << 20;
   std::vector<std::uint8_t> buffer_;
   RawFileOut out_;
+  std::uint64_t total_ = 0;
+  bool ends_in_hole_ = false;
   bool failed_ = false;
 };
 

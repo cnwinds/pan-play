@@ -21,10 +21,26 @@ struct GameFolder {
   std::vector<ArchiveSet> sets;
 };
 
+// 同一款游戏的几种格式（exFAT 镜像、文件夹……）在游戏目录下各占一个 @格式 子目录（@exfat、@folder、@other），
+// 每个子目录就是一个变体，安装、评价都按变体目录走。见 docs/adr/0007。
+struct GameVariant {
+  std::string format;  // 子目录名去掉 @；游戏目录里直接放着压缩包时为空
+  std::string path;
+};
+
 std::string join_storage_path(std::string prefix, const std::string& relative);
 std::string find_title_id(const std::string& name);
+bool is_variant_dir(const std::string& name);
+// 变体目录的格式（"@exfat" → "exfat"），不是变体目录时为空。
+std::string variant_format(const std::string& path);
+// 变体目录所在的游戏目录；本身就是游戏目录时原样返回。
+std::string game_dir_of(const std::string& path);
 std::vector<ArchiveSet> group_archives(const std::vector<DriveEntry>& files);
+// 游戏目录和下一层子目录里的压缩包；@格式 子目录是别的变体，不算。
 std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& dir, std::string* error);
+// 游戏目录下的各个变体，按 exfat、folder、其他的顺序。没分格式时为空；分了格式、游戏目录里又直接放着压缩包时，
+// 游戏目录本身也算一个（format 为空），排在最后。
+std::vector<GameVariant> list_variants(DrivePlugin& drive, const std::string& game_dir, std::string* error);
 std::vector<GameFolder> scan_library(DrivePlugin& drive, const std::string& root, std::string* error);
 
 // 一组压缩包的身份：各分卷的文件名和大小。安装记录、补丁选择都按它认。

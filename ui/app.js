@@ -209,8 +209,9 @@ function buildArt(game, className) {
 
 /* 安装队列：服务器一次装一个，tasks 依次是正在装的、排队的、最近完成的 */
 
+// 装的是某种格式（变体目录）时，按游戏目录也找得到，游戏库格子上跟着显示。
 function taskFor(path) {
-  return tasks.find((task) => task.path === path) || null;
+  return tasks.find((task) => task.path === path) || tasks.find((task) => task.game_dir === path) || null;
 }
 
 function runningTask() {
@@ -832,8 +833,15 @@ const actionText = {
   installing: "正在安装…",
   unsupported: "这种压缩包还不能安装",
   empty: "目录里没有压缩包",
+  other: "主机上装的是另一种格式",
   "need-settings": "先到设置里填写存放位置",
 };
+
+// 网盘上同一款游戏按格式分的子目录（@exfat、@folder、@other）。
+const variantText = { exfat: "exFAT 镜像", folder: "文件夹", other: "其他格式", unknown: "其他格式", "": "没分格式" };
+function variantLabel(format) {
+  return variantText[format] ?? format;
+}
 
 // 主机桌面注册状态。healthy 时状态写在主按钮上，不另起一行；其余给一句提示和要做的操作，不能注册时没有按钮。
 function consoleSummary(info) {
@@ -1327,6 +1335,7 @@ function openDetail(game, opener) {
         ? (shown.playable ? `${who}标记过这个版本能正常玩` : `${who}标记过这个版本有问题${note}`)
         : `这个游戏的另一个版本${who}标记过${shown.playable ? "能玩" : "有问题" + note}`;
       const meta = [shown.firmware ? `固件 ${shown.firmware}` : "固件未知", reviewWhen(shown)];
+      if (shown.format) meta.unshift(variantLabel(shown.format) + "版");
       if (own && !sameLayers(shown, installedNow)) meta.push("当时装的补丁和现在不同");
       reviewMeta.textContent = meta.join(" · ");
     }
@@ -1373,7 +1382,54 @@ function openDetail(game, opener) {
     paint();
   });
 
-  install.append(reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
+  // 网盘上这款游戏有几种格式时选装哪一种。主机上同时只能装一种，换格式要先删掉装着的。
+  const variantRow = el("div", "variant-row");
+  variantRow.setAttribute("role", "radiogroup");
+  variantRow.setAttribute("aria-label", "格式");
+  let variantKey = null;
+  const switchVariant = (path) => {
+    if (path === game.path) return;
+    game.path = path;
+    game.variant = (game.variants || []).find((item) => item.path === path)?.format ?? "";
+    for (const field of ["layers", "review", "other_review", "fingerprint", "resume", "console"]) delete game[field];
+    game.formats = "";
+    game.archive_bytes = 0;
+    game.state = "install";
+    archivesRead = false;
+    reviewMode = "";
+    picking = false;
+    say("");
+    paint();
+    loadCached();
+    reload();
+  };
+  // 打开的是游戏目录本身、它又按格式分了：默认打开主机上装着的那种，没装就按 exFAT、文件夹、其他的顺序取第一个。
+  const pickVariant = () => {
+    const variants = game.variants || [];
+    if (!variants.length || variants.some((item) => item.path === game.path)) return false;
+    const installed = variants.find((item) => item.format === game.installed_variant && game.installed_variant);
+    switchVariant((installed || variants[0]).path);
+    return true;
+  };
+  const paintVariants = (busy) => {
+    const variants = game.variants || [];
+    variantRow.hidden = variants.length < 2 || picking || confirm.open;
+    const key = JSON.stringify([variants, game.path, game.installed_variant, busy]);
+    if (variantRow.hidden || key === variantKey) return;
+    variantKey = key;
+    variantRow.replaceChildren(el("span", "variant-label", "格式"), ...variants.map((item) => {
+      const button = el("button", "chip-toggle", variantLabel(item.format));
+      button.type = "button";
+      button.setAttribute("role", "radio");
+      button.setAttribute("aria-checked", String(item.path === game.path));
+      if (item.format === game.installed_variant && game.installed_variant) button.append(el("span", "variant-installed", "已装"));
+      button.disabled = busy && item.path !== game.path;
+      button.addEventListener("click", () => switchVariant(item.path));
+      return button;
+    }));
+  };
+
+  install.append(variantRow, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1457,13 +1513,14 @@ function openDetail(game, opener) {
     else if (queueBusy() && ["install", "continue", "update"].includes(game.state)) {
       label = { continue: "排队继续安装", update: "排队安装更新" }[game.state] || "加入安装队列";
     }
+    if (game.state === "other" && game.installed_variant) label = `主机上装的是${variantLabel(game.installed_variant)}版`;
     if (waitingLayers) label = "正在读取压缩包…";
     if (unshelved) label = "已从网盘删除";
     const onConsole = game.console && ["installed", "update"].includes(game.state) ? consoleSummary(game.console) : null;
     if (game.state === "installed" && onConsole && onConsole.healthy) label = "已安装 · 已在主机桌面";
     action.textContent = label;
     action.classList.toggle("done", game.state === "installed");
-    action.disabled = unshelved || waitingLayers || running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
+    action.disabled = unshelved || waitingLayers || running || queued || refused || ["installed", "unsupported", "empty", "other"].includes(game.state) ||
       (game.state !== "need-settings" && archivesRead && !game.formats);
     if (picking && (running || queued)) {
       picking = false;
@@ -1472,8 +1529,9 @@ function openDetail(game, opener) {
     if (confirm.open && !confirm.busy && (running || queued)) confirm.close();
     actionRow.hidden = picking || confirm.open;
     const busy = running || queued;
+    paintVariants(busy || unshelved);
     discard.hidden = game.state !== "continue" || busy;
-    remove.hidden = !["installed", "update"].includes(game.state) || busy;
+    remove.hidden = !["installed", "update", "other"].includes(game.state) || busy;
     adjust.hidden = game.state !== "installed" || busy || (game.layers || []).length < 2;
     registerItem.hidden = !onConsole || Boolean(game.console.problem) || busy || consoleBusy;
     registerItem.textContent = onConsole && onConsole.healthy ? "重新注册到主机桌面" : "注册到主机桌面";
@@ -1678,10 +1736,18 @@ function openDetail(game, opener) {
   });
   unshelve.addEventListener("click", () => {
     const installedNow = ["installed", "update"].includes(game.state);
-    const body = [el("p", "", "会删掉网盘里这个游戏的整个文件夹："), el("code", "confirm-path", game.path)];
-    body.push(el("p", "", installedNow
-      ? "主机上装好的游戏不受影响，照样能玩；但它会从盘游的游戏库里消失，以后在盘游里就删不了它了。"
-      : "删除后它会从游戏库里消失。"));
+    // 按格式分了的游戏只删这一种格式，别的格式还在游戏库里。
+    const others = (game.variants || []).filter((item) => item.path !== game.path);
+    const oneFormat = Boolean(others.length);
+    const body = [
+      el("p", "", oneFormat ? `会删掉网盘里这个游戏的「${variantLabel(game.variant)}」这种格式：` : "会删掉网盘里这个游戏的整个文件夹："),
+      el("code", "confirm-path", game.path),
+    ];
+    body.push(el("p", "", oneFormat
+      ? `${installedNow ? "主机上装好的游戏不受影响。" : ""}别的格式（${others.map((item) => variantLabel(item.format)).join("、")}）还留在网盘里。`
+      : installedNow
+        ? "主机上装好的游戏不受影响，照样能玩；但它会从盘游的游戏库里消失，以后在盘游里就删不了它了。"
+        : "删除后它会从游戏库里消失。"));
     if (game.review && !game.review.playable) {
       body.push(el("p", "", "你标的「有问题」会留着，盘架看到同一份文件时不会再转存回来。"));
     }
@@ -1690,14 +1756,25 @@ function openDetail(game, opener) {
     status.hidden = true;
     clearFailure();
     confirm.ask({
-      steps: [{ head: `从网盘删除「${displayName(game)}」${size}？`, body, button: "从网盘删除" }],
+      steps: [{
+        head: `从网盘删除「${displayName(game)}」${oneFormat ? "的" + variantLabel(game.variant) + "版" : ""}${size}？`,
+        body,
+        button: "从网盘删除",
+      }],
       busy: "正在删除…",
       onConfirm: async () => {
         try {
           const data = await api("/api/drive/remove", { path: game.path });
           if (!detail || detail.game !== game) return;
-          unshelved = true;
-          games = games.filter((item) => item.path !== game.path);
+          if (oneFormat) {
+            game.path = game.game_dir;
+            game.variants = others;
+            archivesRead = false;
+            reload();
+          } else {
+            unshelved = true;
+            games = games.filter((item) => item.path !== game.path);
+          }
           if (data.moved_to) {
             detail.fail(`百度要求安全验证、不能直接删除，已移到网盘的 ${data.moved_to} 文件夹。在百度网盘 App 里删掉这个文件夹才会腾出空间。`);
           } else {
@@ -1726,8 +1803,9 @@ function openDetail(game, opener) {
   // 简介等资料和上次读到的压缩包、安装情况都在本机缓存里，马上就有，先显示出来；
   // 实时列网盘目录、连主机要慢一些，读到了再换上。实时的先到了就不用缓存的。
   const loadCached = () => api("/api/game", { path: game.path, cached: true }).then((data) => {
-    if (!detail || detail.game !== game || archivesRead) return;
+    if (!detail || detail.game !== game || archivesRead || data.path !== game.path) return;
     Object.assign(game, data);
+    if (pickVariant()) return;
     paint();
     rename.sync();
     if (data.source === "cache") shareDetail(game);
@@ -1735,9 +1813,11 @@ function openDetail(game, opener) {
     // 实时的请求也会带回资料
   });
 
-  const reload = () => api("/api/game", { path: game.path }).then((data) => {
-    if (!detail || detail.game !== game) return;
+  // 切换格式后，还没回来的上一种格式的结果不要了。
+  const reload = (requested = game.path) => api("/api/game", { path: requested }).then((data) => {
+    if (!detail || detail.game !== game || requested !== game.path) return;
     Object.assign(game, data);
+    if (pickVariant()) return;
     archivesRead = true;
     clearFailure();
     const pending = waitingLayers;
@@ -1748,7 +1828,7 @@ function openDetail(game, opener) {
     if (pending && !action.disabled) beginInstall();
   }).catch((error) => {
     waitingLayers = false;
-    if (detail && detail.game === game) {
+    if (detail && detail.game === game && requested === game.path) {
       paint();
       detail.fail(error.message);
     }

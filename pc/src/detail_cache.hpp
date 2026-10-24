@@ -17,10 +17,15 @@ struct GameDetail {
   std::vector<std::string> installed;
   // 主游戏那组压缩包的内容指纹（content_fingerprint），评价按它认。
   std::string fingerprint;
+  // 游戏目录按格式分了子目录时各个变体的 JSON 数组原文（[{"format","path"}]），没分时为空。
+  std::string variants;
+  // 主机上装着的是哪种格式（完成标记里记的），没装好或旧版本装的为空。
+  std::string installed_variant;
 
   bool operator==(const GameDetail& other) const {
     return state == other.state && archive_bytes == other.archive_bytes && formats == other.formats &&
-           layers == other.layers && installed == other.installed && fingerprint == other.fingerprint;
+           layers == other.layers && installed == other.installed && fingerprint == other.fingerprint &&
+           variants == other.variants && installed_variant == other.installed_variant;
   }
 };
 
@@ -29,5 +34,5 @@ std::optional<GameDetail> cached_game_detail(const std::string& key, const std::
 std::string cached_game_fingerprint(const std::string& key, const std::string& path);
 // 内容变了才写盘，返回有没有变。
 bool store_game_detail(const std::string& key, const std::string& path, const GameDetail& detail);
-// 装完、删除之后主机上的情况变了，下次打开详情以实时读到的为准。
+// 装完、删除之后主机上的情况变了，下次打开详情以实时读到的为准。几种格式装在同一个文件夹，同一款游戏的都忘掉。
 void forget_game_detail(const std::string& path);

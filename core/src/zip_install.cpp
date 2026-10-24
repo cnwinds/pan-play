@@ -196,7 +196,7 @@ struct LayerRecord {
 // 安装标记里的 source 是网盘上各个压缩包文件的名字和大小。再次安装时只比对它，不用为了比对去读压缩包。
 // layers 按叠放顺序记下每一层，出了新补丁时据此只叠新的部分。
 std::string marker_json(const std::string& title_id, const std::string& plugin, const std::string& source,
-                        const std::vector<LayerRecord>& layers, std::vector<Member> members) {
+                        const std::string& variant, const std::vector<LayerRecord>& layers, std::vector<Member> members) {
   std::sort(members.begin(), members.end(), [](const Member& left, const Member& right) { return left.name < right.name; });
   std::string json = "{\"entries\":[";
   bool first = true;
@@ -214,7 +214,7 @@ std::string marker_json(const std::string& title_id, const std::string& plugin, 
             json_escape(layers[i].source) + "\"}";
   }
   json += "],\"plugin\":\"" + json_escape(plugin) + "\",\"source\":\"" + json_escape(source) + "\",\"title_id\":\"" +
-          json_escape(title_id) + "\"}";
+          json_escape(title_id) + "\",\"variant\":\"" + json_escape(variant) + "\"}";
   return json;
 }
 
@@ -453,9 +453,18 @@ void clean_staging(InstallSink& sink, const std::string& staging_root, const std
   sink.remove_dir(parent_path(staging_root));
 }
 
+std::string variant_label(const std::string& variant) {
+  if (variant == "exfat") return " exFAT 镜像版";
+  if (variant == "folder") return "文件夹版";
+  if (variant == "other") return "其他格式的版本";
+  if (variant.empty()) return "没分格式的版本";
+  return "「" + variant + "」版";
+}
+
 // 游戏在主机上的目录名：有 Title ID 用它，没有用网盘目录名。不能用时返回空。
+// 同一款游戏的几种格式装到同一个文件夹，同时只能装一种。
 std::string install_folder(const std::string& source_dir) {
-  const std::string folder_name = base_name(source_dir);
+  const std::string folder_name = base_name(game_dir_of(source_dir));
   const std::string title_id = find_title_id(folder_name);
   const std::string folder = title_id.empty() ? folder_name : title_id;
   if (folder.empty() || folder == "." || folder == ".." || folder.find(':') != std::string::npos) return "";
@@ -485,6 +494,7 @@ bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const s
                       const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets) {
   Json marker;
   if (!read_marker(sink, dest_prefix, source_dir, &marker)) return false;
+  if (marker.get("variant") != nullptr && marker.str("variant") != variant_format(source_dir)) return false;
   std::vector<ArchiveSet> installable;
   for (const auto& set : sets) {
     if ((set.format == "zip" || set.format == "rar" || set.format == "7z") && skip_sets.count(archive_set_id(set)) == 0) {
@@ -502,6 +512,12 @@ std::vector<std::string> installed_sets(InstallSink& sink, const std::string& de
   if (layers == nullptr) return ids;
   for (const auto& layer : layers->array) ids.push_back(layer.str("source"));
   return ids;
+}
+
+std::optional<std::string> installed_variant(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
+  Json marker;
+  if (!read_marker(sink, dest_prefix, source_dir, &marker) || marker.get("variant") == nullptr) return std::nullopt;
+  return marker.str("variant");
 }
 
 std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
@@ -527,7 +543,8 @@ namespace {
 InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request) {
   InstallResult result;
   const std::string folder = install_folder(request.source_dir);
-  const std::string title_id = find_title_id(base_name(request.source_dir));
+  const std::string title_id = find_title_id(base_name(game_dir_of(request.source_dir)));
+  const std::string variant = variant_format(request.source_dir);
   if (folder.empty()) {
     result.status = "error";
     result.message = "游戏目录名不能作为存放目录";
@@ -669,6 +686,13 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
     const Json old = Json::parse(std::string(existing.begin(), existing.end()), &parse_error);
     const Json* entries = old.get("entries");
     const Json* layers = old.get("layers");
+    if (parse_error.empty() && old.get("variant") != nullptr && old.str("variant") != variant) {
+      result.retryable = false;
+      result.status = "error";
+      result.message = "这款游戏已经装了" + variant_label(old.str("variant")) + "，要换成" + variant_label(variant) +
+                       "得先删除已装的";
+      return result;
+    }
     if (parse_error.empty() && entries != nullptr && layers != nullptr && old.str("plugin") == drive.id()) {
       for (const auto& layer : layers->array) {
         old_layers.push_back(layer.str("source"));
@@ -925,7 +949,7 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
   }
   std::vector<LayerRecord> layer_records;
   for (const Source* layer : layers) layer_records.push_back({layer->id, layer->has_param});
-  const std::string expected = marker_json(title_id, drive.id(), signature, layer_records, recorded);
+  const std::string expected = marker_json(title_id, drive.id(), signature, variant, layer_records, recorded);
   error = finish_install(sink, staging_root, final_root, members, expected, marker_path);
   if (!error.empty()) return fail(error);
   if (!existing.empty() && !patch_only) remove_stale(sink, final_root, existing, members);

@@ -2,6 +2,7 @@
 
 #include "panplay/app_paths.hpp"
 #include "panplay/json.hpp"
+#include "panplay/library.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -37,6 +38,8 @@ void load_locked() {
     detail.formats = node.str("formats");
     detail.layers = node.str("layers");
     detail.fingerprint = node.str("fingerprint");
+    detail.variants = node.str("variants");
+    detail.installed_variant = node.str("installed_variant");
     if (const panplay::Json* installed = node.get("installed")) {
       for (const auto& id : installed->array) detail.installed.push_back(id.text);
     }
@@ -54,7 +57,8 @@ void save_locked() {
     json += "\"" + json_escape(path) + "\":{\"state\":\"" + json_escape(detail.state) +
             "\",\"archive_bytes\":" + std::to_string(detail.archive_bytes) + ",\"formats\":\"" +
             json_escape(detail.formats) + "\",\"layers\":\"" + json_escape(detail.layers) + "\",\"fingerprint\":\"" +
-            json_escape(detail.fingerprint) + "\",\"installed\":[";
+            json_escape(detail.fingerprint) + "\",\"variants\":\"" + json_escape(detail.variants) +
+            "\",\"installed_variant\":\"" + json_escape(detail.installed_variant) + "\",\"installed\":[";
     for (std::size_t i = 0; i < detail.installed.size(); ++i) {
       if (i > 0) json += ",";
       json += "\"" + json_escape(detail.installed[i]) + "\"";
@@ -108,7 +112,17 @@ bool store_game_detail(const std::string& key, const std::string& path, const Ga
 }
 
 void forget_game_detail(const std::string& path) {
+  const std::string game_dir = panplay::game_dir_of(path);
   std::lock_guard<std::mutex> lock(mu);
   load_locked();
-  if (details.erase(path) != 0) save_locked();
+  bool erased = false;
+  for (auto it = details.begin(); it != details.end();) {
+    if (panplay::game_dir_of(it->first) != game_dir) {
+      ++it;
+      continue;
+    }
+    it = details.erase(it);
+    erased = true;
+  }
+  if (erased) save_locked();
 }

@@ -29,6 +29,7 @@ struct GameReview {
   bool playable = true;
   std::string note;              // 有问题时的一句说明
   std::string firmware;          // 评价时主机的固件版本；在电脑上评价、读不到时为空
+  std::string format;            // 评的是哪种格式（exfat、folder、unknown，同盘架）；游戏目录没按格式分时为空
   std::int64_t at = 0;           // 评价时间（Unix 秒）
   std::vector<ReviewLayer> layers;  // 当时装着的各组压缩包（主游戏、补丁）
   std::vector<ReviewPart> parts;    // 主游戏那组的各分卷
