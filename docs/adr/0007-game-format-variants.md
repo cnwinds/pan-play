@@ -47,7 +47,8 @@
    - exFAT：扇区 512、`secondary_unit` 0x10000、flags 0x14、`image_type` 0；`nmount` 用 `fstype=exfatfs`、`budgetid=game`、`large=yes`、`timezone=static`、`async`、`noatime`、`ignoreacl`。
    - ffpkg：扇区 4096、`secondary_unit` 4096、flags 0x16、`image_type` 7；`fstype=ufs`，`nmount` 的 flags 是 `0x10000000`。
 2. 挂到 `/mnt/panplay/<游戏文件夹名>`。镜像根目录有 `sce_sys/param.json` 就用根目录，否则用根目录下唯一带它的子目录。
-3. 把游戏文件夹里镜像以外的文件（backport、补丁）按原路径写进镜像里的游戏目录，写完在游戏文件夹里记 `.panplay-overlay`（内容是当时的完成标记），标记没变就不再写。装了更新后完成标记变了，下次挂载会重新写。
+3. 把游戏文件夹里镜像以外的文件（backport、补丁）按原路径写进镜像里的游戏目录，写完在游戏文件夹里记 `.panplay-overlay`（内容是镜像文件的设备号、inode、大小加上当时的完成标记），都没变就不再写。装了更新后完成标记变了，下次挂载会重新写。
+   - 整个重装时新镜像先写进暂存区再改名替换，旧镜像还被 LVD 挂着。挂载时在 `/mnt/panplay/<游戏文件夹名>.image` 记下挂的是哪个镜像文件，注册时发现对不上，就先卸掉 `/system_ex/app/<ID>` 的 nullfs 和旧镜像，再挂新镜像、重新写入 backport；旧镜像卸掉后空间才腾得出来。游戏正在运行时卸不掉，注册报错，关掉游戏后重新注册。
 4. 之后和文件夹版一样（ADR 0003）：镜像里的游戏目录 nullfs 挂到 `/system_ex/app/<ID>`，`mount.lnk` 指向它，再调注册接口。另外写 `/user/app/<ID>/panplay.image` 记下游戏文件夹，开机恢复时先挂镜像。
 5. 删除时先按 ADR 0003 注销、卸 nullfs，再卸掉镜像挂载、detach `/dev/lvdN`（ioctl `0xC0286D01`），之后才能删镜像文件。游戏在运行时卸不掉，照样提示先关游戏。
 

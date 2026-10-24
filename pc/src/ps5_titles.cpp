@@ -311,6 +311,16 @@ std::string image_mount_point(const std::string& game_dir) {
   return std::string(kImageMountBase) + "/" + fs::u8path(game_dir).filename().u8string();
 }
 
+// 镜像文件是哪一个。重装时新镜像先写进暂存区再改名替换，旧镜像还被 LVD 挂着，路径一样、文件不一样。
+std::string image_identity(const std::string& image) {
+  struct stat st {};
+  if (::stat(image.c_str(), &st) != 0) return "";
+  return std::to_string(st.st_dev) + ":" + std::to_string(st.st_ino) + ":" + std::to_string(st.st_size);
+}
+
+// 挂上时记下挂的是哪个镜像文件。
+std::string mounted_image_path(const std::string& mount_point) { return mount_point + ".image"; }
+
 // 挂着的 /dev/lvdN 的 N，不是 LVD 挂的返回 -1。
 int lvd_unit(const std::string& mount_point) {
   const MountTop top = mount_top(mount_point);
@@ -402,6 +412,7 @@ std::string mount_image(const std::string& image, const std::string& mount_point
     detach_lvd(request.device_id);
     return "镜像挂不上：" + (message[0] != '\0' ? std::string(message) : error);
   }
+  write_text(mounted_image_path(mount_point), image_identity(image));
   PANPLAY_DEBUG("已挂载镜像 " + image + " -> " + mount_point);
   return "";
 }
@@ -416,6 +427,7 @@ std::string unmount_image(const std::string& mount_point) {
   detach_lvd(unit);
   std::error_code ec;
   fs::remove(mount_point, ec);
+  fs::remove(mounted_image_path(mount_point), ec);
   return "";
 }
 
@@ -456,9 +468,11 @@ std::string copy_overlay(const fs::path& from, const fs::path& to, bool top, con
 std::string apply_overlay(const std::string& game_dir, const std::string& root, const std::string& image) {
   const fs::path dir = fs::u8path(game_dir);
   const std::string marker = read_text(dir / kDoneMarker);
-  if (!marker.empty() && read_text(dir / kOverlayStamp) == marker) return "";
+  // 换了镜像文件（整个重装）也要重新写。
+  const std::string stamp = marker.empty() ? "" : image_identity(image) + "\n" + marker;
+  if (!stamp.empty() && read_text(dir / kOverlayStamp) == stamp) return "";
   if (auto error = copy_overlay(dir, fs::u8path(root), true, image); !error.empty()) return "补丁写不进镜像：" + error;
-  if (!marker.empty()) write_text(dir / kOverlayStamp, marker);
+  if (!stamp.empty()) write_text(dir / kOverlayStamp, stamp);
   panplay::log_info("已把 " + game_dir + " 里镜像外的文件写进镜像");
   return "";
 }
@@ -469,6 +483,19 @@ std::string console_source(const std::string& game_dir, bool mount, std::string*
   const std::string image = find_image(game_dir);
   if (image.empty()) return game_dir;
   const std::string mount_point = image_mount_point(game_dir);
+  // 挂着的是重装前的旧镜像：先卸掉它（连同 /system_ex/app/<ID> 上的 nullfs），再挂新的。旧镜像卸掉才腾得出空间。
+  if (mount && !mount_top(mount_point).type.empty() && read_text(mounted_image_path(mount_point)) != image_identity(image)) {
+    const std::string old_root = image_game_root(mount_point);
+    std::string problem;
+    const std::string id = read_title_id(old_root, &problem);
+    panplay::log_info("镜像换过了，重新挂载：" + image);
+    std::string failed = !id.empty() && mounted_from(id, old_root) ? unmount_nullfs(id, false) : "";
+    if (failed.empty()) failed = unmount_image(mount_point);
+    if (!failed.empty()) {
+      *error = failed;
+      return "";
+    }
+  }
   if (mount_top(mount_point).type.empty()) {
     if (!mount) return mount_point;
     if (auto failed = mount_image(image, mount_point); !failed.empty()) {
