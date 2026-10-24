@@ -51,6 +51,8 @@ class InstallClock {
   Tally window_;
   bool extracted_ = false;
   double cpu_at_start_;
+  double thread_cpu_at_start_;
+  long long faults_at_start_;
 };
 
 // 在这个作用域里的时间记到 phase 上，离开时换回原来那项。

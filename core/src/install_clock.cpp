@@ -4,6 +4,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <ctime>
+#include <thread>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -64,6 +66,38 @@ double process_cpu_seconds() {
 #endif
 }
 
+// 当前线程用掉的 CPU 时间。安装线程上跑的是解压（UnRAR 另有解码线程）、写盘。
+double thread_cpu_seconds() {
+#if defined(_WIN32)
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return -1;
+  const auto ticks = [](const FILETIME& time) {
+    return (static_cast<unsigned long long>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+  };
+  return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+#else
+  timespec now{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return -1;
+  return static_cast<double>(now.tv_sec) + now.tv_nsec / 1e9;
+#endif
+}
+
+// 整个进程到现在的缺页次数（要从系统要新内存页的次数）。大字典的解压窗口第一次碰到每一页都要缺一次。
+long long page_faults() {
+#if defined(_WIN32)
+  return -1;
+#else
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) return -1;
+  return static_cast<long long>(usage.ru_minflt) + usage.ru_majflt;
+#endif
+}
+
+int online_cpus() {
+  const unsigned count = std::thread::hardware_concurrency();
+  return static_cast<int>(count);
+}
+
 std::string rate_text(std::int64_t bytes, double ms) {
   const double rate = static_cast<double>(bytes) / (1 << 20) / (ms / 1000);
   char text[32];
@@ -74,7 +108,12 @@ std::string rate_text(std::int64_t bytes, double ms) {
 }  // namespace
 
 InstallClock::InstallClock()
-    : outer_(bound), since_(Clock::now()), window_at_(since_), cpu_at_start_(process_cpu_seconds()) {
+    : outer_(bound),
+      since_(Clock::now()),
+      window_at_(since_),
+      cpu_at_start_(process_cpu_seconds()),
+      thread_cpu_at_start_(thread_cpu_seconds()),
+      faults_at_start_(page_faults()) {
   bound = this;
 }
 
@@ -160,11 +199,21 @@ std::string InstallClock::summary(const std::string& name, const std::string& ou
   for (const InstallPhase phase : kReportOrder) {
     if (total_.ms[static_cast<int>(phase)] > total_.ms[static_cast<int>(most)]) most = phase;
   }
+  // 安装线程的 CPU 时间远少于解压加写入的时间，说明线程在等（等 UnRAR 的解码线程、等主机分 CPU），不是算不过来。
   std::string cpu;
   if (const double used = process_cpu_seconds() - cpu_at_start_; cpu_at_start_ >= 0 && all > 0 && used >= 0) {
-    char text[64];
-    std::snprintf(text, sizeof(text), "；整个盘游平均占 %.2f 个 CPU 核", used * 1000 / all);
+    char text[160];
+    std::snprintf(text, sizeof(text), "；整个盘游平均占 %.2f 个 CPU 核（共 %d 核）", used * 1000 / all, online_cpus());
     cpu = text;
+    if (const double mine = thread_cpu_seconds() - thread_cpu_at_start_; thread_cpu_at_start_ >= 0 && mine >= 0) {
+      const double busy_ms = total_.ms[static_cast<int>(InstallPhase::decode)] + total_.ms[static_cast<int>(InstallPhase::write)];
+      std::snprintf(text, sizeof(text), "，安装线程用了 CPU %s（解压加写入共 %s）", seconds_text(mine * 1000).c_str(),
+                    seconds_text(busy_ms).c_str());
+      cpu += text;
+    }
+    if (const long long faults = page_faults() - faults_at_start_; faults_at_start_ >= 0 && faults >= 0) {
+      cpu += "，缺页 " + std::to_string(faults) + " 次";
+    }
   }
   return "安装耗时 " + name + "（" + outcome + "）：共 " + seconds_text(all) + "，" + describe(total_, all, true) +
          "；时间大多花在" + kPhaseNames[static_cast<int>(most)] + cpu;
