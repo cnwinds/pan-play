@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -763,8 +764,10 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
     const double speed = static_cast<double>(received - review_received_) / elapsed;
     const double wait = review_wait_ms_ / elapsed;
     const double full = review_full_ms_ / elapsed;
+    const double consumed = static_cast<double>(total_.delivered - review_delivered_) / elapsed;
     review_from_ = now;
     review_received_ = received;
+    review_delivered_ = total_.delivered;
     review_wait_ms_ = 0;
     review_full_ms_ = 0;
     rate_avg_ = speed;
@@ -781,12 +784,28 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
       }
     }
     if (want_ > 1 && wait < 0.05 && full > 0.5) {
-      const int lower = level_below(want_);
-      log_info(head + "解压跟不上（缓冲满 " + percent(full, 1) + "），减到 " + std::to_string(lower) + " 条");
-      set_want_locked(lower, now);
-      std::lock_guard<std::mutex> lock(options_.tuning->mu);
-      options_.tuning->connections = want_;
-      return;
+      // 只减到够解压器读的条数（留三成余量）：一档档往下减会减过头，解压器反过来等下载。
+      const double lane = lane_rate_ > 0 ? lane_rate_ : speed / want_;
+      int lower = want_;
+      if (lane > 0) {
+        const int needed = std::max(1, static_cast<int>(std::ceil(consumed * 1.3 / lane)));
+        lower = 1;
+        for (const int level : kLevels) {
+          if (level >= needed) {
+            lower = level;
+            break;
+          }
+        }
+        lower = std::min(lower, want_);
+      }
+      if (lower < want_) {
+        log_info(head + "解压跟不上（缓冲满 " + percent(full, 1) + "，解压器读走 " + per_second(consumed) +
+                 "，每条约 " + per_second(lane) + "），减到 " + std::to_string(lower) + " 条");
+        set_want_locked(lower, now);
+        std::lock_guard<std::mutex> lock(options_.tuning->mu);
+        options_.tuning->connections = want_;
+        return;
+      }
     }
     if (want_ > 1 && ms_between(multi_since_, now) >= 12.0 * options_.review_ms) {
       start_tune_locked(Tune::down, level_below(want_), speed, now);
@@ -820,6 +839,7 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
     measuring_ = false;
     review_from_ = now;
     review_received_ = received;
+    review_delivered_ = total_.delivered;
     review_wait_ms_ = 0;
     review_full_ms_ = 0;
     rate_avg_ = speed;
@@ -1015,10 +1035,12 @@ std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::strin
   std::unique_lock<std::mutex> lock(mu_);
   start_locked();
   if (!read_started_) {
+    // 提前下载那段时间读取方还没来：先按"没满"记完账，再开始算缓冲满，也不拿来判断该加还是该减连接。
+    account_locked();
     read_started_ = true;
-    // 提前下载那段时间读取方还没来，不拿来判断该加还是该减连接。
     review_from_ = changed_at_ = Clock::now();
     review_received_ = received_.load();
+    review_delivered_ = total_.delivered;
     review_wait_ms_ = review_full_ms_ = 0;
   }
   bool waiting = false;

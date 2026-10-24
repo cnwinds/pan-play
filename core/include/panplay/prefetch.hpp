@@ -236,6 +236,7 @@ class PrefetchReader {
   double measure_full_ms_ = 0;
   Clock::time_point review_from_;
   std::int64_t review_received_ = 0;
+  std::int64_t review_delivered_ = 0;
   double review_wait_ms_ = 0;
   double review_full_ms_ = 0;
   double rate_avg_ = 0;
