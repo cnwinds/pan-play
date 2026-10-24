@@ -1,21 +1,13 @@
 #include "panplay/write_test.hpp"
 
 #include "panplay/library.hpp"
+#include "panplay/raw_file.hpp"
 #include "panplay/storage_path.hpp"
 #include "panplay/trace.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
-
-#if defined(_WIN32)
-#include <fcntl.h>
-#include <io.h>
-#include <sys/stat.h>
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 namespace panplay {
 
@@ -36,33 +28,6 @@ constexpr DirectWay kDirectWays[] = {
     {"直接写，每次 1 MB", 1 << 20},
     {"直接写，每次 4 MB", 4 << 20},
 };
-
-#if defined(_WIN32)
-int open_out(const std::filesystem::path& path) {
-  return _wopen(path.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
-}
-long long write_out(int fd, const void* data, std::size_t size) { return _write(fd, data, static_cast<unsigned>(size)); }
-int sync_out(int fd) { return _commit(fd); }
-void close_out(int fd) { _close(fd); }
-#else
-int open_out(const std::filesystem::path& path) { return ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666); }
-long long write_out(int fd, const void* data, std::size_t size) { return ::write(fd, data, size); }
-int sync_out(int fd) { return ::fsync(fd); }
-void close_out(int fd) { ::close(fd); }
-#endif
-
-// 已经写完关掉的文件再打开刷一次盘：fsync 刷的是整个文件，不管是哪个句柄写的。
-bool sync_file(const std::filesystem::path& path) {
-#if defined(_WIN32)
-  const int fd = _wopen(path.c_str(), _O_WRONLY | _O_BINARY);
-#else
-  const int fd = ::open(path.c_str(), O_WRONLY);
-#endif
-  if (fd < 0) return false;
-  const bool ok = sync_out(fd) == 0;
-  close_out(fd);
-  return ok;
-}
 
 std::string mb_per_second(double rate) {
   char text[32];
@@ -156,8 +121,8 @@ std::string WriteTest::run_sink(InstallSink& sink, const std::string& path, cons
 }
 
 std::string WriteTest::run_direct(const std::string& local, std::size_t chunk, const std::vector<std::uint8_t>& block) {
-  const int fd = open_out(std::filesystem::u8path(local));
-  if (fd < 0) return "无法写入";
+  RawFileOut out(std::filesystem::u8path(local));
+  if (!out.ok()) return "无法写入";
   std::string error;
   for (std::int64_t done = 0; done < total_ && error.empty();) {
     if (stop_) {
@@ -166,15 +131,15 @@ std::string WriteTest::run_direct(const std::string& local, std::size_t chunk, c
     }
     const std::size_t at = static_cast<std::size_t>(done % static_cast<std::int64_t>(block.size()));
     const std::size_t size = std::min<std::size_t>(chunk, block.size() - at);
-    if (write_out(fd, block.data() + at, size) != static_cast<long long>(size)) {
+    if (!out.write_all(block.data() + at, size)) {
       error = "写入中断";
       break;
     }
     done += static_cast<std::int64_t>(size);
     add_written(size);
   }
-  if (error.empty() && sync_out(fd) != 0) error = "刷盘失败";
-  close_out(fd);
+  if (error.empty() && !out.sync()) error = "刷盘失败";
+  out.close();
   return error;
 }
 

@@ -1,6 +1,8 @@
 #include "panplay/sink.hpp"
 
+#include "install_clock.hpp"
 #include "panplay/dummy_ftp.hpp"
+#include "panplay/raw_file.hpp"
 #include "panplay/storage_path.hpp"
 #include "panplay/socket_util.hpp"
 
@@ -13,6 +15,7 @@
 #include <iostream>
 #include <iterator>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -39,29 +42,62 @@ void open_up(const std::filesystem::path& path) {
 
 class LocalWriter final : public FileWriter {
  public:
-  // libc++ 的 ofstream 默认缓冲只有 4 KB，大块数据也被拆成 4 KB 一次的系统调用；PS5 上这样只能写 25 MB/s。
-  // 缓冲要在 open 之前设才生效。
-  explicit LocalWriter(const std::filesystem::path& path) : buffer_(kBufferBytes) {
-    out_.rdbuf()->pubsetbuf(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
-    out_.open(path, std::ios::binary | std::ios::trunc);
-    if (out_) open_up(path);
+  // 攒满 4 MB 才交给系统一次：PS5 上每次写多大几乎决定了写盘速度，64 KB 一次只有 28 MB/s。
+  explicit LocalWriter(const std::filesystem::path& path) : out_(path) {
+    if (out_.ok()) {
+      buffer_.reserve(kBufferBytes);
+      open_up(path);
+    }
   }
-  bool ok() const { return static_cast<bool>(out_); }
+  // 没 finish 就丢掉（中断、暂停）时，已经交给 write 的数据也要留在盘上。
+  ~LocalWriter() override {
+    if (!failed_) flush();
+  }
+  bool ok() const { return out_.ok(); }
 
   std::string write(const std::uint8_t* data, std::size_t size) override {
-    out_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
-    return out_ ? "" : "写入中断";
+    if (failed_) return "写入中断";
+    while (size > 0) {
+      if (buffer_.empty() && size >= kBufferBytes) {
+        const std::size_t whole = size - size % kBufferBytes;
+        if (!out_.write_all(data, whole)) return fail();
+        data += whole;
+        size -= whole;
+        continue;
+      }
+      const std::size_t take = std::min(size, kBufferBytes - buffer_.size());
+      buffer_.insert(buffer_.end(), data, data + take);
+      data += take;
+      size -= take;
+      if (buffer_.size() == kBufferBytes && !flush()) return fail();
+    }
+    return "";
   }
 
   std::string finish() override {
-    out_.close();
-    return out_ ? "" : "写入中断";
+    const bool flushed = !failed_ && flush();
+    const bool closed = out_.close();
+    return flushed && closed ? "" : "写入中断";
   }
 
  private:
+  bool flush() {
+    if (buffer_.empty()) return true;
+    // finish、析构时补写的最后一块也算写入，不算开关文件。
+    PhaseScope timing(InstallPhase::write);
+    const bool written = out_.write_all(buffer_.data(), buffer_.size());
+    buffer_.clear();
+    return written;
+  }
+  std::string fail() {
+    failed_ = true;
+    return "写入中断";
+  }
+
   static constexpr std::size_t kBufferBytes = 4 << 20;
-  std::vector<char> buffer_;
-  std::ofstream out_;
+  std::vector<std::uint8_t> buffer_;
+  RawFileOut out_;
+  bool failed_ = false;
 };
 
 class LocalSink : public InstallSink {
@@ -86,6 +122,9 @@ class LocalSink : public InstallSink {
     std::filesystem::path local;
     std::string error;
     if (!storage_path(root_, path, &local, &error)) return error;
+    // 每个文件开写前都会来一次，同一个目录下几百个文件不用每次都逐级检查、放开权限。
+    const std::string key = local.lexically_normal().u8string();
+    if (ready_dirs_.count(key) != 0) return "";
     std::filesystem::create_directories(local);
     if (!std::filesystem::is_directory(local)) return "无法创建目录";
     // create_directories 顺带建出的上级目录也要放开，一直到存放位置为止。
@@ -93,6 +132,7 @@ class LocalSink : public InstallSink {
     for (std::filesystem::path dir = local.lexically_normal(); dir != root && dir.has_relative_path(); dir = dir.parent_path()) {
       open_up(dir);
     }
+    ready_dirs_.insert(key);
     return "";
   }
 
@@ -122,6 +162,7 @@ class LocalSink : public InstallSink {
     if (!storage_path(root_, from, &source, &error)) return error;
     if (!storage_path(root_, to, &target, &error)) return error;
     if (std::filesystem::exists(target)) return "目标已存在";
+    if (std::error_code ec; std::filesystem::is_directory(source, ec)) ready_dirs_.clear();
     try {
       std::filesystem::rename(source, target);
     } catch (const std::exception& ex) {
@@ -172,6 +213,7 @@ class LocalSink : public InstallSink {
     std::filesystem::path local;
     std::string error;
     if (!storage_path(root_, path, &local, &error)) return error;
+    ready_dirs_.clear();
     std::error_code ec;
     if (!std::filesystem::is_directory(local, ec) || !std::filesystem::is_empty(local, ec) ||
         !std::filesystem::remove(local, ec)) {
@@ -186,10 +228,13 @@ class LocalSink : public InstallSink {
     if (!storage_path(root_, path, &local, &error)) return error;
     const std::filesystem::path inside = local.lexically_normal().lexically_relative(root_.lexically_normal());
     if (inside.empty() || inside == "." || *inside.begin() == "..") return "不能删除存放位置以外或整个存放位置";
+    ready_dirs_.clear();
     return remove_recursive(local);
   }
 
  private:
+  // 这次安装里已经建好、放开权限的目录。删目录、搬目录时清空。
+  std::set<std::string> ready_dirs_;
   // 不用 remove_all：它删不掉时说不出是哪个文件、什么原因；新版 libc++ 里它还改用 openat/unlinkat 一类调用，
   // 主机上不一定都支持。这里只用列目录、删文件、删空目录。
   std::string remove_recursive(const std::filesystem::path& path) {
