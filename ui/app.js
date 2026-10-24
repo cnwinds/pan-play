@@ -2091,7 +2091,7 @@ async function loadSettings() {
   form.elements.verbose_log.checked = Boolean(settings.verbose_log);
   $("#log-path").textContent = settings.log_path || "";
   summarizeSettings();
-  await Promise.all([loadAccess(), loadCatalogStatus(), pollSpeedtest()]);
+  await Promise.all([loadAccess(), loadCatalogStatus(), pollSpeedtest(), pollWritetest()]);
 }
 
 /* 局域网访问 */
@@ -2400,6 +2400,114 @@ speedRun.addEventListener("click", async () => {
     // 别的页面已经开始测了，就接着显示那一次。
     const status = await api("/api/speedtest").catch(() => null);
     if (status && speedBusy(status)) pollSpeedtest();
+  }
+});
+
+/* 写盘测速：在存放位置用几种写法各写一遍，和下载测速一样只轮询近况 */
+
+const writeRun = $("#writetest-run");
+const writeNote = $("#writetest-note");
+let writeTimer = 0;
+let writeState = null;
+
+function writeBusy(s) {
+  return s.phase === "testing";
+}
+
+// 第一种是盘游安装时的写法，其余是直接写；直接写明显更快说明盘游的写法还能改，差不多就是盘本身的上限。
+function writeVerdict(s) {
+  const done = s.steps.filter((step) => step.done);
+  if (!done.length) return "";
+  const ours = s.steps[0];
+  const direct = s.steps.slice(1).filter((step) => step.done);
+  if (!direct.length) return ours.done ? `写进存放位置 ${mbps(ours.rate)} MB/s，装游戏时写盘快不过这个速度。` : "";
+  const best = direct.reduce((a, b) => (b.rate > a.rate ? b : a));
+  if (!ours.done) return "";
+  if (best.rate >= ours.rate * 1.3) {
+    return `「${best.label}」能到 ${mbps(best.rate)} MB/s，盘游现在的写法只有 ${mbps(ours.rate)} MB/s：盘游的写法还有改进空间。`;
+  }
+  return `盘游现在的写法 ${mbps(ours.rate)} MB/s，直接写最快 ${mbps(best.rate)} MB/s，没有明显差距：盘游的写法不是瓶颈，装游戏时写盘大约就是这个速度。`;
+}
+
+function writeLadder(s) {
+  const busy = writeBusy(s);
+  const top = Math.max(1, ...s.steps.map((step) => step.rate), busy ? s.current_rate : 0);
+  const finished = s.steps.filter((step) => step.done);
+  const best = finished.length > 1 ? finished.reduce((a, b) => (b.rate > a.rate ? b : a)) : null;
+  return s.steps.map((step, index) => {
+    const row = el("li", "speedtest-step");
+    const meter = el("span", "meter");
+    meter.append(el("span"));
+    const value = el("b", "num");
+    let rate = 0;
+    if (step.done) {
+      rate = step.rate;
+      row.classList.add(step === best ? "best" : "done");
+      value.textContent = `${mbps(rate)} MB/s`;
+    } else if (busy && s.current === index) {
+      rate = s.current_rate;
+      row.classList.add("live");
+      value.textContent = rate ? `${mbps(rate)} MB/s` : "开始写…";
+    } else {
+      value.textContent = "—";
+    }
+    meter.style.setProperty("--p", Math.min(1, rate / top));
+    row.append(el("span", "", step.label), meter, value);
+    return row;
+  });
+}
+
+function paintWritetest(s) {
+  writeState = s;
+  const busy = writeBusy(s);
+  writeRun.disabled = false;
+  writeRun.textContent = busy ? "停止" : s.phase === "idle" ? "开始测速" : "再测一次";
+  $("#writetest-board").hidden = !(busy || s.steps.some((step) => step.done));
+  $("#writetest-ladder").replaceChildren(...writeLadder(s));
+  const meta = [s.where];
+  if (busy && s.current >= 0) meta.push(`这一种已写 ${formatBytes(s.written)} / ${formatBytes(s.total)}`);
+  $("#writetest-meta").textContent = meta.filter(Boolean).join(" · ");
+  const verdict = s.phase === "done" && !s.ended ? writeVerdict(s) : "";
+  $("#writetest-verdict").hidden = !verdict;
+  $("#writetest-verdict").textContent = verdict;
+  writeNote.classList.remove("error");
+  if (s.phase === "error") {
+    writeNote.classList.add("error");
+    writeNote.textContent = `写盘测速没有完成：${s.error}`;
+  } else if (s.phase === "done" && s.ended === "stopped") {
+    writeNote.textContent = "已停止，测试文件已删掉。";
+  } else {
+    writeNote.textContent = "";
+  }
+}
+
+async function pollWritetest() {
+  window.clearTimeout(writeTimer);
+  writeTimer = 0;
+  let status;
+  try {
+    status = await api("/api/writetest");
+  } catch (error) {
+    writeTimer = window.setTimeout(pollWritetest, 2000);
+    return;
+  }
+  paintWritetest(status);
+  if (writeBusy(status)) writeTimer = window.setTimeout(pollWritetest, 500);
+}
+
+writeRun.addEventListener("click", async () => {
+  writeRun.disabled = true;
+  try {
+    if (writeState && writeBusy(writeState)) {
+      paintWritetest(await api("/api/writetest/stop", {}));
+    } else {
+      paintWritetest(await api("/api/writetest/start", {}));
+    }
+    pollWritetest();
+  } catch (error) {
+    writeRun.disabled = false;
+    writeNote.classList.add("error");
+    writeNote.textContent = error.message;
   }
 });
 

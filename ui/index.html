@@ -216,6 +216,21 @@
               <span class="hint">每个游戏装到主机这个目录下以 Title ID 命名的文件夹里。</span>
             </label>
           </div>
+          <section class="speedtest" aria-labelledby="writetest-title">
+            <div class="speedtest-head">
+              <div>
+                <h3 id="writetest-title">写盘测速</h3>
+                <p>在已保存的存放位置用几种写法各写 512 MB，写完刷到盘上再删掉，看盘本身能写多快、盘游的写法差多少。约一两分钟，装游戏时不能测。</p>
+              </div>
+              <button type="button" class="btn quiet small" id="writetest-run">开始测速</button>
+            </div>
+            <div class="speedtest-board" id="writetest-board" hidden>
+              <ol class="speedtest-ladder writetest-ladder" id="writetest-ladder" aria-label="各种写法的速度"></ol>
+              <p class="speedtest-meta" id="writetest-meta"></p>
+            </div>
+            <p class="speedtest-verdict" id="writetest-verdict" hidden></p>
+            <p class="note" id="writetest-note" role="status"></p>
+          </section>
         </div>
       </section>
       <section id="panel-unpack" role="tabpanel" aria-labelledby="head-unpack" hidden>

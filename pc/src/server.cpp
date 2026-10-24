@@ -14,6 +14,7 @@
 #include "panplay/library.hpp"
 #include "panplay/socket_util.hpp"
 #include "panplay/speed_test.hpp"
+#include "panplay/write_test.hpp"
 #include "panplay/store_meta.hpp"
 #include "panplay/trace.hpp"
 
@@ -402,6 +403,22 @@ std::string speed_test_json() {
          ",\"bytes\":" + std::to_string(s.bytes) + ",\"seconds\":" + std::to_string(static_cast<long long>(s.seconds)) +
          ",\"first_byte_ms\":" + std::to_string(static_cast<long long>(s.first_byte_ms)) + ",\"ended\":\"" + s.ended +
          "\",\"error\":\"" + panplay::json_escape(s.error) + "\",\"install\":" + install + "}";
+}
+
+panplay::WriteTest& write_test = *new panplay::WriteTest;
+
+std::string write_test_json() {
+  const panplay::WriteTestStatus s = write_test.status();
+  const auto rate = [](double value) { return std::to_string(static_cast<long long>(value)); };
+  std::string steps;
+  for (const auto& step : s.steps) {
+    steps += (steps.empty() ? "" : ",") + std::string("{\"label\":\"") + panplay::json_escape(step.label) +
+             "\",\"rate\":" + rate(step.rate) + ",\"done\":" + (step.done ? "true" : "false") + "}";
+  }
+  return "{\"phase\":\"" + s.phase + "\",\"where\":\"" + panplay::json_escape(s.where) + "\",\"steps\":[" + steps +
+         "],\"current\":" + std::to_string(s.current) + ",\"written\":" + std::to_string(s.written) +
+         ",\"total\":" + std::to_string(s.total) + ",\"current_rate\":" + rate(s.current_rate) + ",\"ended\":\"" +
+         s.ended + "\",\"error\":\"" + panplay::json_escape(s.error) + "\"}";
 }
 
 std::string catalog_status_json() {
@@ -1862,6 +1879,40 @@ void handle_client(SOCKET client, bool local_peer) {
   if (method == "POST" && target == "/api/speedtest/stop") {
     speed_test.stop();
     reply_json(client, 200, speed_test_json());
+    return;
+  }
+  // 写盘测速和安装抢同一块盘，装着游戏时不测。
+  if (method == "GET" && target == "/api/writetest") {
+    reply_json(client, 200, write_test_json());
+    return;
+  }
+  if (method == "POST" && target == "/api/writetest/start") {
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      if (installs.current) {
+        reply_json(client, 409, json_error("正在安装，先暂停再测写盘"));
+        return;
+      }
+    }
+    const AppSettings settings = load_settings();
+    panplay::Destination destination;
+    std::string error;
+    if (settings.dest().empty() || !panplay::parse_destination(settings.dest(), &destination, &error)) {
+      reply_json(client, 400, json_error(error.empty() ? "先在设置里填写存放位置" : error));
+      return;
+    }
+    destination.prefix = settings.prefix();
+    if (error = write_test.start(destination); !error.empty()) {
+      reply_json(client, 409, json_error(error));
+      return;
+    }
+    panplay::log_info("开始写盘测速");
+    reply_json(client, 200, write_test_json());
+    return;
+  }
+  if (method == "POST" && target == "/api/writetest/stop") {
+    write_test.stop();
+    reply_json(client, 200, write_test_json());
     return;
   }
   if (method == "GET" && target == "/api/session") {
