@@ -10,6 +10,7 @@
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
+#include <mbedtls/gcm.h>
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
@@ -23,6 +24,8 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
+#include <thread>
 #include <vector>
 
 #if defined(PANPLAY_EMBEDDED_CA)
@@ -64,6 +67,42 @@ void widen_receive_buffer(SOCKET fd) {
            std::to_string(got >> 10) + " KB");
 }
 #endif
+
+// 下载全走 HTTPS，解密吃的是主机 CPU。每个服务器第一次连上时记一行用的什么加密，
+// 第一次时再量一下本机 AES-GCM 解密多快，看得出解密会不会拖慢下载、有没有用上 CPU 的 AES 指令。
+void measure_aes_gcm() {
+  std::vector<unsigned char> data(16u << 20);
+  unsigned char key[16]{};
+  unsigned char iv[12]{};
+  unsigned char tag[16];
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 128) != 0) {
+    mbedtls_gcm_free(&gcm);
+    return;
+  }
+  const auto started = std::chrono::steady_clock::now();
+  const int code = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_DECRYPT, data.size(), iv, sizeof(iv), nullptr, 0, data.data(),
+                                             data.data(), sizeof(tag), tag);
+  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  mbedtls_gcm_free(&gcm);
+  if (code != 0 || seconds <= 0) return;
+  log_info("本机 AES-128-GCM 解密 " + std::to_string(static_cast<long long>(data.size() / seconds / (1 << 20))) +
+           " MB/s（单核；低于 200 MB/s 多半没用上 CPU 的 AES 指令）");
+}
+
+void note_tls_suite(const std::string& host, const mbedtls_ssl_context& ssl) {
+  static std::mutex mu;
+  static std::set<std::string> seen;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!seen.insert(host).second) return;
+    if (seen.size() > 32) return;
+  }
+  log_info("HTTPS " + host + "：" + mbedtls_ssl_get_version(&ssl) + "，" + mbedtls_ssl_get_ciphersuite(&ssl));
+  static std::once_flag measured;
+  std::call_once(measured, [] { std::thread(measure_aes_gcm).detach(); });
+}
 
 std::string tls_error_text(int code) {
   char text[160]{};
@@ -466,6 +505,7 @@ std::unique_ptr<Connection> open_connection(const Url& url, int receive_timeout_
     return nullptr;
   }
   PANPLAY_DEBUG("连接 " + url.host + " 已建立（TLS），耗时 " + std::to_string(ms_since(open_start)) + " ms");
+  note_tls_suite(url.host, conn->ssl);
   return conn;
 }
 

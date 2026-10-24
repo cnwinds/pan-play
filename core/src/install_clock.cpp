@@ -5,6 +5,13 @@
 #include <cmath>
 #include <cstdio>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/resource.h>
+#include <sys/time.h>
+#endif
+
 namespace panplay {
 namespace {
 
@@ -40,6 +47,23 @@ std::string bytes_text(std::int64_t bytes) {
   return text;
 }
 
+// 整个进程（连同下载线程、解压线程）用掉的 CPU 时间。
+double process_cpu_seconds() {
+#if defined(_WIN32)
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return -1;
+  const auto ticks = [](const FILETIME& time) {
+    return (static_cast<unsigned long long>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+  };
+  return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+#else
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) return -1;
+  const auto seconds = [](const timeval& time) { return static_cast<double>(time.tv_sec) + time.tv_usec / 1e6; };
+  return seconds(usage.ru_utime) + seconds(usage.ru_stime);
+#endif
+}
+
 std::string rate_text(std::int64_t bytes, double ms) {
   const double rate = static_cast<double>(bytes) / (1 << 20) / (ms / 1000);
   char text[32];
@@ -49,7 +73,10 @@ std::string rate_text(std::int64_t bytes, double ms) {
 
 }  // namespace
 
-InstallClock::InstallClock() : outer_(bound), since_(Clock::now()), window_at_(since_) { bound = this; }
+InstallClock::InstallClock()
+    : outer_(bound), since_(Clock::now()), window_at_(since_), cpu_at_start_(process_cpu_seconds()) {
+  bound = this;
+}
 
 InstallClock::~InstallClock() { bound = outer_; }
 
@@ -89,7 +116,10 @@ std::string describe(const Tally& tally, double all_ms, bool durations) {
       add("写了 " + bytes_text(tally.written));
       if (ms >= 50) add("写入时 " + rate_text(tally.written, ms));
     }
-    if (phase == InstallPhase::files && tally.opened > 0) add("新建 " + std::to_string(tally.opened) + " 个文件");
+    if (phase == InstallPhase::files && tally.opened > 0) {
+      add("新建 " + std::to_string(tally.opened) + " 个文件");
+      if (durations) add("平均每个 " + std::to_string(std::lround(ms / tally.opened)) + " ms");
+    }
     text += (text.empty() ? "" : "，") + std::string(kPhaseNames[index]) + " " + std::to_string(percent) + "%" +
             (extra.empty() ? "" : "（" + extra + "）");
   }
@@ -130,8 +160,14 @@ std::string InstallClock::summary(const std::string& name, const std::string& ou
   for (const InstallPhase phase : kReportOrder) {
     if (total_.ms[static_cast<int>(phase)] > total_.ms[static_cast<int>(most)]) most = phase;
   }
+  std::string cpu;
+  if (const double used = process_cpu_seconds() - cpu_at_start_; cpu_at_start_ >= 0 && all > 0 && used >= 0) {
+    char text[64];
+    std::snprintf(text, sizeof(text), "；整个盘游平均占 %.2f 个 CPU 核", used * 1000 / all);
+    cpu = text;
+  }
   return "安装耗时 " + name + "（" + outcome + "）：共 " + seconds_text(all) + "，" + describe(total_, all, true) +
-         "；时间大多花在" + kPhaseNames[static_cast<int>(most)];
+         "；时间大多花在" + kPhaseNames[static_cast<int>(most)] + cpu;
 }
 
 PhaseScope::PhaseScope(InstallPhase phase) : clock_(bound) {
