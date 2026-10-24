@@ -47,6 +47,7 @@ class VolumeStream {
 
  private:
   void open_volume(std::size_t index);
+  void start_next_if_due();
 
   DrivePlugin& drive_;
   std::vector<ArchiveVolume> volumes_;
@@ -54,6 +55,8 @@ class VolumeStream {
   PrefetchOptions options_;
   std::size_t index_ = 0;
   std::unique_ptr<PrefetchReader> reader_;
+  // 当前卷都派给连接以后提前开始下的下一卷。
+  std::unique_ptr<PrefetchReader> next_;
   std::int64_t position_ = 0;
 };
 

@@ -140,8 +140,9 @@ int claim_name(const wchar_t* name) {
   const std::string wanted = lower_copy(base_name(name));
   for (std::size_t i = 0; i < session->volumes.size(); ++i) {
     if (lower_copy(session->volumes[i].name) == wanted) {
-      if (static_cast<std::size_t>(session->index) < session->volumes.size()) {
-        session->volumes[static_cast<std::size_t>(session->index)].reader.reset();
+      // 只留要换到的这卷的预读器（可能已经提前开始下了），别的卷的缓冲马上还掉。
+      for (std::size_t k = 0; k < session->volumes.size(); ++k) {
+        if (k != i) session->volumes[k].reader.reset();
       }
       session->index = static_cast<int>(i);
       session->volumes[i].pos = 0;
@@ -359,6 +360,15 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
   }
   volume.pos += static_cast<std::int64_t>(filled);
   report_bytes(false);
+  // 这卷都派给连接了，下一卷提前开始下，UnRAR 换卷时不用等连接建立。
+  const std::size_t next = static_cast<std::size_t>(session->index) + 1;
+  if (next < session->volumes.size() && !session->volumes[next].reader && volume.reader->fully_assigned()) {
+    VolumeState& upcoming = session->volumes[next];
+    upcoming.reader = std::make_unique<panplay::PrefetchReader>(*session->drive, upcoming.file_id, upcoming.size,
+                                                                session->cancel, session->prefetch);
+    upcoming.reader->start();
+    PANPLAY_DEBUG("RAR 分卷 " + upcoming.name + " 提前开始下载，用预读 #" + std::to_string(upcoming.reader->id()));
+  }
   return static_cast<int>(filled);
 }
 

@@ -63,6 +63,10 @@ class PrefetchReader {
   int id() const { return id_; }
   // 现在用几条连接。
   int connections();
+  // 不等第一次 read 就开始下载：分卷快读完时提前下下一卷，换卷时不用等连接建立。
+  void start();
+  // 整个文件都已经派给连接了（下完或正在下），连接马上要空出来。
+  bool fully_assigned();
 
  private:
   using Clock = std::chrono::steady_clock;
@@ -142,6 +146,7 @@ class PrefetchReader {
   bool stale(std::uint64_t generation);
 
   // 以下都要持有 mu_。
+  void start_locked();
   std::int64_t lowest_unassigned_locked() const;
   bool can_lease_locked(int index) const;
   void make_lease_locked(int index);
@@ -198,6 +203,8 @@ class PrefetchReader {
   std::vector<Worker> workers_state_;
   std::uint64_t generation_ = 0;
   bool started_ = false;
+  // 读取方读过了。提前开始下载时缓冲满是在等上一卷读完，不是解压跟不上。
+  bool read_started_ = false;
   bool stop_ = false;
   std::string error_;
   int in_flight_ = 0;

@@ -115,7 +115,17 @@ std::string VolumeStream::read(std::uint8_t* dst, std::size_t size) {
     filled += got;
     position_ += static_cast<std::int64_t>(got);
   }
+  start_next_if_due();
   return "";
+}
+
+void VolumeStream::start_next_if_due() {
+  if (next_ || !reader_ || index_ + 1 >= volumes_.size() || !reader_->fully_assigned()) return;
+  const ArchiveVolume& volume = volumes_[index_ + 1];
+  next_ = std::make_unique<PrefetchReader>(drive_, volume.file_id, volume.size, cancel_, options_);
+  next_->start();
+  PANPLAY_DEBUG("第 " + std::to_string(index_ + 2) + "/" + std::to_string(volumes_.size()) + " 卷提前开始下载，用预读 #" +
+                std::to_string(next_->id()));
 }
 
 std::string VolumeStream::skip(std::int64_t size) {
@@ -125,8 +135,13 @@ std::string VolumeStream::skip(std::int64_t size) {
 
 void VolumeStream::open_volume(std::size_t index) {
   reader_.reset();
+  if (next_ && index == index_ + 1) {
+    reader_ = std::move(next_);
+  } else {
+    next_.reset();
+    reader_ = std::make_unique<PrefetchReader>(drive_, volumes_[index].file_id, volumes_[index].size, cancel_, options_);
+  }
   index_ = index;
-  reader_ = std::make_unique<PrefetchReader>(drive_, volumes_[index].file_id, volumes_[index].size, cancel_, options_);
   PANPLAY_DEBUG("第 " + std::to_string(index + 1) + "/" + std::to_string(volumes_.size()) + " 卷用预读 #" +
                 std::to_string(reader_->id()));
   position_ = volumes_[index].start;

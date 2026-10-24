@@ -166,11 +166,12 @@ PrefetchReader::~PrefetchReader() {
   cv_.notify_all();
   for (auto& worker : workers_) worker.join();
   std::lock_guard<std::mutex> lock(mu_);
-  if (!started_ || !log_enabled(LogLevel::debug)) return;
+  if (!started_) return;
   account_locked();
   const std::int64_t received = received_.load();
-  PANPLAY_DEBUG("预读 #" + std::to_string(id_) + " 结束：共 " + fixed(total_.elapsed_ms / 1000) + " 秒，收到 " +
-                mb(received) + "，读走 " + mb(total_.delivered) + "；" + describe_locked(total_, received));
+  // 每卷一行，不开详细日志也记：看得出每次请求等首字节多久、多条连接时缓冲够不够用。
+  log_info("预读 #" + std::to_string(id_) + " 结束：共 " + fixed(total_.elapsed_ms / 1000) + " 秒，收到 " + mb(received) +
+           "，读走 " + mb(total_.delivered) + "，缓冲 " + mb(budget_) + "；" + describe_locked(total_, received));
 }
 
 int PrefetchReader::connections() {
@@ -648,7 +649,7 @@ void PrefetchReader::account_locked() {
     if (worker.lease.active && worker.lease.connected && worker.lease.generation == generation_) ++busy;
   }
   const std::int64_t front = download_front_locked();
-  const bool full = error_.empty() && front < size_ &&
+  const bool full = read_started_ && error_.empty() && front < size_ &&
                     front - position_ >= budget_ - static_cast<std::int64_t>(options_.block_size);
   count_locked([&](Stats& stats) {
     stats.elapsed_ms += dt;
@@ -989,16 +990,36 @@ bool PrefetchReader::detail_locked() {
   return true;
 }
 
+void PrefetchReader::start() {
+  std::lock_guard<std::mutex> lock(mu_);
+  start_locked();
+}
+
+void PrefetchReader::start_locked() {
+  if (started_) return;
+  started_ = true;
+  const auto now = Clock::now();
+  accounted_at_ = window_at_ = review_from_ = changed_at_ = tuned_at_ = multi_since_ = starve_from_ = now;
+  window_received_ = review_received_ = received_.load();
+  cv_.notify_all();
+}
+
+bool PrefetchReader::fully_assigned() {
+  std::lock_guard<std::mutex> lock(mu_);
+  return started_ && error_.empty() && lowest_unassigned_locked() >= size_;
+}
+
 std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::string* error) {
   if (size == 0 || position_ >= size_) return 0;
   PhaseScope timing(InstallPhase::download);
   std::unique_lock<std::mutex> lock(mu_);
-  if (!started_) {
-    started_ = true;
-    const auto now = Clock::now();
-    accounted_at_ = window_at_ = review_from_ = changed_at_ = tuned_at_ = multi_since_ = starve_from_ = now;
-    window_received_ = review_received_ = received_.load();
-    cv_.notify_all();
+  start_locked();
+  if (!read_started_) {
+    read_started_ = true;
+    // 提前下载那段时间读取方还没来，不拿来判断该加还是该减连接。
+    review_from_ = changed_at_ = Clock::now();
+    review_received_ = received_.load();
+    review_wait_ms_ = review_full_ms_ = 0;
   }
   bool waiting = false;
   Clock::time_point waited_from;
