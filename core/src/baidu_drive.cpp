@@ -47,6 +47,12 @@ constexpr int kQrLifetimeSeconds = 300;
 constexpr int kLongPollTimeoutMs = 40000;
 // 百度返回 -6 表示登录态失效。
 constexpr int kErrnoNotLoggedIn = -6;
+// 网页接口（建目录、移动、删除）要带 bdstoken。用网盘客户端的 UA，和盘架一样。
+const std::string kNetdiskUa =
+    "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;";
+// 百度风控要求安全验证时（网页版会弹短信验证）删不掉文件，移动不受影响，改为移进这个目录等用户自己清空。
+constexpr int kErrnoNeedVerify = 132;
+const std::string kTrashDir = "/盘游待删除";
 
 bool write_file_atomic(const std::string& path, const std::string& text) {
   const std::filesystem::path target = std::filesystem::u8path(path);
@@ -457,7 +463,101 @@ class BaiduDrive final : public DrivePlugin {
     return "上传失败，状态 " + std::to_string(response.status) + (code != 0 ? " error_code=" + std::to_string(code) : "");
   }
 
+  std::string remove_path(const std::string& path, std::string* moved_to) override {
+    if (moved_to) moved_to->clear();
+    if (path.empty() || path == "/") return "不能删除网盘根目录";
+    std::string token;
+    if (auto error = bdstoken(&token); !error.empty()) return error;
+    int code = 0;
+    if (auto error = file_manager(token, "delete", "[\"" + json_escape(path) + "\"]", &code); !error.empty()) return error;
+    if (code == 0) return "";
+    if (code != kErrnoNeedVerify) return "百度删除失败 errno=" + std::to_string(code);
+    Json created;
+    if (auto error = web_api("/api/create", {{"a", "commit"}},
+                             "path=" + url_encode(kTrashDir) + "&isdir=1&block_list=%5B%5D&rtype=0", token, &created);
+        !error.empty()) {
+      return error;
+    }
+    // -8：目录已经有了
+    const int create_code = static_cast<int>(created.num("errno"));
+    if (create_code != 0 && create_code != -8) return "百度要求安全验证、不能直接删除，建 " + kTrashDir + " 也失败了 errno=" + std::to_string(create_code);
+    const std::string name = path.substr(path.rfind('/') + 1);
+    for (const std::string& new_name : {name, name + " (" + now_ms_text() + ")"}) {
+      const std::string item = "[{\"path\":\"" + json_escape(path) + "\",\"dest\":\"" + json_escape(kTrashDir) +
+                               "\",\"newname\":\"" + json_escape(new_name) + "\"}]";
+      if (auto error = file_manager(token, "move", item, &code); !error.empty()) return error;
+      if (code == 0) {
+        if (moved_to) *moved_to = kTrashDir;
+        return "";
+      }
+    }
+    return "百度要求安全验证、不能直接删除，移到 " + kTrashDir + " 也失败了 errno=" + std::to_string(code);
+  }
+
  private:
+  std::string bdstoken(std::string* token) {
+    const std::string cookie = pan_cookie();
+    if (cookie.empty()) return "百度未登录";
+    const HttpResponse response =
+        client_.send({"https://pan.baidu.com/api/gettemplatevariable?clienttype=0&app_id=250528&web=1&fields=" +
+                          url_encode("[\"bdstoken\"]"),
+                      "GET",
+                      "",
+                      {{"User-Agent", kNetdiskUa}, {"Referer", kPanHome}, {"Cookie", cookie}}});
+    if (!response.error.empty()) return response.error;
+    const Json json = Json::parse(response.body, nullptr);
+    const int code = static_cast<int>(json.num("errno"));
+    if (code == kErrnoNotLoggedIn) return signed_out();
+    const Json* result = json.get("result");
+    *token = result ? result->str("bdstoken") : "";
+    if (code != 0 || token->empty()) return "没有拿到百度网盘的 bdstoken errno=" + std::to_string(code);
+    return "";
+  }
+
+  // 调网页接口，form 是已经编好的表单。百度回的 errno 由调用方看。
+  std::string web_api(const std::string& path, const std::vector<std::pair<std::string, std::string>>& query,
+                      const std::string& form, const std::string& token, Json* out) {
+    const std::string cookie = pan_cookie();
+    if (cookie.empty()) return "百度未登录";
+    std::string url = "https://pan.baidu.com" + path + "?clienttype=0&app_id=250528&web=1&bdstoken=" + url_encode(token);
+    for (const auto& [key, value] : query) url += "&" + key + "=" + url_encode(value);
+    const HttpResponse response = client_.send({url,
+                                                "POST",
+                                                form,
+                                                {{"User-Agent", kNetdiskUa},
+                                                 {"Referer", kPanHome},
+                                                 {"Cookie", cookie},
+                                                 {"Content-Type", "application/x-www-form-urlencoded"}}});
+    if (!response.error.empty()) return response.error;
+    std::string parse_error;
+    *out = Json::parse(response.body, &parse_error);
+    if (!parse_error.empty() || out->get("errno") == nullptr) {
+      return "百度返回的内容看不懂，状态 " + std::to_string(response.status);
+    }
+    if (out->num("errno") == kErrnoNotLoggedIn) return signed_out();
+    return "";
+  }
+
+  // 同步执行。整体 errno 为 0 时还要逐项看 info，code 取整体或第一个出错项的 errno。
+  std::string file_manager(const std::string& token, const std::string& opera, const std::string& filelist, int* code) {
+    Json json;
+    if (auto error = web_api("/api/filemanager", {{"opera", opera}, {"async", "0"}, {"onnest", "fail"}},
+                             "filelist=" + url_encode(filelist) + "&ondup=fail", token, &json);
+        !error.empty()) {
+      return error;
+    }
+    *code = static_cast<int>(json.num("errno"));
+    if (const Json* info = json.get("info"); *code == 0 && info && info->type == Json::Type::array) {
+      for (const Json& item : info->array) {
+        if (const int item_code = static_cast<int>(item.num("errno")); item_code != 0) {
+          *code = item_code;
+          break;
+        }
+      }
+    }
+    return "";
+  }
+
   std::unique_ptr<ByteStream> open_bytes(const std::string& file_id, std::int64_t offset, std::int64_t length,
                                          std::string* error, AbortSignal* abort) {
     std::string range = "bytes=" + std::to_string(offset) + "-";

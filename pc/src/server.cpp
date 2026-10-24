@@ -2204,6 +2204,75 @@ void handle_client(SOCKET client, bool local_peer) {
     return;
   }
 #endif
+  // 把游戏文件夹从网盘删掉腾空间：装好了不用再留，或者装不了、玩不了。主机上装好的游戏不动，评价按内容指纹记着也不丢。
+  // 只删游戏库目录下列出来的游戏文件夹；主机上留着没装完的文件时不删，不然没地方再删那些文件。
+  if (method == "POST" && target == "/api/drive/remove") {
+    std::string parse_error;
+    const panplay::Json json = panplay::Json::parse(body, &parse_error);
+    const std::string path = json.str("path");
+    if (!parse_error.empty() || path.empty()) {
+      reply_json(client, 400, json_error(parse_error.empty() ? "缺少游戏目录" : parse_error));
+      return;
+    }
+    auto drive = open_drive();
+    std::string error;
+    const auto listing = shelf_listing(*drive, false, &error);
+    if (!listing) {
+      reply_json(client, 500, json_error(error));
+      return;
+    }
+    const auto folder = std::find_if(listing->folders.begin(), listing->folders.end(),
+                                     [&](const ShelfListing::Folder& item) { return item.path == path; });
+    if (folder == listing->folders.end()) {
+      reply_json(client, 400, json_error("游戏库目录里没有这个文件夹，可能已经从网盘删掉了"));
+      return;
+    }
+    // 游戏库设成网盘根目录时，盘游自己放评价的目录和待删除目录也会列成游戏。
+    if (path == "/盘游" || path == "/盘游待删除") {
+      reply_json(client, 400, json_error("这是盘游自己用的文件夹，不能当游戏删除"));
+      return;
+    }
+    if (listing->sink_ready && shelf_state(listing->placement, folder->name, folder->title_id, path) == "continue") {
+      reply_json(client, 409, json_error("存放位置里还留着这个游戏没装完的文件，先在「⋯」里删除已装的部分，再从网盘删除"));
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      const bool queued = (installs.current && installs.current->path == path) ||
+                          std::any_of(installs.waiting.begin(), installs.waiting.end(),
+                                      [&](const InstallTask& task) { return task.path == path; });
+      if (queued) {
+        reply_json(client, 409, json_error("这个游戏还在安装队列里，先取消再从网盘删除"));
+        return;
+      }
+      if (!installs.discarding.insert(path).second) {
+        reply_json(client, 409, json_error("正在处理这个游戏，稍等再试"));
+        return;
+      }
+    }
+    std::string moved_to;
+    panplay::log_info("从网盘删除 " + path);
+    error = drive->remove_path(path, &moved_to);
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      installs.discarding.erase(path);
+      if (error.empty()) erase_path(installs.finished, path);
+    }
+    if (!error.empty()) {
+      panplay::log_warn("从网盘删除失败 " + path + "：" + error);
+      reply_json(client, 500, json_error(error));
+      return;
+    }
+    if (!moved_to.empty()) panplay::log_warn("百度要求安全验证、不能直接删除，已移到 " + moved_to + "：" + path);
+    forget_install_progress(path);
+    forget_game_detail(path);
+    {
+      std::lock_guard<std::mutex> lock(shelf_mu);
+      shelf_cache.reset();
+    }
+    reply_json(client, 200, "{\"moved_to\":\"" + panplay::json_escape(moved_to) + "\"}");
+    return;
+  }
   if (method == "POST" && (target == "/api/discard" || target == "/api/uninstall")) {
     const bool whole = target == "/api/uninstall";
     std::string parse_error;

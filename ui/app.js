@@ -1169,6 +1169,7 @@ function openDetail(game, opener) {
   const registerItem = menuItem("注册到主机桌面");
   const discard = menuItem("删除已装的部分", "danger");
   const remove = menuItem("删除游戏", "danger");
+  const unshelve = menuItem("从网盘删除", "danger");
   const more = el("button", "btn more");
   more.type = "button";
   more.setAttribute("aria-haspopup", "menu");
@@ -1176,7 +1177,7 @@ function openDetail(game, opener) {
   more.innerHTML = '<svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true" fill="currentColor"><circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13" cy="8" r="1.5"/></svg>';
   const menu = el("div", "more-menu");
   menu.setAttribute("role", "menu");
-  menu.append(adjust, registerItem, discard, remove);
+  menu.append(adjust, registerItem, discard, remove, unshelve);
   const moreWrap = el("div", "more-wrap");
   moreWrap.append(more, menu);
   let menuOpen = false;
@@ -1426,6 +1427,8 @@ function openDetail(game, opener) {
   // refreshing：正在向商店重新取资料；refreshResult：刚取完时图标短暂显示的结果（done / warn）。
   let refreshing = false;
   let refreshResult = "";
+  // 已经从网盘删掉了：游戏库里不再有它，详情只留着显示结果。
+  let unshelved = false;
   const paint = () => {
     syncGameState(game);
     title.textContent = displayName(game);
@@ -1455,11 +1458,12 @@ function openDetail(game, opener) {
       label = { continue: "排队继续安装", update: "排队安装更新" }[game.state] || "加入安装队列";
     }
     if (waitingLayers) label = "正在读取压缩包…";
+    if (unshelved) label = "已从网盘删除";
     const onConsole = game.console && ["installed", "update"].includes(game.state) ? consoleSummary(game.console) : null;
     if (game.state === "installed" && onConsole && onConsole.healthy) label = "已安装 · 已在主机桌面";
     action.textContent = label;
     action.classList.toggle("done", game.state === "installed");
-    action.disabled = waitingLayers || running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
+    action.disabled = unshelved || waitingLayers || running || queued || refused || ["installed", "unsupported", "empty"].includes(game.state) ||
       (game.state !== "need-settings" && archivesRead && !game.formats);
     if (picking && (running || queued)) {
       picking = false;
@@ -1476,8 +1480,9 @@ function openDetail(game, opener) {
     const installedNow = ["installed", "update"].includes(game.state);
     reviewItem.hidden = !game.fingerprint || busy || (!game.review && !installedNow);
     reviewItem.textContent = game.review ? "修改评价" : "评价这个版本";
-    paintReview(installedNow, busy);
-    moreWrap.hidden = [adjust, registerItem, reviewItem, discard, remove].every((item) => item.hidden);
+    unshelve.hidden = !game.path || busy || game.state === "continue";
+    paintReview(installedNow, busy || unshelved);
+    moreWrap.hidden = unshelved || [adjust, registerItem, reviewItem, discard, remove, unshelve].every((item) => item.hidden);
     if (moreWrap.hidden && menuOpen) setMenu(false);
     consoleRow.hidden = !onConsole || (onConsole.healthy && !consoleBusy) || picking || confirm.open || busy;
     if (!consoleRow.hidden) {
@@ -1512,7 +1517,7 @@ function openDetail(game, opener) {
       resumeAll.hidden = !queuePaused;
       first.hidden = position <= 1;
     }
-    const finished = task && task.state === "done";
+    const finished = !unshelved && task && task.state === "done";
     if (running || queued) say("");
     const failed = Boolean(notice) && noticeWarn;
     status.hidden = !failed && !finished && !notice;
@@ -1670,6 +1675,49 @@ function openDetail(game, opener) {
         button: "确认删除",
       },
     ], "/api/uninstall", "已从存放位置删除。", more);
+  });
+  unshelve.addEventListener("click", () => {
+    const installedNow = ["installed", "update"].includes(game.state);
+    const body = [el("p", "", "会删掉网盘里这个游戏的整个文件夹："), el("code", "confirm-path", game.path)];
+    body.push(el("p", "", installedNow
+      ? "主机上装好的游戏不受影响，照样能玩；但它会从盘游的游戏库里消失，以后在盘游里就删不了它了。"
+      : "删除后它会从游戏库里消失。"));
+    if (game.review && !game.review.playable) {
+      body.push(el("p", "", "你标的「有问题」会留着，盘架看到同一份文件时不会再转存回来。"));
+    }
+    body.push(el("p", "", "删掉的文件进百度网盘回收站，一段时间内还能在网盘 App 里找回。"));
+    const size = game.archive_bytes ? `（腾出约 ${formatBytes(game.archive_bytes)}）` : "";
+    status.hidden = true;
+    clearFailure();
+    confirm.ask({
+      steps: [{ head: `从网盘删除「${displayName(game)}」${size}？`, body, button: "从网盘删除" }],
+      busy: "正在删除…",
+      onConfirm: async () => {
+        try {
+          const data = await api("/api/drive/remove", { path: game.path });
+          if (!detail || detail.game !== game) return;
+          unshelved = true;
+          games = games.filter((item) => item.path !== game.path);
+          if (data.moved_to) {
+            detail.fail(`百度要求安全验证、不能直接删除，已移到网盘的 ${data.moved_to} 文件夹。在百度网盘 App 里删掉这个文件夹才会腾出空间。`);
+          } else {
+            say("已从网盘删除，文件在百度网盘回收站里。");
+          }
+          loadGames();
+        } catch (error) {
+          if (detail && detail.game === game) detail.fail(error.message);
+        }
+        if (!detail || detail.game !== game) return;
+        confirm.close();
+        paint();
+        $("#detail-close").focus();
+      },
+      onCancel: () => {
+        paint();
+        more.focus();
+      },
+    });
+    paint();
   });
   resumeAll.addEventListener("click", () => queueAction("/api/queue/resume", {}));
   first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));

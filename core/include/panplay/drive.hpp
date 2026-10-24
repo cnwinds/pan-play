@@ -86,6 +86,9 @@ class DrivePlugin {
                                                  std::string* error, AbortSignal* abort = nullptr);
   // 写一个几 KB 的小文件（评价同步用），已有的覆盖，上级目录没有时网盘自己建。返回出错原因。
   virtual std::string write_small_file(const std::string& path, const std::string& bytes);
+  // 从网盘删掉一个文件或整个文件夹，删掉的进网盘回收站。网盘不让直接删时可以改为移进一个待删除目录，
+  // 这时 moved_to 写这个目录，要用户自己去网盘里清空才释放空间。返回出错原因。
+  virtual std::string remove_path(const std::string& path, std::string* moved_to);
 };
 
 struct BaiduConfig {

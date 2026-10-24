@@ -109,6 +109,11 @@ std::unique_ptr<ByteStream> DrivePlugin::open_range(const std::string& file_id, 
 
 std::string DrivePlugin::write_small_file(const std::string&, const std::string&) { return "这个网盘不支持写文件"; }
 
+std::string DrivePlugin::remove_path(const std::string&, std::string* moved_to) {
+  if (moved_to) moved_to->clear();
+  return "这个网盘不支持删除文件";
+}
+
 namespace {
 
 PrefetchOptions sane(PrefetchOptions options) {
