@@ -113,6 +113,8 @@ void sync_loop(const std::function<std::shared_ptr<panplay::DrivePlugin>()>& ope
   const std::string id = device_id();
   const std::string name = device_name();
   const std::string own_file = id + ".json";
+  // 断网（比如主机进了待机）时每 10 分钟都会失败，只在第一次记警告，恢复时再记一行。
+  bool pull_failing = false;
   std::this_thread::sleep_for(std::chrono::seconds(5));
   while (true) {
     bool do_upload = false;
@@ -161,7 +163,15 @@ void sync_loop(const std::function<std::shared_ptr<panplay::DrivePlugin>()>& ope
     }
     if (do_refresh) {
       if (const std::string error = pull(*drive, own_file); !error.empty()) {
-        panplay::log_warn("没能读到别的设备的评价：" + error);
+        if (pull_failing) {
+          PANPLAY_DEBUG("还是没能读到别的设备的评价：" + error);
+        } else {
+          panplay::log_warn("没能读到别的设备的评价：" + error + "（恢复之前不再重复记）");
+        }
+        pull_failing = true;
+      } else if (pull_failing) {
+        pull_failing = false;
+        panplay::log_info("又能读到别的设备的评价了");
       }
     }
   }
