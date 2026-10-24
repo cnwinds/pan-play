@@ -361,11 +361,22 @@ struct Pool {
         ++it;
       }
     }
-    const auto found = idle.find(key);
-    if (found == idle.end()) return nullptr;
-    auto conn = std::move(found->second);
-    idle.erase(found);
-    return conn;
+    for (auto found = idle.find(key); found != idle.end(); found = idle.find(key)) {
+      auto conn = std::move(found->second);
+      idle.erase(found);
+      // 空闲连接上本不该有数据，可读就是服务器发了关闭（FIN 或 TLS close_notify），发请求只会白失败一次。
+      if (!readable_now(conn->fd)) return conn;
+      PANPLAY_DEBUG("连接 " + key + " 已被服务器关掉，不再复用（" + conn->story() + "）");
+    }
+    return nullptr;
+  }
+
+  static bool readable_now(SOCKET fd) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+    timeval wait{};
+    return select(fd + 1, &fds, nullptr, nullptr, &wait) != 0;
   }
 
   void put(std::unique_ptr<Connection> conn) {
