@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <string>
 
@@ -22,6 +23,10 @@ std::string running_app_title_id();
 
 // 把进程身份临时换成能注册应用、挂载目录的特权身份，执行完换回。同一时间只有一个在执行。
 std::string with_privileged_auth(const std::function<std::string()>& action);
+
+// 退出前调用：等别的线程做完正在进行的注册、挂载、加载系统库，然后一直占着锁，之后谁也开始不了新的。
+// 等了 wait 还没做完返回 false。
+bool hold_privileged_ops(std::chrono::milliseconds wait);
 
 // 注册 /user/app/<title_id> 下准备好的应用。固件 12 以下只注册这一个，12 起整体重新扫描。
 // 先 load_app_inst_util，再在 with_privileged_auth 里调用。返回错误，成功（含已存在、已恢复）为空。

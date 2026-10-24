@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 namespace {
 
@@ -142,6 +143,15 @@ std::string with_privileged_auth(const std::function<std::string()>& action) {
   }
   if (kernel_set_ucred_authid(-1, own_auth_id) != 0) panplay::log_error("换回进程原来的身份失败");
   return error;
+}
+
+bool hold_privileged_ops(std::chrono::milliseconds wait) {
+  const auto deadline = std::chrono::steady_clock::now() + wait;
+  while (!auth_mu.try_lock()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return true;
 }
 
 // 固件 12 起按目录注册单个应用在载荷里用不了（ShadowMountPlus 同样改用整体重新扫描）。

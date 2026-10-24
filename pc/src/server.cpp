@@ -269,6 +269,8 @@ struct InstallQueue {
   std::set<std::string> discarding;
   // 全部暂停：排队的不开始，用户点继续之前一直停着；存到磁盘，重开程序后还是暂停的。
   bool paused = false;
+  // 正在退出：不再开始新的安装。
+  bool quitting = false;
   bool worker_running = false;
   std::thread worker;
 };
@@ -1214,7 +1216,7 @@ void queue_worker() {
     std::shared_ptr<panplay::CancelToken> cancel;
     {
       std::lock_guard<std::mutex> lock(installs.mu);
-      if (installs.waiting.empty() || installs.paused) {
+      if (installs.waiting.empty() || installs.paused || installs.quitting) {
         installs.worker_running = false;
         return;
       }
@@ -1262,8 +1264,47 @@ void queue_worker() {
   }
 }
 
+// 退出前先让手上的事停在稳妥的地方：正在装的游戏停在能续装的地方、回到队首；正在删的删完；
+// PS5 上不在注册应用、挂载目录这些系统调用中途结束进程。等太久就不等了，照样退出。
+void stop_for_quit() {
+  using Clock = std::chrono::steady_clock;
+  constexpr auto kWait = std::chrono::seconds(20);
+  const auto started = Clock::now();
+  std::string busy;
+  {
+    std::lock_guard<std::mutex> lock(installs.mu);
+    installs.quitting = true;
+    if (installs.current && installs.current->cancel) {
+      busy = "，先停下正在装的 " + installs.current->path;
+      installs.current->pausing = true;
+      installs.current->cancel->cancel();
+    }
+    if (!installs.discarding.empty()) busy += "，等 " + std::to_string(installs.discarding.size()) + " 个游戏删完";
+  }
+  panplay::log_info("收到退出请求" + busy);
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      if (!installs.worker_running && installs.discarding.empty()) break;
+    }
+    if (Clock::now() - started >= kWait) {
+      panplay::log_warn("退出：等了 20 秒安装或删除还没停下，直接退出");
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+#if defined(PANPLAY_PS5)
+  const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(kWait - (Clock::now() - started));
+  if (!hold_privileged_ops(std::max(left, std::chrono::milliseconds(2000)))) {
+    panplay::log_warn("退出：注册应用或挂载目录一直没做完，直接退出");
+  }
+#endif
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+  panplay::log_info("退出：用了 " + std::to_string(ms) + " ms 停好，进程结束");
+}
+
 void start_worker_locked() {
-  if (installs.worker_running || installs.paused || installs.waiting.empty()) return;
+  if (installs.worker_running || installs.paused || installs.quitting || installs.waiting.empty()) return;
   if (installs.worker.joinable()) installs.worker.join();
   installs.worker_running = true;
   installs.worker = std::thread(queue_worker);
@@ -1731,12 +1772,15 @@ void handle_client(SOCKET client, bool local_peer) {
     reply_json(client, 200, catalog_status_json());
     return;
   }
-  // 队列一直存在磁盘上，直接结束进程也不丢：正在装的游戏下次启动接着装。
+  // 正在装的游戏停下后回到队首，下次启动接着装。
+  // 停好以后仍用 _Exit：走正常退出时，系统库在析构全局对象时抛 resource deadlock would occur 并中止进程。
   if (method == "POST" && target == "/api/quit") {
     reply_json(client, 200, "{}");
     std::thread([] {
       std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      stop_for_quit();
       if (on_quit) on_quit();
+      std::fflush(nullptr);
       std::_Exit(0);
     }).detach();
     return;
