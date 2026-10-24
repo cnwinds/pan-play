@@ -74,6 +74,8 @@ let metaRounds = 0;
 let tasks = [];
 // 全部暂停：排队的游戏都不开始，等用户点全部继续。
 let queuePaused = false;
+// 不是用户点的暂停（存放位置写满了）时服务端给的原因。
+let queuePauseReason = "";
 let queueTimer = 0;
 let dockOpen = false;
 let detail = null;
@@ -515,6 +517,7 @@ function jobText(current, inDetail = false) {
   if (current.state === "queued") {
     const position = queuePosition(current.path);
     if (!queuePaused) return `排队中，第 ${position} 个`;
+    if (queuePauseReason && position === 1) return queuePauseReason;
     return taskStarted(current) ? `已暂停，装到 ${Math.floor(taskFraction(current) * 100)}%` : `已暂停，第 ${position} 个`;
   }
   if (current.state === "running") {
@@ -584,6 +587,7 @@ function setQueue(data) {
   const active = new Set(tasks.filter((task) => task.state !== "done").map((task) => task.path));
   tasks = data.tasks || [];
   queuePaused = Boolean(data.paused);
+  queuePauseReason = queuePaused ? data.pause_reason || "" : "";
   if (Number.isFinite(data.utc_offset_min)) serverUtcOffset = data.utc_offset_min;
   const settled = tasks.filter((task) => task.state === "done" && active.has(task.path)).map((task) => task.path);
   applyQueue();
@@ -670,6 +674,7 @@ function dockSummary() {
   if (running) return { head: running, state: "installing", text: jobText(running) + waitText, p: taskFraction(running) };
   if (queued.length && queuePaused) {
     const head = queued[0];
+    if (queuePauseReason) return { head, state: "error", text: queuePauseReason, p: taskFraction(head) };
     const parts = ["已暂停"];
     if (taskStarted(head)) parts.push(`装到 ${Math.floor(taskFraction(head) * 100)}%`);
     if (queued.length > 1) parts.push(`还有 ${queued.length - 1} 个等待`);
@@ -694,7 +699,7 @@ function paintDock() {
   dockTitle.textContent = displayName(summary.head);
   dockStatus.textContent = summary.text;
   const pace = taskPace(running);
-  dockStatus.title = pace && pace.left !== null ? `平均 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : "";
+  dockStatus.title = pace && pace.left !== null ? `平均 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : queuePauseReason;
   const artKey = summary.head.path + "\n" + (summary.head.cover_url || "");
   if (dockArtKey !== artKey) {
     dockArtKey = artKey;
@@ -713,7 +718,7 @@ function paintDock() {
   dockAction.className = "btn small " + (resume ? "primary" : "quiet");
   dockAction.disabled = pausing;
   dockAction.title = pending && !resume && !pausing ? "正在装的停在能续装的地方，排队的都先不开始" : "";
-  dockHeading.textContent = queuePaused && pending ? "安装队列 · 已暂停" : "安装队列";
+  dockHeading.textContent = queuePaused && pending ? (queuePauseReason ? "安装队列 · 空间不够，已全部暂停" : "安装队列 · 已暂停") : "安装队列";
   dockToggle.setAttribute("aria-expanded", String(dockOpen));
   dockToggle.setAttribute("aria-label", dockOpen ? "收起安装队列" : "展开安装队列");
   dockPanel.hidden = !dockOpen;

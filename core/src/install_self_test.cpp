@@ -350,10 +350,12 @@ class MemorySink final : public InstallSink {
   };
 
   std::map<std::string, File> files;
+  // 文件内容还能写多少字节，写超了报存放位置空间不够；负数不限。
+  std::int64_t room = -1;
 
   std::unique_ptr<FileWriter> open_writer(const std::string& path, std::int64_t, std::string*) override {
     files[path] = File{};
-    return std::make_unique<Writer>(files[path]);
+    return std::make_unique<Writer>(files[path], room);
   }
   std::string ensure_dir(const std::string&) override { return ""; }
   std::int64_t file_size(const std::string& path, std::string*) override {
@@ -400,8 +402,12 @@ class MemorySink final : public InstallSink {
  private:
   class Writer final : public FileWriter {
    public:
-    explicit Writer(File& file) : file_(file) {}
+    Writer(File& file, std::int64_t& room) : file_(file), room_(room) {}
     std::string write(const std::uint8_t* data, std::size_t size) override {
+      if (room_ >= 0) {
+        if (static_cast<std::int64_t>(size) > room_) return disk_full_error("盘写满了");
+        room_ -= static_cast<std::int64_t>(size);
+      }
       file_.size += static_cast<std::int64_t>(size);
       if (file_.size <= (1 << 20)) file_.bytes.insert(file_.bytes.end(), data, data + size);
       else file_.bytes.clear();
@@ -411,6 +417,7 @@ class MemorySink final : public InstallSink {
 
    private:
     File& file_;
+    std::int64_t& room_;
   };
 };
 
@@ -1383,6 +1390,27 @@ int zip64_split_test() {
   return 0;
 }
 
+int disk_full_test() {
+  FakeDrive drive;
+  const auto small = pattern(5000, 5);
+  const auto big = pattern(300000, 9);
+  drive.add("/apps/panplay/Full PPSA41000/game.zip", make_zip({{"sce_sys/param.json", small, true}, {"eboot.bin", big, false}}, {}).front());
+  MemorySink sink;
+  sink.room = 100000;
+  InstallRequest request;
+  request.source_dir = "/apps/panplay/Full PPSA41000";
+  const InstallResult full = install_game(drive, sink, request);
+  if (full.status != "error" || !is_disk_full_error(full.message)) return fail("存放位置写满时没有报空间不够: " + full.message);
+  if (full.auto_resume) return fail("存放位置写满了不该自动再装");
+  if (!full.retryable) return fail("腾出空间后应该能接着装");
+  sink.room = -1;
+  const InstallResult resumed = install_game(drive, sink, request);
+  if (resumed.status != "installed") return fail("腾出空间后没有接着装完: " + resumed.message);
+  if (sink.files["/data/homebrew/PPSA41000/eboot.bin"].bytes.size() != big.size()) return fail("腾出空间后装的大文件大小不对");
+  if (!is_disk_full_error(disk_full_error("主机存储空间不足（552）"))) return fail("FTP 空间不足没有认成写满");
+  return 0;
+}
+
 int variant_test() {
   if (variant_format("/apps/panplay/Var PPSA41000/@exfat") != "exfat" || !variant_format("/apps/panplay/Var PPSA41000").empty() ||
       !variant_format("/apps/panplay/@exfat/Var PPSA41000").empty()) {
@@ -2323,6 +2351,7 @@ int run_install_pipeline_self_test() {
   if (const int code = package_and_duplicate_test()) return code;
   if (const int code = many_files_test()) return code;
   if (const int code = zip64_split_test()) return code;
+  if (const int code = disk_full_test()) return code;
   if (const int code = variant_test()) return code;
   if (const int code = sparse_write_test()) return code;
   if (const int code = cancel_install_test()) return code;

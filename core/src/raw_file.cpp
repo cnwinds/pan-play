@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include <cerrno>
+
 #if defined(_WIN32)
 #include <fcntl.h>
 #include <io.h>
@@ -31,7 +33,11 @@ long long write_some(int fd, const void* data, std::size_t size) {
 int sync_fd(int fd) { return _commit(fd); }
 int close_fd(int fd) { return _close(fd); }
 bool seek_ahead(int fd, std::uint64_t size) { return _lseeki64(fd, static_cast<__int64>(size), SEEK_CUR) >= 0; }
-bool resize_fd(int fd, std::uint64_t size) { return _chsize_s(fd, static_cast<__int64>(size)) == 0; }
+bool resize_fd(int fd, std::uint64_t size) {
+  const errno_t code = _chsize_s(fd, static_cast<__int64>(size));
+  if (code != 0) errno = code;
+  return code == 0;
+}
 #else
 int open_for_write(const std::filesystem::path& path, bool truncate) {
   return ::open(path.c_str(), O_WRONLY | (truncate ? O_CREAT | O_TRUNC : 0), 0666);
@@ -45,33 +51,53 @@ bool resize_fd(int fd, std::uint64_t size) { return ::ftruncate(fd, static_cast<
 
 }  // namespace
 
+bool RawFileOut::failed() {
+  error_ = errno != 0 ? errno : EIO;
+  return false;
+}
+
 bool RawFileOut::open(const std::filesystem::path& path) {
   close();
+  errno = 0;
   fd_ = open_for_write(path, true);
-  return ok();
+  return ok() || failed();
 }
 
 bool RawFileOut::write_all(const void* data, std::size_t size) {
   if (fd_ < 0) return false;
   const char* at = static_cast<const char*>(data);
   while (size > 0) {
+    errno = 0;
     const long long written = write_some(fd_, at, size);
-    if (written <= 0) return false;
+    if (written < 0 && errno == EINTR) continue;
+    // 一个字节都写不进去又没报错，只能是盘满了。
+    if (written == 0 && errno == 0) errno = ENOSPC;
+    if (written <= 0) return failed();
     at += written;
     size -= static_cast<std::size_t>(written);
   }
   return true;
 }
 
-bool RawFileOut::skip(std::uint64_t size) { return fd_ >= 0 && seek_ahead(fd_, size); }
+bool RawFileOut::skip(std::uint64_t size) {
+  errno = 0;
+  return fd_ >= 0 && (seek_ahead(fd_, size) || failed());
+}
 
-bool RawFileOut::set_size(std::uint64_t size) { return fd_ >= 0 && resize_fd(fd_, size); }
+bool RawFileOut::set_size(std::uint64_t size) {
+  errno = 0;
+  return fd_ >= 0 && (resize_fd(fd_, size) || failed());
+}
 
-bool RawFileOut::sync() { return fd_ >= 0 && sync_fd(fd_) == 0; }
+bool RawFileOut::sync() {
+  errno = 0;
+  return fd_ >= 0 && (sync_fd(fd_) == 0 || failed());
+}
 
 bool RawFileOut::close() {
   if (fd_ < 0) return true;
-  const bool closed = close_fd(fd_) == 0;
+  errno = 0;
+  const bool closed = close_fd(fd_) == 0 || failed();
   fd_ = -1;
   return closed;
 }

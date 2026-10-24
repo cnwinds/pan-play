@@ -24,9 +24,13 @@ class RawFileOut {
   bool set_size(std::uint64_t size);
   bool sync();
   bool close();
+  // 上一次失败时的 errno（ENOSPC 是盘满了），没失败过为 0。
+  int error() const { return error_; }
 
  private:
+  bool failed();
   int fd_ = -1;
+  int error_ = 0;
 };
 
 // 测硬盘读速度用：尽量绕过系统缓存直接从盘上读（刚写完的文件还在缓存里，普通读量到的是内存速度）。

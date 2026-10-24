@@ -48,6 +48,10 @@ struct FtpEndpoint {
 std::unique_ptr<InstallSink> make_local_sink(std::string root);
 std::unique_ptr<InstallSink> make_ftp_sink(FtpEndpoint endpoint, std::string* error);
 
+// 存放位置写满了。重试、换下一个游戏都只会接着失败，整个安装队列要停下等用户腾出空间。
+std::string disk_full_error(const std::string& detail);
+bool is_disk_full_error(const std::string& message);
+
 int run_install_sink_self_test();
 
 }  // namespace panplay

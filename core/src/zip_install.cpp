@@ -576,7 +576,8 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
     result.message = message == kInterrupted ? "已中断，再次执行安装会继续" : message;
     result.retryable = !is_install_package_error(message) && !is_unsupported_7z_error(message);
     result.auto_resume = result.retryable && message != kInterrupted && !is_dictionary_refusal(message) &&
-                         !is_out_of_memory_error(message) && message.find("未登录") == std::string::npos;
+                         !is_out_of_memory_error(message) && !is_disk_full_error(message) &&
+                         message.find("未登录") == std::string::npos;
     return result;
   };
   const auto interrupted = [&]() {

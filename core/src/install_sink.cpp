@@ -7,6 +7,7 @@
 #include "panplay/socket_util.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -30,6 +31,26 @@ bool login_ftp(SOCKET control, LineReader* reader, const FtpEndpoint& endpoint, 
 
 namespace {
 
+constexpr char kDiskFullPrefix[] = "存放位置空间不够";
+// errno 不一定靠得住（有的文件系统写满时报 EIO、FAT 类会 0 字节返回），写失败时剩余空间不到这么多也算写满了。
+constexpr std::uintmax_t kNearlyFull = 64u << 20;
+
+std::string mb_text(std::uintmax_t bytes) { return std::to_string(bytes >> 20) + " MB"; }
+
+// 本机写失败的原因。path 是在写的文件或目录，code 是 errno（不知道时为 0）。
+std::string local_write_failure(const std::filesystem::path& path, int code) {
+  std::error_code ec;
+  std::filesystem::path probe = path;
+  while (!probe.empty() && !std::filesystem::exists(probe, ec)) probe = probe.parent_path();
+  const auto space = std::filesystem::space(probe.empty() ? path : probe, ec);
+  bool full = code == ENOSPC || (!ec && space.available < kNearlyFull);
+#if defined(EDQUOT)
+  full = full || code == EDQUOT;
+#endif
+  if (full) return disk_full_error(ec ? "盘写满了" : "盘写满了，只剩 " + mb_text(space.available));
+  return code != 0 ? std::string("写入中断：") + std::strerror(code) : "写入中断";
+}
+
 // PS5 上游戏进程和盘游不是同一个用户，eboot.bin、sce_module 里的 prx 还要有执行位，否则主机提示「无法开始此游戏」。
 // 和 PS5 上的 FTP 服务端（ftpsrv）一样，目录和文件一律 0777。直接调 chmod：libc++ 的 permissions 可能用到主机上没有的调用。
 void open_up(const std::filesystem::path& path) {
@@ -43,12 +64,13 @@ void open_up(const std::filesystem::path& path) {
 class LocalWriter final : public FileWriter {
  public:
   // 攒满 4 MB 才交给系统一次：PS5 上每次写多大几乎决定了写盘速度，64 KB 一次只有 28 MB/s。
-  explicit LocalWriter(const std::filesystem::path& path) : out_(path) {
+  explicit LocalWriter(const std::filesystem::path& path) : out_(path), path_(path) {
     if (out_.ok()) {
       buffer_.reserve(kBufferBytes);
       open_up(path);
     }
   }
+  std::string open_error() const { return local_write_failure(path_, out_.error()); }
   // 没 finish 就丢掉（中断、暂停）时，已经交给 write 的数据也要留在盘上。
   ~LocalWriter() override {
     if (!failed_) flush();
@@ -56,7 +78,7 @@ class LocalWriter final : public FileWriter {
   bool ok() const { return out_.ok(); }
 
   std::string write(const std::uint8_t* data, std::size_t size) override {
-    if (failed_) return "写入中断";
+    if (failed_) return error_;
     while (size > 0) {
       if (buffer_.empty() && size >= kBufferBytes) {
         if (!put(data, kBufferBytes)) return fail();
@@ -74,10 +96,12 @@ class LocalWriter final : public FileWriter {
   }
 
   std::string finish() override {
-    bool flushed = !failed_ && flush();
+    if (failed_) return error_;
+    bool flushed = flush();
     if (flushed && ends_in_hole_) flushed = out_.set_size(total_);
     const bool closed = out_.close();
-    return flushed && closed ? "" : "写入中断";
+    if (flushed && closed) return "";
+    return failed_ ? error_ : local_write_failure(path_, out_.error());
   }
 
  private:
@@ -102,15 +126,18 @@ class LocalWriter final : public FileWriter {
   }
   std::string fail() {
     failed_ = true;
-    return "写入中断";
+    error_ = local_write_failure(path_, out_.error());
+    return error_;
   }
 
   static constexpr std::size_t kBufferBytes = 4 << 20;
   std::vector<std::uint8_t> buffer_;
   RawFileOut out_;
+  std::filesystem::path path_;
   std::uint64_t total_ = 0;
   bool ends_in_hole_ = false;
   bool failed_ = false;
+  std::string error_;
 };
 
 class LocalSink : public InstallSink {
@@ -125,7 +152,7 @@ class LocalSink : public InstallSink {
     if (!storage_path(root_, path, &local, error)) return nullptr;
     auto writer = std::make_unique<LocalWriter>(local);
     if (!writer->ok()) {
-      *error = "无法写入";
+      *error = writer->open_error();
       return nullptr;
     }
     return writer;
@@ -138,8 +165,12 @@ class LocalSink : public InstallSink {
     // 每个文件开写前都会来一次，同一个目录下几百个文件不用每次都逐级检查、放开权限。
     const std::string key = local.lexically_normal().u8string();
     if (ready_dirs_.count(key) != 0) return "";
-    std::filesystem::create_directories(local);
-    if (!std::filesystem::is_directory(local)) return "无法创建目录";
+    std::error_code ec;
+    std::filesystem::create_directories(local, ec);
+    if (!std::filesystem::is_directory(local)) {
+      const std::string failure = local_write_failure(local, ec.category() == std::generic_category() ? ec.value() : 0);
+      return is_disk_full_error(failure) ? failure : "无法创建目录" + (ec ? "：" + ec.message() : std::string());
+    }
     // create_directories 顺带建出的上级目录也要放开，一直到存放位置为止。
     const std::filesystem::path root = root_.lexically_normal();
     for (std::filesystem::path dir = local.lexically_normal(); dir != root && dir.has_relative_path(); dir = dir.parent_path()) {
@@ -274,11 +305,13 @@ class LocalSink : public InstallSink {
     std::filesystem::path local;
     std::string error;
     if (!storage_path(root_, path, &local, &error)) return error;
+    errno = 0;
     std::ofstream out(local, std::ios::binary | (append ? std::ios::app : std::ios::trunc));
-    if (!out) return "无法写入";
+    if (!out) return local_write_failure(local, errno);
     open_up(local);
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
-    if (!out) return "写入中断";
+    out.flush();
+    if (!out) return local_write_failure(local, errno);
     return "";
   }
 
@@ -310,7 +343,7 @@ class FtpSink : public InstallSink {
 
   // 主机答复 452/552 是存储空间不够，重试也没用。
   static bool out_of_space(int code) { return code == 452 || code == 552; }
-  static std::string out_of_space_error(const std::string& reply) { return "主机存储空间不足（" + reply + "）"; }
+  static std::string out_of_space_error(const std::string& reply) { return disk_full_error("主机存储空间不足（" + reply + "）"); }
 
   // 写入流结束时调用，读回传输结果。replied 表示收到了主机的答复，也就是主机已经关掉了文件。
   std::string end_upload(SOCKET data_socket, bool finished, bool* replied = nullptr, bool* fatal = nullptr) {
@@ -913,6 +946,12 @@ int exercise(InstallSink& sink, const std::filesystem::path& disk_root, const st
 std::unique_ptr<InstallSink> make_local_sink(std::string root) {
   return std::make_unique<LocalSink>(std::filesystem::u8path(root));
 }
+
+std::string disk_full_error(const std::string& detail) {
+  return std::string(kDiskFullPrefix) + "：" + detail + "。安装队列已全部暂停，腾出空间后点「全部继续」，已装好的文件不会重装";
+}
+
+bool is_disk_full_error(const std::string& message) { return message.find(kDiskFullPrefix) != std::string::npos; }
 
 bool login_ftp(SOCKET control, LineReader* reader, const FtpEndpoint& endpoint, std::string* error) {
   std::string reply;

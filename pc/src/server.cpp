@@ -270,6 +270,8 @@ struct InstallQueue {
   std::set<std::string> discarding;
   // 全部暂停：排队的不开始，用户点继续之前一直停着；存到磁盘，重开程序后还是暂停的。
   bool paused = false;
+  // 不是用户点的暂停（存放位置写满了）时写明原因，安装条上显示；继续或队列清空时清掉。
+  std::string pause_reason;
   // 正在退出：不再开始新的安装。
   bool quitting = false;
   bool worker_running = false;
@@ -1187,7 +1189,9 @@ std::filesystem::path queue_file() { return panplay::app_data_dir() / "install-q
 void save_queue_locked() {
   // 队列空了暂停就没意义了，留着会让之后加入的游戏莫名不开始。
   if (!installs.current && installs.waiting.empty()) installs.paused = false;
-  std::string json = std::string("{\"paused\":") + (installs.paused ? "true" : "false") + ",\"paths\":[";
+  if (!installs.paused) installs.pause_reason.clear();
+  std::string json = std::string("{\"paused\":") + (installs.paused ? "true" : "false") + ",\"pause_reason\":\"" +
+                     panplay::json_escape(installs.pause_reason) + "\",\"paths\":[";
   bool first = true;
   const auto add = [&](const InstallTask& task) {
     if (!first) json += ",";
@@ -1334,12 +1338,21 @@ void queue_worker() {
       if (!result.install_package_set.empty()) review_install_package(path, result.install_package_set);
     }
     forget_game_detail(path);
+    // 存放位置写满了：后面排队的装下去只会接着失败，整个队列停下，这个游戏回到队首，腾出空间后点继续接着装。
+    const bool disk_full = result.status == "error" && panplay::is_disk_full_error(result.message);
+#if defined(PANPLAY_PS5)
+    if (disk_full) notify("存放位置空间不够，安装队列已全部暂停");
+#endif
     std::lock_guard<std::mutex> lock(installs.mu);
     InstallTask done = std::move(*installs.current);
     installs.current.reset();
     done.result = result;
     done.cancel.reset();
-    if (done.pausing && result.status == "interrupted") {
+    if (disk_full) {
+      installs.paused = true;
+      installs.pause_reason = result.message;
+      installs.waiting.push_front(std::move(done));
+    } else if (done.pausing && result.status == "interrupted") {
       done.result.message = "已暂停";
       installs.waiting.push_front(std::move(done));
     } else {
@@ -1409,6 +1422,7 @@ void load_queue() {
     installs.waiting.push_back(std::move(task));
   }
   installs.paused = json.boolean_or("paused", false);
+  installs.pause_reason = installs.paused ? json.str("pause_reason") : "";
   if (!installs.waiting.empty()) {
     panplay::log_info("上次没装完的队列有 " + std::to_string(installs.waiting.size()) + " 个，" +
                       (installs.paused ? "队列是暂停的，等点继续" : "接着装"));
@@ -1484,8 +1498,8 @@ std::string queue_json() {
   if (installs.current) add(*installs.current, "running");
   for (const auto& task : installs.waiting) add(task, "queued");
   for (const auto& task : installs.finished) add(task, "done");
-  return "{\"tasks\":[" + items + "],\"paused\":" + (installs.paused ? "true" : "false") +
-         ",\"utc_offset_min\":" + std::to_string(local_utc_offset_minutes()) + "}";
+  return "{\"tasks\":[" + items + "],\"paused\":" + (installs.paused ? "true" : "false") + ",\"pause_reason\":\"" +
+         panplay::json_escape(installs.pause_reason) + "\",\"utc_offset_min\":" + std::to_string(local_utc_offset_minutes()) + "}";
 }
 
 SpeedReference find_speed_reference() {
@@ -2098,6 +2112,7 @@ void handle_client(SOCKET client, bool local_peer) {
     {
       std::lock_guard<std::mutex> lock(installs.mu);
       installs.paused = pause;
+      installs.pause_reason.clear();
       if (pause && installs.current && installs.current->cancel) {
         installs.current->pausing = true;
         installs.current->cancel->cancel();
