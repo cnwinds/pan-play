@@ -488,13 +488,21 @@ bool read_marker(InstallSink& sink, const std::string& dest_prefix, const std::s
   return parse_error.empty();
 }
 
+// 完成标记里记的格式。旧版本没记、或者装的是没分格式的游戏目录时为空 optional，和哪种格式都对得上：
+// 盘架把旧目录迁进 @格式 子目录后，装好的游戏不用重装。
+std::optional<std::string> marker_variant(const Json& marker) {
+  const std::string variant = marker.str("variant");
+  if (variant.empty()) return std::nullopt;
+  return variant;
+}
+
 }  // namespace
 
 bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
                       const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets) {
   Json marker;
   if (!read_marker(sink, dest_prefix, source_dir, &marker)) return false;
-  if (marker.get("variant") != nullptr && marker.str("variant") != variant_format(source_dir)) return false;
+  if (const auto variant = marker_variant(marker); variant && *variant != variant_format(source_dir)) return false;
   std::vector<ArchiveSet> installable;
   for (const auto& set : sets) {
     if ((set.format == "zip" || set.format == "rar" || set.format == "7z") && skip_sets.count(archive_set_id(set)) == 0) {
@@ -516,8 +524,8 @@ std::vector<std::string> installed_sets(InstallSink& sink, const std::string& de
 
 std::optional<std::string> installed_variant(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
   Json marker;
-  if (!read_marker(sink, dest_prefix, source_dir, &marker) || marker.get("variant") == nullptr) return std::nullopt;
-  return marker.str("variant");
+  if (!read_marker(sink, dest_prefix, source_dir, &marker)) return std::nullopt;
+  return marker_variant(marker);
 }
 
 std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
@@ -686,10 +694,11 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
     const Json old = Json::parse(std::string(existing.begin(), existing.end()), &parse_error);
     const Json* entries = old.get("entries");
     const Json* layers = old.get("layers");
-    if (parse_error.empty() && old.get("variant") != nullptr && old.str("variant") != variant) {
+    const auto old_variant = parse_error.empty() ? marker_variant(old) : std::nullopt;
+    if (old_variant && *old_variant != variant) {
       result.retryable = false;
       result.status = "error";
-      result.message = "这款游戏已经装了" + variant_label(old.str("variant")) + "，要换成" + variant_label(variant) +
+      result.message = "这款游戏已经装了" + variant_label(*old_variant) + "，要换成" + variant_label(variant) +
                        "得先删除已装的";
       return result;
     }

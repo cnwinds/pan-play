@@ -1457,6 +1457,20 @@ int variant_test() {
   done.size = static_cast<std::int64_t>(text.size());
   if (installed_variant(legacy, "/data/homebrew", request.source_dir).has_value()) return fail("没记格式的完成标记读出了格式");
   if (install_game(drive, legacy, request).status != "already") return fail("没记格式的旧安装没有显示已安装");
+
+  // 从没分格式的目录装好，盘架再把压缩包迁进 @folder，不用重装。
+  const auto loose_zip = make_zip({{"eboot.bin", folder, true}}, {}).front();
+  FakeDrive before;
+  before.add("/apps/panplay/Mig PPSA42000/game.zip", loose_zip);
+  MemorySink migrated;
+  request.source_dir = "/apps/panplay/Mig PPSA42000";
+  if (install_game(before, migrated, request).status != "installed") return fail("没分格式的游戏没装上");
+  FakeDrive after;
+  after.add("/apps/panplay/Mig PPSA42000/@folder/game.zip", loose_zip);
+  request.source_dir = "/apps/panplay/Mig PPSA42000/@folder";
+  if (installed_variant(migrated, "/data/homebrew", request.source_dir).has_value()) return fail("没分格式的安装读出了格式");
+  const InstallResult moved = install_game(after, migrated, request);
+  if (moved.status != "already") return fail("迁进 @folder 后没有显示已安装: " + moved.status + " " + moved.message);
   return 0;
 }
 

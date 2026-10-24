@@ -173,7 +173,8 @@ bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const s
                       const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets = {});
 // 已装好的游戏按顺序叠了哪些压缩包组（archive_set_id）。没装好或旧版本装的返回空。
 std::vector<std::string> installed_sets(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
-// 这款游戏装好的是哪种格式（variant_format）。没装好时为空 optional；旧版本装的、完成标记里没记格式的也为空 optional。
+// 这款游戏装好的是哪种格式（variant_format）。没装好时为空 optional；旧版本装的、从没分格式的游戏目录装的也为空 optional，
+// 这两种和哪种格式都对得上。
 std::optional<std::string> installed_variant(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 // 删掉没装完的游戏留在暂存区的全部文件，之后只能从头装。已经装好的游戏不受影响。
 std::string discard_install(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
