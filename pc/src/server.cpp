@@ -14,7 +14,7 @@
 #include "panplay/library.hpp"
 #include "panplay/socket_util.hpp"
 #include "panplay/speed_test.hpp"
-#include "panplay/write_test.hpp"
+#include "panplay/disk_test.hpp"
 #include "panplay/store_meta.hpp"
 #include "panplay/trace.hpp"
 
@@ -405,10 +405,10 @@ std::string speed_test_json() {
          "\",\"error\":\"" + panplay::json_escape(s.error) + "\",\"install\":" + install + "}";
 }
 
-panplay::WriteTest& write_test = *new panplay::WriteTest;
+panplay::DiskTest& disk_test = *new panplay::DiskTest;
 
-std::string write_test_json() {
-  const panplay::WriteTestStatus s = write_test.status();
+std::string disk_test_json() {
+  const panplay::DiskTestStatus s = disk_test.status();
   const auto rate = [](double value) { return std::to_string(static_cast<long long>(value)); };
   std::string steps;
   for (const auto& step : s.steps) {
@@ -416,9 +416,10 @@ std::string write_test_json() {
              "\",\"rate\":" + rate(step.rate) + ",\"done\":" + (step.done ? "true" : "false") + "}";
   }
   return "{\"phase\":\"" + s.phase + "\",\"where\":\"" + panplay::json_escape(s.where) + "\",\"steps\":[" + steps +
-         "],\"current\":" + std::to_string(s.current) + ",\"written\":" + std::to_string(s.written) +
+         "],\"current\":" + std::to_string(s.current) + ",\"bytes\":" + std::to_string(s.bytes) +
          ",\"total\":" + std::to_string(s.total) + ",\"current_rate\":" + rate(s.current_rate) + ",\"ended\":\"" +
-         s.ended + "\",\"error\":\"" + panplay::json_escape(s.error) + "\"}";
+         s.ended + "\",\"error\":\"" + panplay::json_escape(s.error) + "\",\"read_cached\":" +
+         (s.read_cached ? "true" : "false") + "}";
 }
 
 std::string catalog_status_json() {
@@ -1247,6 +1248,12 @@ void queue_worker() {
       path = installs.current->path;
       cancel = installs.current->cancel;
     }
+    // 测速和安装抢网络、抢硬盘，两边都不准：开始装就停掉测速。
+    if (speed_test.running() || disk_test.running()) {
+      speed_test.stop();
+      disk_test.stop();
+      panplay::log_info("开始安装，停掉正在进行的测速");
+    }
     panplay::log_info("开始安装 " + path);
     panplay::InstallResult result = install_with_auto_resume(path, *cancel);
     if (result.status == "interrupted" && cancel->cancelled()) {
@@ -1854,6 +1861,13 @@ void handle_client(SOCKET client, bool local_peer) {
     return;
   }
   if (method == "POST" && target == "/api/speedtest/start") {
+    {
+      std::lock_guard<std::mutex> lock(installs.mu);
+      if (installs.current) {
+        reply_json(client, 409, json_error("正在安装，先暂停再测网速"));
+        return;
+      }
+    }
     auto drive = open_drive();
     if (!drive->session_valid()) {
       reply_json(client, 400, json_error("先登录网盘"));
@@ -1881,16 +1895,16 @@ void handle_client(SOCKET client, bool local_peer) {
     reply_json(client, 200, speed_test_json());
     return;
   }
-  // 写盘测速和安装抢同一块盘，装着游戏时不测。
-  if (method == "GET" && target == "/api/writetest") {
-    reply_json(client, 200, write_test_json());
+  // 硬盘测速和安装抢同一块盘，装着游戏时不测。
+  if (method == "GET" && target == "/api/disktest") {
+    reply_json(client, 200, disk_test_json());
     return;
   }
-  if (method == "POST" && target == "/api/writetest/start") {
+  if (method == "POST" && target == "/api/disktest/start") {
     {
       std::lock_guard<std::mutex> lock(installs.mu);
       if (installs.current) {
-        reply_json(client, 409, json_error("正在安装，先暂停再测写盘"));
+        reply_json(client, 409, json_error("正在安装，先暂停再测硬盘"));
         return;
       }
     }
@@ -1902,17 +1916,17 @@ void handle_client(SOCKET client, bool local_peer) {
       return;
     }
     destination.prefix = settings.prefix();
-    if (error = write_test.start(destination); !error.empty()) {
+    if (error = disk_test.start(destination); !error.empty()) {
       reply_json(client, 409, json_error(error));
       return;
     }
-    panplay::log_info("开始写盘测速");
-    reply_json(client, 200, write_test_json());
+    panplay::log_info("开始硬盘读写测速");
+    reply_json(client, 200, disk_test_json());
     return;
   }
-  if (method == "POST" && target == "/api/writetest/stop") {
-    write_test.stop();
-    reply_json(client, 200, write_test_json());
+  if (method == "POST" && target == "/api/disktest/stop") {
+    disk_test.stop();
+    reply_json(client, 200, disk_test_json());
     return;
   }
   if (method == "GET" && target == "/api/session") {

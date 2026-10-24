@@ -2162,7 +2162,7 @@ body.drawer-open { overflow: hidden; }
   font-size: 0.85rem;
 }
 
-.writetest-ladder .speedtest-step { grid-template-columns: 10.5em minmax(0, 1fr) 6.5em; }
+.disktest-ladder .speedtest-step { grid-template-columns: 4em minmax(0, 1fr) 6.5em; }
 .speedtest-step b { font-weight: 500; text-align: right; white-space: nowrap; }
 .speedtest-step .meter > span { background: var(--faint); transition: width 0.45s ease; }
 .speedtest-step.done,

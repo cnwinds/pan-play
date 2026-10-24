@@ -25,6 +25,28 @@ class RawFileOut {
   int fd_ = -1;
 };
 
+// 测硬盘读速度用：尽量绕过系统缓存直接从盘上读（刚写完的文件还在缓存里，普通读量到的是内存速度）。
+// 绕过缓存要求每次读的大小、缓冲地址按扇区对齐，调用方按 4 KB 的整数倍读、缓冲按 4 KB 对齐。
+class RawFileIn {
+ public:
+  RawFileIn() = default;
+  ~RawFileIn() { close(); }
+  RawFileIn(const RawFileIn&) = delete;
+  RawFileIn& operator=(const RawFileIn&) = delete;
+
+  // 系统不支持绕过缓存时退回普通读，uncached() 为 false。
+  bool open(const std::filesystem::path& path);
+  bool ok() const { return handle_ >= 0; }
+  bool uncached() const { return uncached_; }
+  // 返回读到的字节数，0 是读完了，负数是出错。
+  long long read(void* data, std::size_t size);
+  void close();
+
+ private:
+  long long handle_ = -1;
+  bool uncached_ = false;
+};
+
 // 已经写完关掉的文件再打开刷一次盘：fsync 刷的是整个文件，不管是哪个句柄写的。
 bool sync_file(const std::filesystem::path& path);
 

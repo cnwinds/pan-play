@@ -158,7 +158,7 @@
             <div class="speedtest-head">
               <div>
                 <h3 id="speedtest-title">下载测速</h3>
-                <p>从游戏库里挑个大文件读，读到的数据直接丢掉，不解压也不写盘。先用一条连接，再加到 2、4、8 条同时读，看单连接和总带宽各能跑多快，和安装速度一比就知道慢在哪。约半分钟。</p>
+                <p>从游戏库里挑个大文件读，读到的数据直接丢掉，不解压也不写盘。先用一条连接，再加到 2、4、8 条同时读，看单连接和总带宽各能跑多快，和安装速度一比就知道慢在哪。约半分钟，装游戏时不能测。</p>
               </div>
               <button type="button" class="btn quiet small" id="speedtest-run">开始测速</button>
             </div>
@@ -216,20 +216,20 @@
               <span class="hint">每个游戏装到主机这个目录下以 Title ID 命名的文件夹里。</span>
             </label>
           </div>
-          <section class="speedtest" aria-labelledby="writetest-title">
+          <section class="speedtest" aria-labelledby="disktest-title">
             <div class="speedtest-head">
               <div>
-                <h3 id="writetest-title">写盘测速</h3>
-                <p>在已保存的存放位置用几种写法各写 512 MB，写完刷到盘上再删掉，看盘本身能写多快、盘游的写法差多少。约一两分钟，装游戏时不能测。</p>
+                <h3 id="disktest-title">硬盘读写测速</h3>
+                <p>在已保存的存放位置写一个 1 GB 的测试文件、刷到盘上，再读一遍，测完删掉。内置 SSD、外接硬盘都能测，写入速度就是装游戏时写盘的上限。约半分钟，装游戏时不能测。</p>
               </div>
-              <button type="button" class="btn quiet small" id="writetest-run">开始测速</button>
+              <button type="button" class="btn quiet small" id="disktest-run">开始测速</button>
             </div>
-            <div class="speedtest-board" id="writetest-board" hidden>
-              <ol class="speedtest-ladder writetest-ladder" id="writetest-ladder" aria-label="各种写法的速度"></ol>
-              <p class="speedtest-meta" id="writetest-meta"></p>
+            <div class="speedtest-board" id="disktest-board" hidden>
+              <ol class="speedtest-ladder disktest-ladder" id="disktest-ladder" aria-label="写入和读取速度"></ol>
+              <p class="speedtest-meta" id="disktest-meta"></p>
             </div>
-            <p class="speedtest-verdict" id="writetest-verdict" hidden></p>
-            <p class="note" id="writetest-note" role="status"></p>
+            <p class="speedtest-verdict" id="disktest-verdict" hidden></p>
+            <p class="note" id="disktest-note" role="status"></p>
           </section>
         </div>
       </section>

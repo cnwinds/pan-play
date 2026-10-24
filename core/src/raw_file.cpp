@@ -6,7 +6,12 @@
 #include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -62,6 +67,59 @@ bool RawFileOut::close() {
   fd_ = -1;
   return closed;
 }
+
+#if defined(_WIN32)
+bool RawFileIn::open(const std::filesystem::path& path) {
+  close();
+  for (const bool uncached : {true, false}) {
+    const DWORD flags = FILE_FLAG_SEQUENTIAL_SCAN | (uncached ? FILE_FLAG_NO_BUFFERING : 0);
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+      handle_ = reinterpret_cast<long long>(file);
+      uncached_ = uncached;
+      return true;
+    }
+  }
+  return false;
+}
+
+long long RawFileIn::read(void* data, std::size_t size) {
+  if (handle_ < 0) return -1;
+  DWORD got = 0;
+  const DWORD want = static_cast<DWORD>(std::min<std::size_t>(size, 1u << 30));
+  if (!ReadFile(reinterpret_cast<HANDLE>(handle_), data, want, &got, nullptr)) return -1;
+  return got;
+}
+
+void RawFileIn::close() {
+  if (handle_ >= 0) CloseHandle(reinterpret_cast<HANDLE>(handle_));
+  handle_ = -1;
+}
+#else
+bool RawFileIn::open(const std::filesystem::path& path) {
+  close();
+#if defined(O_DIRECT)
+  handle_ = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+  uncached_ = handle_ >= 0;
+#endif
+  if (handle_ < 0) handle_ = ::open(path.c_str(), O_RDONLY);
+  return ok();
+}
+
+long long RawFileIn::read(void* data, std::size_t size) {
+  if (handle_ < 0) return -1;
+  for (;;) {
+    const auto n = ::read(static_cast<int>(handle_), data, size);
+    if (n < 0 && errno == EINTR) continue;
+    return static_cast<long long>(n);
+  }
+}
+
+void RawFileIn::close() {
+  if (handle_ >= 0) ::close(static_cast<int>(handle_));
+  handle_ = -1;
+}
+#endif
 
 bool sync_file(const std::filesystem::path& path) {
   const int fd = open_for_write(path, false);
