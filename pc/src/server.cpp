@@ -281,6 +281,12 @@ struct InstallQueue {
 InstallQueue installs;
 constexpr std::size_t kFinishedKept = 50;
 
+// 游戏库里能看到的情况（装好、没装完、删掉、评价、名字）每变一次加一。队列接口和游戏库接口都带上，
+// 页面发现和自己取游戏库时的不一样就重取，别的设备上做的改动、装完一个游戏，不用刷新页面就能看到。
+std::atomic<long long> library_version{1};
+
+void library_changed() { library_version.fetch_add(1); }
+
 // 正在装的是 "installing"，排队的是 "queued"，不在队列里没有记录。
 std::map<std::string, std::string> queue_states() {
   std::lock_guard<std::mutex> lock(installs.mu);
@@ -601,6 +607,34 @@ std::shared_ptr<const ShelfListing> cached_shelf(const AppSettings& settings) {
   return shelf_cache && shelf_cache->key == shelf_key(settings) ? shelf_cache : nullptr;
 }
 
+bool same_listing(const ShelfListing& left, const ShelfListing& right) {
+  const auto same_folders = [](const std::vector<ShelfListing::Folder>& a, const std::vector<ShelfListing::Folder>& b) {
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(),
+                      [](const ShelfListing::Folder& x, const ShelfListing::Folder& y) { return x.path == y.path; });
+  };
+  return left.key == right.key && left.dest_ready == right.dest_ready && left.sink_ready == right.sink_ready &&
+         same_folders(left.folders, right.folders) && same_folders(left.orphans, right.orphans) &&
+         left.placement.installed_dirs == right.placement.installed_dirs &&
+         left.placement.staging_dirs == right.placement.staging_dirs;
+}
+
+void read_listing_placement(ShelfListing& listing, panplay::InstallSink& sink, const AppSettings& settings) {
+  listing.sink_ready = true;
+  listing.placement = read_shelf_placement(sink, settings.prefix());
+  std::unordered_set<std::string> claimed;
+  for (const auto& folder : listing.folders) claimed.insert(folder.title_id.empty() ? folder.name : folder.title_id);
+  // 存放位置常和别的自制程序共用（/data/homebrew），只认带盘游完成标记的文件夹。
+  for (const auto& dir : listing.placement.installed_dirs) {
+    if (claimed.count(dir) != 0 || dir.rfind(".panplay", 0) == 0) continue;
+    std::string size_error;
+    const std::string marker = panplay::join_storage_path(panplay::join_storage_path(settings.prefix(), dir), ".panplay-done.json");
+    if (sink.file_size(marker, &size_error) < 0) continue;
+    listing.orphans.push_back({dir, panplay::join_storage_path(settings.library_path(), dir), panplay::find_title_id(dir)});
+  }
+  std::sort(listing.orphans.begin(), listing.orphans.end(),
+            [](const ShelfListing::Folder& left, const ShelfListing::Folder& right) { return left.name < right.name; });
+}
+
 std::shared_ptr<const ShelfListing> shelf_listing(panplay::DrivePlugin& drive, bool fresh, std::string* error) {
   const AppSettings settings = load_settings();
   const std::string key = shelf_key(settings);
@@ -621,25 +655,31 @@ std::shared_ptr<const ShelfListing> shelf_listing(panplay::DrivePlugin& drive, b
   const std::string dest = settings.dest();
   listing->dest_ready = !dest.empty() && panplay::parse_destination(dest, &destination, &dest_error);
   if (listing->dest_ready) {
-    if (auto sink = panplay::open_destination(destination, &dest_error)) {
-      listing->sink_ready = true;
-      listing->placement = read_shelf_placement(*sink, settings.prefix());
-      std::unordered_set<std::string> claimed;
-      for (const auto& folder : listing->folders) claimed.insert(folder.title_id.empty() ? folder.name : folder.title_id);
-      // 存放位置常和别的自制程序共用（/data/homebrew），只认带盘游完成标记的文件夹。
-      for (const auto& dir : listing->placement.installed_dirs) {
-        if (claimed.count(dir) != 0 || dir.rfind(".panplay", 0) == 0) continue;
-        std::string size_error;
-        const std::string marker = panplay::join_storage_path(panplay::join_storage_path(settings.prefix(), dir), ".panplay-done.json");
-        if (sink->file_size(marker, &size_error) < 0) continue;
-        listing->orphans.push_back({dir, panplay::join_storage_path(library_path, dir), panplay::find_title_id(dir)});
-      }
-      std::sort(listing->orphans.begin(), listing->orphans.end(),
-                [](const ShelfListing::Folder& left, const ShelfListing::Folder& right) { return left.name < right.name; });
-    }
+    if (auto sink = panplay::open_destination(destination, &dest_error)) read_listing_placement(*listing, *sink, settings);
   }
+  if (shelf_cache && !same_listing(*shelf_cache, *listing)) library_changed();
   shelf_cache = listing;
   return listing;
+}
+
+// 装完、停下、删掉游戏后只重读主机上的安装情况，换掉列表缓存里的这部分；网盘目录没变，不重列。
+void refresh_shelf_placement() {
+  const AppSettings settings = load_settings();
+  const auto old = cached_shelf(settings);
+  if (!old || !old->dest_ready) return;
+  panplay::Destination destination;
+  std::string error;
+  if (!panplay::parse_destination(settings.dest(), &destination, &error)) return;
+  auto sink = panplay::open_destination(destination, &error);
+  std::shared_ptr<ShelfListing> listing;
+  if (sink) {
+    listing = std::make_shared<ShelfListing>(*old);
+    listing->orphans.clear();
+    read_listing_placement(*listing, *sink, settings);
+  }
+  std::lock_guard<std::mutex> lock(shelf_mu);
+  // 读的时候列表已经整个重读过了，那份更新，不用换；连不上存放位置时丢掉缓存，下次整个重读。
+  if (shelf_cache == old) shelf_cache = listing;
 }
 
 bool is_orphan(const ShelfListing& listing, const std::string& path) {
@@ -666,6 +706,7 @@ void sync_shelf_state(const std::string& key, const std::string& name, const std
   if (installed) listing->placement.installed_dirs.insert(folder);
   else if (!staging) listing->placement.installed_dirs.erase(folder);
   shelf_cache = listing;
+  library_changed();
 }
 
 std::string url_decode(const std::string& text) {
@@ -732,6 +773,8 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   const bool chinese_only = query_param(query, "cn") == "1";
   const bool multi_only = query_param(query, "multi") == "1";
 
+  // 在读列表之前取：读的过程中又有变化时，页面拿到的是旧号，会再取一次。
+  const long long version = library_version.load();
   std::string error;
   const auto listing = shelf_listing(drive, fresh, &error);
   if (!listing) return json_error(error);
@@ -811,7 +854,7 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   const std::size_t matched = rows.size();
   return "{\"games\":[" + items + "],\"offset\":" + std::to_string(offset) + ",\"total\":" + std::to_string(matched) +
          ",\"all\":" + std::to_string(entries.size()) + ",\"installed\":" + std::to_string(installed) +
-         ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + "}";
+         ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + ",\"version\":" + std::to_string(version) + "}";
 }
 
 // 能装的每组压缩包一项，供安装前挑选补丁。主游戏是直接放在游戏目录里最大的那组（都在子目录里时取最大的），
@@ -1375,6 +1418,7 @@ void queue_worker() {
       if (!result.install_package_set.empty()) review_install_package(path, result.install_package_set);
     }
     forget_game_detail(path);
+    refresh_shelf_placement();
     // 存放位置写满了：后面排队的装下去只会接着失败，整个队列停下，这个游戏回到队首，腾出空间后点继续接着装。
     const bool disk_full = result.status == "error" && panplay::is_disk_full_error(result.message);
 #if defined(PANPLAY_PS5)
@@ -1396,6 +1440,7 @@ void queue_worker() {
       installs.finished.push_front(std::move(done));
       if (installs.finished.size() > kFinishedKept) installs.finished.pop_back();
     }
+    library_changed();
     save_queue_locked();
   }
 }
@@ -1537,7 +1582,8 @@ std::string queue_json() {
   for (const auto& task : installs.waiting) add(task, "queued");
   for (const auto& task : installs.finished) add(task, "done");
   return "{\"tasks\":[" + items + "],\"paused\":" + (installs.paused ? "true" : "false") + ",\"pause_reason\":\"" +
-         panplay::json_escape(installs.pause_reason) + "\",\"utc_offset_min\":" + std::to_string(local_utc_offset_minutes()) + "}";
+         panplay::json_escape(installs.pause_reason) + "\",\"utc_offset_min\":" + std::to_string(local_utc_offset_minutes()) +
+         ",\"version\":" + std::to_string(library_version.load()) + "}";
 }
 
 SpeedReference find_speed_reference() {
@@ -1887,6 +1933,7 @@ void handle_client(SOCKET client, bool local_peer) {
         reply_json(client, 500, json_error(error));
         return;
       }
+      library_changed();
     } else {
       const panplay::CatalogMatch match = panplay::GameCatalog::instance().lookup(panplay::find_title_id(name), name);
       if (!match.found || match.entry.concept_id <= 0 || store_meta == nullptr) {
@@ -1909,6 +1956,7 @@ void handle_client(SOCKET client, bool local_peer) {
       reply_json(client, 500, json_error(catalog_error.empty() ? "资料库加载失败" : catalog_error));
       return;
     }
+    library_changed();
     reply_json(client, 200, catalog_status_json());
     return;
   }
@@ -1968,6 +2016,7 @@ void handle_client(SOCKET client, bool local_peer) {
       panplay::set_log_level(settings.verbose_log ? panplay::LogLevel::debug : panplay::LogLevel::info);
       panplay::log_info(std::string("详细日志已") + (settings.verbose_log ? "打开" : "关闭"));
     }
+    if (error.empty()) library_changed();
     reply_json(client, error.empty() ? 200 : 500, error.empty() ? "{\"ok\":true}" : json_error(error));
     return;
   }
@@ -2215,6 +2264,7 @@ void handle_client(SOCKET client, bool local_peer) {
         installs.current->result.message = "正在暂停…";
       } else if (waiting != installs.waiting.end()) {
         installs.waiting.erase(waiting);
+        library_changed();
       } else if (!erase_path(installs.finished, path)) {
         reply_json(client, 409, json_error("这个游戏不在安装队列里"));
         return;
@@ -2242,7 +2292,10 @@ void handle_client(SOCKET client, bool local_peer) {
     }
     if (target == "/api/review/remove") {
       const std::string error = remove_review(detail->fingerprint);
-      if (error.empty()) review_changed();
+      if (error.empty()) {
+        review_changed();
+        library_changed();
+      }
       reply_json(client, error.empty() ? 200 : 500, error.empty() ? "{\"review\":null}" : json_error(error));
       return;
     }
@@ -2270,6 +2323,7 @@ void handle_client(SOCKET client, bool local_peer) {
       return;
     }
     review_changed();
+    library_changed();
     panplay::log_info(std::string("评价 ") + review.name + "：" + (review.playable ? "能玩" : "有问题 " + review.note) +
                       (review.firmware.empty() ? "" : "，固件 " + review.firmware));
     reply_json(client, 200, "{\"review\":" + review_json(find_review(review.fingerprint).value_or(review)) + "}");
@@ -2393,6 +2447,7 @@ void handle_client(SOCKET client, bool local_peer) {
       std::lock_guard<std::mutex> lock(shelf_mu);
       shelf_cache.reset();
     }
+    library_changed();
     reply_json(client, 200, "{\"moved_to\":\"" + panplay::json_escape(moved_to) + "\"}");
     return;
   }
@@ -2460,10 +2515,8 @@ void handle_client(SOCKET client, bool local_peer) {
       return;
     }
     forget_game_detail(path);
-    {
-      std::lock_guard<std::mutex> lock(shelf_mu);
-      shelf_cache.reset();
-    }
+    refresh_shelf_placement();
+    library_changed();
     reply_json(client, 200, queue_json());
     return;
   }

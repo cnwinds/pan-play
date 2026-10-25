@@ -77,6 +77,11 @@ let queuePaused = false;
 // 不是用户点的暂停（存放位置写满了）时服务端给的原因。
 let queuePauseReason = "";
 let queueTimer = 0;
+let queueEvery = 0;
+// 游戏库的变化号：shelfVersion 是取当前这份游戏库时服务器的号，libraryVersion 是队列接口最近带回的号，
+// 两个不一样就说明游戏库变了（装完、删掉、评价，或者别的设备上做的），重取一次。
+let shelfVersion = 0;
+let libraryVersion = 0;
 let dockOpen = false;
 let detail = null;
 const tiles = new Map();
@@ -292,14 +297,15 @@ function pageSize() {
   return perRow * Math.max(2, rows);
 }
 
-// 取一页游戏。reset 时从头取，替换掉已有的格子；fresh 让服务器重新列网盘目录、重读主机上的安装情况。
-async function fetchShelf({ reset = false, fresh = false } = {}) {
+// 取一页游戏。reset 时从头取，替换掉已有的格子；fresh 让服务器重新列网盘目录、重读主机上的安装情况；
+// keep 是游戏库有变化时重取，已经翻到的几页一起取回来，不跳回顶上。
+async function fetchShelf({ reset = false, fresh = false, keep = false } = {}) {
   if (!reset && (pageLoading || loaded >= total)) return;
   const token = reset ? ++pageToken : pageToken;
   pageLoading = true;
   shelfMore.hidden = reset;
   shelfMore.textContent = "正在加载更多…";
-  const limit = reset && fresh ? Math.max(loaded, pageSize()) : pageSize();
+  const limit = reset && (fresh || keep) ? Math.max(loaded, pageSize()) : pageSize();
   const params = new URLSearchParams({ offset: reset ? 0 : loaded, limit });
   if (filter !== "all") params.set("filter", filter);
   if (query) params.set("q", query);
@@ -312,7 +318,14 @@ async function fetchShelf({ reset = false, fresh = false } = {}) {
     if (token !== pageToken) return;
     const page = data.games || [];
     for (const game of page) syncGameState(game);
+    // 格子整个换掉后，手柄焦点和关详情时要回到的格子都换到同一款游戏的新格子上。
+    let focusPath = null;
+    let openerPath = null;
     if (reset) {
+      for (const [path, entry] of tiles) {
+        if (entry.tile === document.activeElement) focusPath = path;
+        if (detail && entry.tile === detail.opener) openerPath = path;
+      }
       games = [];
       tiles.clear();
       shelf.replaceChildren();
@@ -322,11 +335,14 @@ async function fetchShelf({ reset = false, fresh = false } = {}) {
       games.push(game);
       shelf.append(buildTile(game));
     }
+    if (focusPath && tiles.has(focusPath)) tiles.get(focusPath).tile.focus({ preventScroll: true });
+    if (openerPath && tiles.has(openerPath) && detail) detail.opener = tiles.get(openerPath).tile;
     loaded = (data.offset || 0) + page.length;
     total = data.total || 0;
     counts = { all: data.all || 0, installed: data.installed || 0, need_settings: Boolean(data.need_settings) };
     renderCounts();
-    scheduleMetaPoll(reset);
+    scheduleMetaPoll(reset && !keep);
+    if (reset && Number.isFinite(data.version)) shelfVersion = data.version;
     window.requestAnimationFrame(fillViewport);
   } catch (error) {
     if (token !== pageToken) return;
@@ -612,28 +628,70 @@ function setQueue(data) {
   if (Number.isFinite(data.utc_offset_min)) serverUtcOffset = data.utc_offset_min;
   const settled = tasks.filter((task) => task.state === "done" && active.has(task.path)).map((task) => task.path);
   applyQueue();
-  if (settled.length) loadGames();
   if (detail && settled.includes(detail.game.path)) detail.reload();
-  if (queueBusy()) watchQueue();
-  else stopQueueWatch();
+  if (Number.isFinite(data.version)) {
+    libraryVersion = data.version;
+    syncShelf();
+  }
+  // 空闲时也隔几秒问一次：别的设备上加进队列、装完、删掉的游戏，这里不刷新页面也能看到。
+  if (queueEvery >= 0) watchQueue(queueBusy() ? 1000 : 5000);
+}
+
+// 游戏库变了就按当前的筛选重取，主机上的安装情况服务器已经重读过，不用重列网盘目录。
+function syncShelf() {
+  if (!loggedIn || !libraryVersion || !shelfVersion || libraryVersion === shelfVersion || pageLoading) return;
+  fetchShelf({ reset: true, keep: true }).then(syncDetail).catch(() => {
+    // 下次轮询再取
+  });
+}
+
+// 是否装在主机上：装着别的格式也算装着。
+function placementOf(state) {
+  if (["installed", "update", "other"].includes(state)) return "installed";
+  if (state === "continue" || state === "install") return state;
+  return "";
+}
+
+// 打开着的详情在别处被装好、删掉、停下时跟着重读。先问缓存的，安装情况没变就不实时读网盘和主机。
+async function syncDetail() {
+  if (!detail) return;
+  const game = detail.game;
+  const task = taskFor(game.path);
+  if (task && task.state !== "done") return;
+  const data = await api("/api/game", { path: game.path, cached: true }).catch(() => null);
+  if (!data || !detail || detail.game !== game || data.path !== game.path) return;
+  const now = placementOf(data.state);
+  const shown = placementOf(game.state);
+  if (now && shown && now !== shown) detail.reload();
 }
 
 async function refreshQueue() {
+  if (document.hidden) return;
   try {
     setQueue(await api("/api/queue"));
   } catch (error) {
-    // 下一秒再试
+    // 下次再试
   }
 }
 
-function watchQueue() {
-  if (!queueTimer) queueTimer = window.setInterval(refreshQueue, 1000);
+function watchQueue(every) {
+  if (queueTimer && queueEvery === every) return;
+  window.clearInterval(queueTimer);
+  queueEvery = every;
+  queueTimer = window.setInterval(refreshQueue, every);
 }
 
+// 退出盘游后不再轮询。
 function stopQueueWatch() {
   window.clearInterval(queueTimer);
   queueTimer = 0;
+  queueEvery = -1;
 }
+
+// PS5 上切去玩游戏再回到浏览器时，页面可能停过，回来先问一次。
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && queueEvery >= 0) refreshQueue();
+});
 
 // 加入队列、移出、排到下一个、清除都返回新的队列。
 async function queueAction(path, body) {
@@ -656,7 +714,6 @@ async function removeInstall(game, endpoint) {
   }
   game.state = "install";
   for (const layer of game.layers || []) layer.installed = false;
-  loadGames();
   return "";
 }
 
