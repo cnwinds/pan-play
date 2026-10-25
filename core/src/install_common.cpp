@@ -74,6 +74,7 @@ std::string read_span(DrivePlugin& drive, const std::vector<ArchiveVolume>& volu
       if (!got.error.empty()) return got.error;
       if (got.bytes.empty() || got.bytes.size() > want) return "压缩包意外结束";
       out->insert(out->end(), got.bytes.begin(), got.bytes.end());
+      InstallClock::note_read(got.bytes.size());
       position += static_cast<std::int64_t>(got.bytes.size());
     }
   }

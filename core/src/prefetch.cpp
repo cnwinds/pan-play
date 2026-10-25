@@ -1071,6 +1071,7 @@ std::size_t PrefetchReader::read(std::uint8_t* dst, std::size_t size, std::strin
         prune_locked();
         cv_.notify_all();
       }
+      InstallClock::note_read(n);
       return n;
     }
     if (!error_.empty()) {

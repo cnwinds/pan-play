@@ -2,6 +2,7 @@
 
 #include "panplay/trace.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -114,7 +115,29 @@ InstallClock::InstallClock()
       cpu_at_start_(process_cpu_seconds()),
       thread_cpu_at_start_(thread_cpu_seconds()),
       faults_at_start_(page_faults()) {
+  window_usage_ = usage_now();
   bound = this;
+}
+
+InstallClock::Usage InstallClock::usage_now() {
+  Usage usage;
+  usage.process_cpu = process_cpu_seconds();
+  usage.thread_cpu = thread_cpu_seconds();
+#if !defined(_WIN32)
+  rusage self{};
+  if (getrusage(RUSAGE_SELF, &self) == 0) {
+    usage.faults = static_cast<long long>(self.ru_minflt) + self.ru_majflt;
+    usage.hard_faults = self.ru_majflt;
+  }
+#if defined(RUSAGE_THREAD)
+  rusage mine{};
+  if (getrusage(RUSAGE_THREAD, &mine) == 0) {
+    usage.preempted = mine.ru_nivcsw;
+    usage.yielded = mine.ru_nvcsw;
+  }
+#endif
+#endif
+  return usage;
 }
 
 InstallClock::~InstallClock() { bound = outer_; }
@@ -129,6 +152,18 @@ void InstallClock::note_opened() {
   if (bound == nullptr) return;
   ++bound->total_.opened;
   ++bound->window_.opened;
+}
+
+void InstallClock::note_read(std::size_t bytes) {
+  if (bound == nullptr) return;
+  bound->total_.read += static_cast<std::int64_t>(bytes);
+  bound->window_.read += static_cast<std::int64_t>(bytes);
+}
+
+void InstallClock::note_write_time(double ms) {
+  if (bound == nullptr) return;
+  bound->total_.longest_write_ms = std::max(bound->total_.longest_write_ms, ms);
+  bound->window_.longest_write_ms = std::max(bound->window_.longest_write_ms, ms);
 }
 
 void InstallClock::charge(Clock::time_point now) {
@@ -183,12 +218,45 @@ InstallPhase InstallClock::switch_to(InstallPhase phase) {
   if (now - window_at_ >= std::chrono::seconds(10)) {
     if (extracted_ && log_enabled(LogLevel::debug)) {
       const double all = sum_ms(window_);
-      log_line(LogLevel::debug, "安装耗时（最近 " + seconds_text(all) + "）：" + describe(window_, all, false));
+      log_line(LogLevel::debug,
+               "安装耗时（最近 " + seconds_text(all) + "）：" + describe(window_, all, false) + window_details(now));
     }
     window_ = {};
     window_at_ = now;
+    window_usage_ = usage_now();
   }
   return previous;
+}
+
+// 解压慢时分清是在算（安装线程 CPU 接近 1 核）、在等内存（缺页多）、还是被系统抢走了 CPU（被抢走次数多）。
+std::string InstallClock::window_details(Clock::time_point now) const {
+  const double wall_ms = std::chrono::duration<double, std::milli>(now - window_at_).count();
+  if (wall_ms <= 0) return "";
+  std::string text = "；读入压缩数据 " + rate_text(window_.read, wall_ms) + "，解出 " + rate_text(window_.written, wall_ms);
+  char part[160];
+  if (window_.longest_write_ms > 0) {
+    std::snprintf(part, sizeof(part), "，单次写最长 %.0f ms", window_.longest_write_ms);
+    text += part;
+  }
+  const Usage now_usage = usage_now();
+  if (window_usage_.process_cpu >= 0 && now_usage.process_cpu >= 0) {
+    std::snprintf(part, sizeof(part), "；整个盘游占 %.2f 核", (now_usage.process_cpu - window_usage_.process_cpu) * 1000 / wall_ms);
+    text += part;
+    if (window_usage_.thread_cpu >= 0 && now_usage.thread_cpu >= 0) {
+      std::snprintf(part, sizeof(part), "，安装线程占 %.2f 核", (now_usage.thread_cpu - window_usage_.thread_cpu) * 1000 / wall_ms);
+      text += part;
+    }
+  }
+  if (window_usage_.faults >= 0 && now_usage.faults >= 0) {
+    text += "；缺页 " + std::to_string(now_usage.faults - window_usage_.faults) + " 次（要读盘 " +
+            std::to_string(now_usage.hard_faults - window_usage_.hard_faults) + " 次）";
+  }
+  if (window_usage_.preempted >= 0 && now_usage.preempted >= 0) {
+    text += "，安装线程被抢走 CPU " + std::to_string(now_usage.preempted - window_usage_.preempted) + " 次、自己等待 " +
+            std::to_string(now_usage.yielded - window_usage_.yielded) + " 次";
+  }
+  if (const std::string memory = memory_summary(); !memory.empty()) text += "；" + memory;
+  return text;
 }
 
 std::string InstallClock::summary(const std::string& name, const std::string& outcome) {
@@ -239,7 +307,9 @@ class TimedWriter final : public FileWriter {
 
   std::string write(const std::uint8_t* data, std::size_t size) override {
     PhaseScope scope(InstallPhase::write);
+    const auto started = std::chrono::steady_clock::now();
     std::string error = inner_->write(data, size);
+    InstallClock::note_write_time(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
     if (error.empty()) InstallClock::note_written(size);
     return error;
   }

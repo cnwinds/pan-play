@@ -15,7 +15,7 @@ enum class InstallPhase { other, download, decode, write, files };
 
 // 同一时刻只记一项：进入新的一项时上一项暂停，离开时接着记，各项加起来就是安装用的总时间。
 // 构造时绑定到当前线程，别的线程（预读的下载线程等）进出 PhaseScope 不记。
-// 打开详细日志时每 10 秒记一行这段时间的占比，见 ADR 0001「诊断日志」。
+// 打开详细日志时每 10 秒记一行这段时间的占比，连同读入解出速度、CPU、缺页、内存，见 ADR 0001「诊断日志」。
 class InstallClock {
  public:
   InstallClock();
@@ -29,6 +29,10 @@ class InstallClock {
   // 当前线程正在计时的安装写出了多少字节、新建了一个文件。没有在计时时什么也不做。
   static void note_written(std::size_t bytes);
   static void note_opened();
+  // 解压器从预读（或直接从网盘）读到了多少字节压缩数据。
+  static void note_read(std::size_t bytes);
+  // 一次写调用用了多久，记下每 10 秒里最长的一次：系统回写跟不上时个别写调用会卡很久。
+  static void note_write_time(double ms);
 
  private:
   friend class PhaseScope;
@@ -38,15 +42,29 @@ class InstallClock {
     double ms[kPhases] = {};
     std::int64_t written = 0;
     int opened = 0;
+    std::int64_t read = 0;
+    double longest_write_ms = 0;
+  };
+  // 取不到的项为 -1。
+  struct Usage {
+    double process_cpu = -1;
+    double thread_cpu = -1;
+    long long faults = -1;
+    long long hard_faults = -1;
+    long long preempted = -1;
+    long long yielded = -1;
   };
 
+  static Usage usage_now();
   InstallPhase switch_to(InstallPhase phase);
   void charge(Clock::time_point now);
+  std::string window_details(Clock::time_point now) const;
 
   InstallClock* outer_;
   InstallPhase current_ = InstallPhase::other;
   Clock::time_point since_;
   Clock::time_point window_at_;
+  Usage window_usage_;
   Tally total_;
   Tally window_;
   bool extracted_ = false;
