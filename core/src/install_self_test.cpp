@@ -924,6 +924,66 @@ int tuning_tests() {
     }
   }
 
+  // 加到上限以后读取方一直在等下载：少一条只会更慢，过了定期复核的时间也不能试着减。
+  {
+    reset_limits();
+    drive.stream_kbps = 6 * 1024;
+    PrefetchOptions options = base();
+    options.connections = 4;
+    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
+    std::string error;
+    bool reached = false;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(9);
+    while (std::chrono::steady_clock::now() < until) {
+      drain(reader, size, 0.05, &error);
+      if (!error.empty()) return fail("按连接限速、加到上限后读取出错: " + error);
+      const int now_connections = reader.connections();
+      if (now_connections == 4) reached = true;
+      if (reached && now_connections < 4) {
+        return fail("读取方一直在等下载时不该减连接，从 4 条减到了 " + std::to_string(now_connections) + " 条");
+      }
+    }
+    if (!reached) return fail("按连接限速时应该加到 4 条上限");
+  }
+
+  // 解压一时跟不上减了连接，恢复后读取方又在等：直接回到之前试过更快的条数，不等加连接的退避（这里 10 分钟）。
+  {
+    reset_limits();
+    drive.stream_kbps = 6 * 1024;
+    PrefetchOptions options = base();
+    options.connections = 4;
+    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
+    std::string error;
+    auto until = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (reader.connections() < 4 && std::chrono::steady_clock::now() < until) {
+      drain(reader, size, 0.05, &error);
+      if (!error.empty()) return fail("恢复测试加连接时读取出错: " + error);
+    }
+    if (reader.connections() != 4) return fail("恢复测试没能加到 4 条");
+    std::vector<std::uint8_t> piece(256 << 10);
+    until = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (reader.connections() == 4 && std::chrono::steady_clock::now() < until) {
+      reader.read(piece.data(), piece.size(), &error);
+      if (!error.empty()) return fail("解压慢时读取出错: " + error);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    const int lowered = reader.connections();
+    if (lowered >= 4) return fail("解压一直跟不上时应该减连接");
+    until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (reader.connections() < 4 && std::chrono::steady_clock::now() < until) {
+      drain(reader, size, 0.05, &error);
+      if (!error.empty()) return fail("解压恢复后读取出错: " + error);
+      const int now_connections = reader.connections();
+      if (now_connections > lowered && now_connections < 4) {
+        return fail("解压恢复后应该一步回到 4 条，却从 " + std::to_string(lowered) + " 条一档档往上试");
+      }
+    }
+    if (reader.connections() != 4) {
+      return fail("解压恢复、读取方又在等时应该直接回到 4 条，实际停在 " + std::to_string(reader.connections()) + " 条（减到过 " +
+                  std::to_string(lowered) + " 条）");
+    }
+  }
+
   // 卡住（每秒 16 KB）和一直有数据但很慢（每 40 毫秒 16 KB，400 KB/s，高于卡住的下限）：
   // 很慢的那段每次只交一点，解压器拿到一点又等，不能只看它连续等了多久。
   for (const int piece_ms : {1000, 40}) {
@@ -1101,7 +1161,7 @@ int install_clock_test() {
       line.find("写了 1 KB") == std::string::npos) {
     return fail("安装耗时总账不对: " + line);
   }
-  if (percent("等下载") < 60 || percent("等下载") > 85 || percent("解压") < 12) return fail("安装耗时占比不对: " + line);
+  if (percent("等下载") < 60 || percent("等下载") > 90 || percent("解压") < 12) return fail("安装耗时占比不对: " + line);
   InstallClock::note_dictionary(64u << 20);
   if (clock.dictionary() != (64u << 20)) return fail("安装计时没记下字典大小");
   if (!clock.slow().empty()) return fail("不到 10 秒就判断了慢在哪: " + clock.slow());

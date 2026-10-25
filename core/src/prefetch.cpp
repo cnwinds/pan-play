@@ -711,9 +711,22 @@ long long PrefetchReader::remember_locked(bool failed, Clock::time_point now) {
     const int failures = ++options_.tuning->failures;
     delay = static_cast<long long>(options_.backoff_ms) * (failures == 1 ? 1 : failures == 2 ? 2 : 5);
     options_.tuning->next_probe = now + std::chrono::milliseconds(delay);
+    options_.tuning->failed_from = tune_from_;
+    options_.tuning->failed_rate = tune_base_;
   } else {
     options_.tuning->failures = 0;
+    options_.tuning->failed_from = 0;
+    options_.tuning->proven = want_;
   }
+  options_.tuning->connections = want_;
+  return delay;
+}
+
+long long PrefetchReader::remember_down_failed_locked(Clock::time_point now) {
+  std::lock_guard<std::mutex> lock(options_.tuning->mu);
+  const int failures = ++options_.tuning->down_failures;
+  const long long delay = static_cast<long long>(options_.backoff_ms) * (failures == 1 ? 2 : failures == 2 ? 5 : 10);
+  options_.tuning->next_down = now + std::chrono::milliseconds(delay);
   options_.tuning->connections = want_;
   return delay;
 }
@@ -723,8 +736,9 @@ void PrefetchReader::set_want_locked(int connections, Clock::time_point now) {
   const int old = want_;
   want_ = connections;
   changed_at_ = now;
+  level_rate_ = 0;
+  decode_bound_rounds_ = 0;
   if (old == 1 && connections > 1) {
-    multi_since_ = now;
     // 没有终点的请求改不了范围：在大约 2 秒后能下到的地方收尾，之后的范围派给各条连接。
     for (auto& worker : workers_state_) {
       Lease& lease = worker.lease;
@@ -738,8 +752,17 @@ void PrefetchReader::set_want_locked(int connections, Clock::time_point now) {
     }
   }
   // 减掉的连接马上断开，没下的部分交给留下的连接；不等它下完，免得慢的那条堵在解压器前面。
+  // 只有解压器接下来要读的最前面那段让它下完：留下的连接手上都是后面的段，常常还被缓冲堵着，
+  // 断开后这段要等它们下完才有人接，解压器只能干等。真卡住了有卡住检查管。
+  const Lease* front = nullptr;
+  for (const auto& worker : workers_state_) {
+    const Lease& lease = worker.lease;
+    if (!lease.active || lease.generation != generation_ || lease.restart || lease.at >= lease.end) continue;
+    if (front == nullptr || lease.at < front->at) front = &lease;
+  }
   for (int i = connections; i < static_cast<int>(workers_state_.size()); ++i) {
     Lease& lease = workers_state_[static_cast<std::size_t>(i)].lease;
+    if (&lease == front) continue;
     if (lease.active && lease.generation == generation_ && !lease.restart) restart_lease_locked(lease);
   }
   cv_.notify_all();
@@ -752,7 +775,8 @@ void PrefetchReader::start_tune_locked(Tune direction, int level, double base_ra
   tune_base_ = base_rate;
   measuring_ = false;
   measure_rounds_ = 0;
-  PANPLAY_DEBUG("下载 #" + std::to_string(id_) + "：试 " + std::to_string(level) + " 条（现在 " +
+  extended_ = false;
+  PANPLAY_DEBUG("下载 #" + std::to_string(id_) + "：" + (direction == Tune::up ? "试 " : "减到 ") + std::to_string(level) + " 条（现在 " +
                 std::to_string(want_) + " 条，总 " + per_second(base_rate) + "）");
   set_want_locked(level, now);
 }
@@ -777,23 +801,47 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
     review_full_ms_ = 0;
     rate_avg_ = speed;
     if (ms_between(changed_at_, now) < options_.settle_ms) return;
-    if (wait > 0.2 && want_ < options_.connections) {
+    if (wait > 0.2) {
+      decode_bound_rounds_ = 0;
+      level_rate_ = level_rate_ > 0 ? (level_rate_ + speed) / 2 : speed;
+      if (want_ >= options_.connections) return;
+      int proven = 1;
       bool allowed = false;
       {
         std::lock_guard<std::mutex> lock(options_.tuning->mu);
-        allowed = now >= options_.tuning->next_probe;
+        const PrefetchTuning& tuning = *options_.tuning;
+        proven = std::min(tuning.proven, options_.connections);
+        allowed = now >= tuning.next_probe || tuning.failed_from != want_ || level_rate_ < 0.7 * tuning.failed_rate;
       }
-      if (allowed) {
-        start_tune_locked(Tune::up, level_above(want_, options_.connections), speed, now);
+      if (proven > want_) {
+        // 解压一时跟不上（换字典、换页）减下来的，解压器恢复后读取方又在等：那几条之前试过确实更快，
+        // 直接加回去，不用等加连接的退避再一档档试。
+        log_info(head + "读取方又在等数据（" + percent(wait, 1) + "，总 " + per_second(speed) + "），回到之前试过更快的 " +
+                 std::to_string(proven) + " 条");
+        set_want_locked(proven, now);
+        remember_down_failed_locked(now);
         return;
       }
+      if (allowed) start_tune_locked(Tune::up, level_above(want_, options_.connections), level_rate_, now);
+      return;
     }
-    if (want_ > 1 && wait < 0.05 && full > 0.5) {
-      // 只减到够解压器读的条数（留三成余量）：一档档往下减会减过头，解压器反过来等下载。
+    // 下面是读取方几乎不等、下载有富余时才考虑减：下载跟不上时少一条只会更慢。
+    if (want_ <= 1 || wait >= 0.05) {
+      decode_bound_rounds_ = 0;
+      return;
+    }
+    bool down_allowed = false;
+    {
+      std::lock_guard<std::mutex> lock(options_.tuning->mu);
+      down_allowed = now >= options_.tuning->next_down;
+    }
+    if (full > 0.5) {
+      if (++decode_bound_rounds_ < 2 || !down_allowed) return;
+      // 只减到够解压器读的条数（留五成余量）：一档档往下减会减过头，解压器反过来等下载。
       const double lane = lane_rate_ > 0 ? lane_rate_ : speed / want_;
       int lower = want_;
       if (lane > 0) {
-        const int needed = std::max(1, static_cast<int>(std::ceil(consumed * 1.3 / lane)));
+        const int needed = std::max(1, static_cast<int>(std::ceil(consumed * 1.5 / lane)));
         lower = 1;
         for (const int level : kLevels) {
           if (level >= needed) {
@@ -804,15 +852,18 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
         lower = std::min(lower, want_);
       }
       if (lower < want_) {
-        log_info(head + "解压跟不上（缓冲满 " + percent(full, 1) + "，解压器读走 " + per_second(consumed) +
-                 "，每条约 " + per_second(lane) + "），减到 " + std::to_string(lower) + " 条");
+        log_info(head + "解压跟不上（连着 " + std::to_string(decode_bound_rounds_) + " 个观察期缓冲常满，这期满 " +
+                 percent(full, 1) + "，解压器读走 " + per_second(consumed) + "，每条约 " + per_second(lane) + "），减到 " +
+                 std::to_string(lower) + " 条");
         set_want_locked(lower, now);
         std::lock_guard<std::mutex> lock(options_.tuning->mu);
         options_.tuning->connections = want_;
         return;
       }
+    } else {
+      decode_bound_rounds_ = 0;
     }
-    if (want_ > 1 && ms_between(multi_since_, now) >= 12.0 * options_.review_ms) {
+    if (down_allowed && full > 0.2 && ms_between(changed_at_, now) >= 12.0 * options_.review_ms) {
       start_tune_locked(Tune::down, level_below(want_), speed, now);
     }
     return;
@@ -823,6 +874,7 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
       measuring_ = true;
       measure_from_ = now;
       measure_received_ = received_.load();
+      measure_delivered_ = total_.delivered;
       measure_wait_ms_ = 0;
       measure_full_ms_ = 0;
       for (auto& worker : workers_state_) worker.mark = worker.received;
@@ -830,7 +882,7 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
     return;
   }
   const double elapsed = ms_between(measure_from_, now);
-  if (elapsed < options_.measure_ms) return;
+  if (elapsed < options_.measure_ms * (extended_ ? 2.0 : 1.0)) return;
   const std::int64_t received = received_.load();
   const double speed = static_cast<double>(received - measure_received_) / elapsed;
   const double wait = measure_wait_ms_ / elapsed;
@@ -850,19 +902,27 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
     rate_avg_ = speed;
   };
   if (tune_ == Tune::up) {
-    // 多连接时最远的那段可能已经顶到缓冲上限，解压器却还在等最前面那段，这时瓶颈仍在下载。
+    // 加了以后缓冲常满、读取方不怎么等了：下载已经够读，至少不比原来慢，留着；多出来的由解压跟不上的复核去减。
+    // 只看缓冲满不够：多连接时最远的那段可能已经顶到缓冲上限，解压器却还在等最前面那段，这时瓶颈仍在下载。
     if (full > 0.3 && wait < 0.2) {
-      set_want_locked(tune_from_, now);
-      const long long delay = remember_locked(true, now);
-      log_info(head + "试 " + tried + " 条：" + numbers + "，缓冲常满、瓶颈不在下载，退回 " + before + " 条，" +
-               std::to_string(delay / 1000) + " 秒后再试");
+      {
+        std::lock_guard<std::mutex> lock(options_.tuning->mu);
+        options_.tuning->connections = want_;
+      }
+      log_info(head + "试 " + tried + " 条：" + numbers + "，缓冲常满、下载已经够读，保留");
       settle();
       return;
     }
-    if (ratio >= 1.3) {
+    // 门槛按这一档理论上能多出多少定：1→2 理论翻倍，6→8 最多多三成，用同一个门槛 6→8 几乎永远过不了。
+    // 百度的速度一会儿高一会儿低，不上不下时多量一轮、合起来再判。
+    const double gain = static_cast<double>(want_) / std::max(1, tune_from_) - 1;
+    const double keep_at = 1 + std::min(0.3, gain * 0.5);
+    const double drop_below = 1 + std::min(0.15, gain * 0.25);
+    if (ratio >= keep_at || (extended_ && ratio >= (keep_at + drop_below) / 2)) {
       remember_locked(false, now);
       log_info(head + "试 " + tried + " 条：" + numbers + "，确实更快，保留");
       settle();
+      level_rate_ = speed;
       if (wait > 0.2 && want_ < options_.connections) start_tune_locked(Tune::up, level_above(want_, options_.connections), speed, now);
       return;
     }
@@ -888,33 +948,45 @@ void PrefetchReader::tune_locked(Clock::time_point now) {
         }
         ++measure_rounds_;
         measuring_ = false;
+        extended_ = false;
         changed_at_ = now;
         return;
       }
     }
-    if (ratio >= 1.15 && measure_rounds_ == 0) {
-      ++measure_rounds_;
-      measure_from_ = now;
-      measure_received_ = received;
-      measure_wait_ms_ = 0;
-      measure_full_ms_ = 0;
-      for (auto& worker : workers_state_) worker.mark = worker.received;
+    if (ratio >= drop_below && !extended_) {
+      extended_ = true;
       return;
     }
+    const double base = tune_base_;
     set_want_locked(tune_from_, now);
     const long long delay = remember_locked(true, now);
     log_info(head + "试 " + tried + " 条：" + numbers + "，只是分流，退回 " + before + " 条，" +
              std::to_string(delay / 1000) + " 秒后再试");
     settle();
+    level_rate_ = base;
     return;
   }
-  multi_since_ = now;
-  if (ratio >= 0.9) {
-    remember_locked(false, now);
-    log_info(head + "减到 " + tried + " 条：" + numbers + "，没变慢，保留");
+  // 减下来的条数够不够：缓冲满着时下载被解压器拖着，总速度和减之前比没有意义；
+  // 看下载跟不跟得上解压器读，缓冲少了不到一块（新块按整块领）算跟得上。
+  const double consumed = static_cast<double>(total_.delivered - measure_delivered_) / elapsed;
+  const std::int64_t drained = (total_.delivered - measure_delivered_) - (received - measure_received_);
+  const std::string reading = numbers + "，解压器读走 " + per_second(consumed);
+  if (wait < 0.05 && (full > 0.2 || drained <= static_cast<std::int64_t>(options_.block_size))) {
+    {
+      std::lock_guard<std::mutex> lock(options_.tuning->mu);
+      options_.tuning->connections = want_;
+      options_.tuning->down_failures = 0;
+    }
+    log_info(head + "减到 " + tried + " 条：" + reading + "，够用，保留");
   } else {
     set_want_locked(tune_from_, now);
-    log_info(head + "减到 " + tried + " 条：" + numbers + "，变慢了，回到 " + before + " 条");
+    {
+      std::lock_guard<std::mutex> lock(options_.tuning->mu);
+      options_.tuning->proven = std::max(options_.tuning->proven, want_);
+    }
+    const long long delay = remember_down_failed_locked(now);
+    log_info(head + "减到 " + tried + " 条：" + reading + "，跟不上，回到 " + before + " 条，" +
+             std::to_string(delay / 1000) + " 秒后再试");
   }
   settle();
 }
@@ -949,15 +1021,34 @@ void PrefetchReader::check_stalls_locked(Clock::time_point now) {
   std::int64_t need = position_;
   if (const ChunkPtr chunk = chunk_at_locked(position_)) need = chunk->filled_end();
   Lease* slow = nullptr;
+  bool covered = false;
   std::vector<double> others;
   for (auto& worker : workers_state_) {
     Lease& lease = worker.lease;
-    if (!lease.active || lease.generation != generation_ || !lease.connected || lease.restart) continue;
+    if (!lease.active || lease.generation != generation_) continue;
     if (need >= lease.start && need < lease.end) {
-      slow = &lease;
-    } else if (lease.check_rate >= 0) {
+      covered = true;
+      if (lease.connected && !lease.restart) slow = &lease;
+    } else if (lease.connected && !lease.restart && lease.check_rate >= 0) {
       others.push_back(lease.check_rate);
     }
+  }
+  if (!covered && need < size_) {
+    // 解压器要的那段没人在下（减连接时断开的、卡住重派放回去的），留下的连接又都在下后面的段、
+    // 常常还被缓冲堵着，要等它们下完才有人接：断开最靠后的那段，让它的连接先来接这段。
+    Lease* last = nullptr;
+    for (int i = 0; i < want_; ++i) {
+      Lease& lease = workers_state_[static_cast<std::size_t>(i)].lease;
+      // 有空着或正在换段的连接，马上就会来接。
+      if (!lease.active || lease.generation != generation_ || lease.restart) return;
+      if (lease.start > need && (last == nullptr || lease.start > last->start)) last = &lease;
+    }
+    if (last == nullptr) return;
+    PANPLAY_DEBUG("预读 #" + std::to_string(id_) + "：解压器要的 @" + mb(need) + " 没有连接在下，断开最靠后的段 @" +
+                  mb(last->start) + " 先来接");
+    count_locked([](Stats& stats) { ++stats.restarts; });
+    restart_lease_locked(*last);
+    return;
   }
   if (slow == nullptr || slow->check_rate < 0) return;
   // 先和正在下的其他连接比；没有（单连接，或者其他连接都被缓冲堵着）就和卡住之前的单条速度、
@@ -1024,7 +1115,7 @@ void PrefetchReader::start_locked() {
   if (started_) return;
   started_ = true;
   const auto now = Clock::now();
-  accounted_at_ = window_at_ = review_from_ = changed_at_ = tuned_at_ = multi_since_ = starve_from_ = now;
+  accounted_at_ = window_at_ = review_from_ = changed_at_ = tuned_at_ = starve_from_ = now;
   window_received_ = review_received_ = received_.load();
   cv_.notify_all();
 }

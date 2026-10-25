@@ -19,8 +19,17 @@ namespace panplay {
 struct PrefetchTuning {
   std::mutex mu;
   int connections = 1;
+  // 试过确实比少一档快的条数。解压器拖慢时减下去，读取方又等数据时直接回到这里，不用重新试。
+  int proven = 1;
+  // 往上试失败：从几条往上试的、当时的总速度（字节/毫秒）。退避只管从这个条数往上试，
+  // 条数变了或者这个条数下的总速度掉了三成，说明情况变了，不用等。
+  int failed_from = 0;
+  double failed_rate = 0;
   int failures = 0;
   std::chrono::steady_clock::time_point next_probe{};
+  // 往下减了又不够用的次数，和什么时候能再减。
+  int down_failures = 0;
+  std::chrono::steady_clock::time_point next_down{};
 };
 
 struct PrefetchOptions {
@@ -37,7 +46,7 @@ struct PrefetchOptions {
   int settle_ms = 3000;     // 连接数变了以后等这么久才开始判断
   int measure_ms = 3000;    // 一次试探量这么久
   int review_ms = 10000;    // 观察期
-  int backoff_ms = 60000;   // 试探失败后第一次退避这么久，第二次翻倍，之后 5 倍
+  int backoff_ms = 60000;   // 加连接失败后第一次退避这么久，第二次翻倍，之后 5 倍；减连接失败退避 2、5、10 倍
   int segment_ms = 4000;    // 多连接时一段至少下这么久
   int stall_ms = 5000;      // 解压器等着的那段慢成这样持续这么久，就断开重下
   // 默认每份选项一个；复制选项时一起复制，所以同一次安装的各卷共用。
@@ -168,8 +177,10 @@ class PrefetchReader {
   void note_lane_rate_locked(double rate);
   void start_tune_locked(Tune direction, int level, double base_rate, Clock::time_point now);
   void set_want_locked(int connections, Clock::time_point now);
-  // 把定下来的连接数记到各卷共用的 tuning 上；failed 时记一次失败，返回要退避多少毫秒。
+  // 把定下来的连接数记到各卷共用的 tuning 上；failed 时记一次加连接失败，返回要退避多少毫秒。
   long long remember_locked(bool failed, Clock::time_point now);
+  // 减了连接又不够用：记一次，返回多久以后才能再减。
+  long long remember_down_failed_locked(Clock::time_point now);
   bool all_connected_locked() const;
   std::string speeds_locked(double elapsed_ms) const;
   template <class Apply>
@@ -229,9 +240,12 @@ class PrefetchReader {
   double tune_base_ = 0;
   bool measuring_ = false;
   int measure_rounds_ = 0;
+  // 结果不上不下时多量一轮，和第一轮合起来算。
+  bool extended_ = false;
   Clock::time_point changed_at_;
   Clock::time_point measure_from_;
   std::int64_t measure_received_ = 0;
+  std::int64_t measure_delivered_ = 0;
   double measure_wait_ms_ = 0;
   double measure_full_ms_ = 0;
   Clock::time_point review_from_;
@@ -240,7 +254,11 @@ class PrefetchReader {
   double review_wait_ms_ = 0;
   double review_full_ms_ = 0;
   double rate_avg_ = 0;
-  Clock::time_point multi_since_;
+  // 现在这个条数下、读取方在等数据（量到的是下载真实速度）的观察期总速度的平均，往上试时拿它当基准，
+  // 比只看最近一个观察期稳：百度的速度一会儿高一会儿低。条数变了清零。
+  double level_rate_ = 0;
+  // 连着几个观察期都是解压跟不上：只看一期会把换字典这类一时变慢当成常态。
+  int decode_bound_rounds_ = 0;
   Clock::time_point tuned_at_;
 
   // 后台线程读网络时不拿锁，收到的字节数单独计。
