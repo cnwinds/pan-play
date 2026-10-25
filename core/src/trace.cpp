@@ -47,6 +47,7 @@ namespace panplay {
 namespace {
 
 constexpr std::uint64_t kMaxLogBytes = 2u << 20;
+constexpr auto kLogCheckInterval = std::chrono::seconds(2);
 
 std::atomic<int> current_level{static_cast<int>(LogLevel::warn)};
 const auto started = std::chrono::steady_clock::now();
@@ -58,6 +59,7 @@ std::mutex file_mu;
 std::filesystem::path file_path;
 std::uint64_t file_bytes = 0;
 bool capture_stdio_to_file = false;
+std::chrono::steady_clock::time_point last_file_check;
 
 int thread_number() {
   thread_local const int number = next_thread++;
@@ -125,6 +127,17 @@ void rotate_locked() {
   if (previous >= 0) close_fd(previous);
   std::error_code ec;
   std::filesystem::rename(file_path, old_log_path(), ec);
+  reopen_locked();
+}
+
+// 调用方持有 file_mu。运行中日志文件被删掉时，旧描述符还能写但内容没处看，重新建一个。
+// 每行都查太费，隔 kLogCheckInterval 才查一次。
+void recreate_if_missing_locked(std::chrono::steady_clock::time_point now) {
+  if (now - last_file_check < kLogCheckInterval) return;
+  last_file_check = now;
+  std::error_code ec;
+  if (std::filesystem::exists(file_path, ec) || ec) return;
+  std::filesystem::create_directories(file_path.parent_path(), ec);
   reopen_locked();
 }
 
@@ -230,13 +243,15 @@ void log_line(LogLevel level, const std::string& message) {
 #else
   localtime_r(&seconds, &tm);
 #endif
-  const double uptime = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  const auto steady_now = std::chrono::steady_clock::now();
+  const double uptime = std::chrono::duration<double>(steady_now - started).count();
   char head[96];
   std::snprintf(head, sizeof(head), "%04d-%02d-%02d %02d:%02d:%02d.%03d +%.3fs [t%d] %s ", tm.tm_year + 1900,
                 tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, ms, uptime, thread_number(),
                 level_tag(level));
   const std::string line = head + message + "\n";
   std::lock_guard<std::mutex> lock(file_mu);
+  if (log_fd.load() >= 0) recreate_if_missing_locked(steady_now);
   write_raw(line.data(), line.size());
   if (log_fd.load() < 0) return;
   // 写文件时，警告和错误在控制台上也打一份，开着窗口的人能直接看到。

@@ -31,6 +31,7 @@ inline void log_info(const std::string& message) { log_line(LogLevel::info, mess
   } while (0)
 
 // 往这个文件追加日志，超过 2 MB 时改名成 <名字>.old.log 再开新文件，只留一份旧的。
+// 运行中文件被删掉时，最多过 2 秒、下一行日志写之前会重新建出来。
 // capture_stdio 时把标准输出和标准错误也接到这个文件：PS5 上加载器把它们接在管道上，没人读时写满会卡住线程。
 bool open_log_file(const std::filesystem::path& path, bool capture_stdio);
 
