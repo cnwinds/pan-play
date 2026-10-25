@@ -1050,17 +1050,19 @@ body.drawer-open { overflow: hidden; }
 .review .link[hidden] { display: none; }
 
 .review-banner {
-  display: grid;
-  gap: 0.2rem;
-  padding: 0.7rem 0.9rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  min-width: 0;
+  padding: 0.55rem 0.9rem;
   border-left: 3px solid var(--faint);
   border-radius: 9px;
   background: rgba(255, 255, 255, 0.04);
   color: var(--muted);
 }
 
-.review-banner strong { font-size: 0.95rem; font-weight: 600; }
-.review-meta { font-size: 0.8rem; opacity: 0.85; }
+.review-banner strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.95rem; font-weight: 600; }
+.review-meta { flex: none; margin-left: auto; font-size: 0.8rem; opacity: 0.85; white-space: nowrap; }
 .review-banner[data-state="good"] { border-color: var(--mint); background: rgba(95, 211, 160, 0.1); color: var(--mint); }
 .review-banner[data-state="bad"] { border-color: var(--danger); background: rgba(255, 138, 122, 0.1); color: var(--danger); }
 

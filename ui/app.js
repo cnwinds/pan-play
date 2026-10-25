@@ -1315,7 +1315,7 @@ function openDetail(game, opener) {
   };
   const reviewWhen = (review) => {
     const date = serverClockDate(review.at * 1000);
-    return `${date.getUTCMonth() + 1} 月 ${date.getUTCDate()} 日`;
+    return `${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
   };
   const paintReview = (installedNow, busy) => {
     const review = game.review;
@@ -1338,15 +1338,16 @@ function openDetail(game, opener) {
     if (!reviewBanner.hidden) {
       const own = shown === review;
       const note = shown.note ? `：${shown.note}` : "";
-      const who = shown.device ? `你在${shown.device}上` : "你";
       reviewBanner.dataset.state = own ? (shown.playable ? "good" : "bad") : "info";
-      reviewText.textContent = own
-        ? (shown.playable ? `${who}标记过这个版本能正常玩` : `${who}标记过这个版本有问题${note}`)
-        : `这个游戏的另一个版本${who}标记过${shown.playable ? "能玩" : "有问题" + note}`;
+      const verdict = shown.playable ? "能正常玩" : "有问题" + note;
+      reviewText.textContent = own ? verdict : `另一版本${verdict}`;
       const meta = [shown.firmware ? `固件 ${shown.firmware}` : "固件未知", reviewWhen(shown)];
-      if (shown.format) meta.unshift(variantLabel(shown.format) + "版");
-      if (own && !sameLayers(shown, installedNow)) meta.push("当时装的补丁和现在不同");
+      if (!own && shown.format) meta.unshift(variantLabel(shown.format) + "版");
+      if (shown.device) meta.push(shown.device);
+      if (own && !sameLayers(shown, installedNow)) meta.push("补丁已变");
       reviewMeta.textContent = meta.join(" · ");
+      reviewBanner.title = `${shown.device ? `你在${shown.device}上` : "你"}标记过${own ? "这个版本" : "另一个版本"}` +
+        `${verdict}（${meta.join(" · ")}）`;
     }
   };
   const sendReview = async (endpoint, body) => {
