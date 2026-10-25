@@ -397,6 +397,8 @@ class Unpack:PackDef
     uint64 AllocWinSize;
     size_t MaxWinSize;
     size_t MaxWinMask;
+    // panplay: window bytes written by the files since the window was last discarded.
+    size_t DirtyWinSize;
 
     bool ExtraDist; // Allow distances up to 1 TB.
 

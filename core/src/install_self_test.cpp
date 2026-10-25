@@ -1036,6 +1036,30 @@ int speed_test_tests() {
 }
 
 // 安装耗时：嵌套时只记最里面那项，别的线程不记，写入经 timed_sink 记到写入、新建文件记到开关文件，没开始解压时没有总账。
+int big_memory_test() {
+  constexpr std::size_t kSize = 8u << 20;
+  auto* window = static_cast<std::uint8_t*>(big_alloc(kSize));
+  if (window == nullptr) return fail("要不到 8 MB 的字典内存");
+  std::memset(window, 0xAB, kSize);
+  const std::size_t dropped = big_discard(window, kSize);
+  const std::uint64_t total = big_memory_discarded();
+  if (dropped == 0 || dropped > kSize) {
+    big_free(window);
+    return fail("字典内存没能交给系统丢掉: " + std::to_string(dropped));
+  }
+  if (window_reuse(window, 1u << 20)) {
+    big_free(window);
+    return fail("字典只写了 1 MB 也被丢掉了");
+  }
+  std::memset(window, 0x5A, kSize);
+  const bool kept = window[0] == 0x5A && window[kSize - 1] == 0x5A;
+  big_free(window);
+  if (!kept) return fail("字典内存丢掉内容后写不进去");
+  if (total < dropped) return fail("没记下丢掉了多少字典内存");
+  if (big_memory_in_use() != 0) return fail("字典内存测试后没有还掉");
+  return 0;
+}
+
 int install_clock_test() {
   const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
   {
@@ -2349,6 +2373,7 @@ int run_install_pipeline_self_test() {
   if (const int code = prefetch_tests()) return code;
   if (const int code = tuning_tests()) return code;
   if (const int code = speed_test_tests()) return code;
+  if (const int code = big_memory_test()) return code;
   if (const int code = install_clock_test()) return code;
   if (const int code = game_root_test()) return code;
   if (const int code = package_and_duplicate_test()) return code;

@@ -1,5 +1,10 @@
 #include "rar.hpp"
 
+#ifdef RARDLL
+// panplay: core/src/big_memory.cpp. Returns true when the window contents were discarded.
+extern "C" bool panplay_window_reuse(void* window, size_t used);
+#endif
+
 #include "coder.cpp"
 #include "suballoc.cpp"
 #include "model.cpp"
@@ -33,6 +38,7 @@ Unpack::Unpack(ComprDataIO *DataIO)
   AllocWinSize=0;
   MaxWinSize=0;
   MaxWinMask=0;
+  DirtyWinSize=0;
 
   // Perform initialization, which should be done only once for all files.
   // It prevents crash if first unpacked file has the wrong "true" Solid flag,
@@ -153,6 +159,7 @@ void Unpack::Init(uint64 WinSize,bool Solid)
 //    memset(Window,0,(size_t)WinSize);
 
     AllocWinSize=WinSize;
+    DirtyWinSize=0;
   }
 }
 
@@ -200,6 +207,10 @@ void Unpack::DoUnpack(uint Method,bool Solid)
       Unpack5(Solid);
       break;
   }
+#ifdef RARDLL
+  if (Window!=nullptr && !Fragmented)
+    DirtyWinSize=Max(DirtyWinSize,FirstWinDone ? MaxWinSize:Min(UnpPtr,MaxWinSize));
+#endif
 }
 
 
@@ -207,6 +218,14 @@ void Unpack::UnpInitData(bool Solid)
 {
   if (!Solid)
   {
+#ifdef RARDLL
+    // panplay: a non-solid file restarts at the window start and never reads what earlier files left there.
+    // Once enough was written, let the system drop those pages, so pages already swapped out are not
+    // read back from disk just to be overwritten.
+    if (Window!=nullptr && !Fragmented && DirtyWinSize>0 &&
+        panplay_window_reuse(Window,Min(DirtyWinSize,(size_t)AllocWinSize)))
+      DirtyWinSize=0;
+#endif
     OldDist[0]=OldDist[1]=OldDist[2]=OldDist[3]=(size_t)-1;
 
     OldDistPtr=0;
