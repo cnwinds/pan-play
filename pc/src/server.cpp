@@ -581,6 +581,8 @@ struct ShelfListing {
   };
   std::string key;
   std::vector<Folder> folders;
+  // 盘游装好、网盘里已经没有对应游戏目录的游戏。path 是按存放目录名拼出的游戏库路径，网盘里并不存在。
+  std::vector<Folder> orphans;
   bool dest_ready = false;
   bool sink_ready = false;
   ShelfPlacement placement;
@@ -622,10 +624,27 @@ std::shared_ptr<const ShelfListing> shelf_listing(panplay::DrivePlugin& drive, b
     if (auto sink = panplay::open_destination(destination, &dest_error)) {
       listing->sink_ready = true;
       listing->placement = read_shelf_placement(*sink, settings.prefix());
+      std::unordered_set<std::string> claimed;
+      for (const auto& folder : listing->folders) claimed.insert(folder.title_id.empty() ? folder.name : folder.title_id);
+      // 存放位置常和别的自制程序共用（/data/homebrew），只认带盘游完成标记的文件夹。
+      for (const auto& dir : listing->placement.installed_dirs) {
+        if (claimed.count(dir) != 0 || dir.rfind(".panplay", 0) == 0) continue;
+        std::string size_error;
+        const std::string marker = panplay::join_storage_path(panplay::join_storage_path(settings.prefix(), dir), ".panplay-done.json");
+        if (sink->file_size(marker, &size_error) < 0) continue;
+        listing->orphans.push_back({dir, panplay::join_storage_path(library_path, dir), panplay::find_title_id(dir)});
+      }
+      std::sort(listing->orphans.begin(), listing->orphans.end(),
+                [](const ShelfListing::Folder& left, const ShelfListing::Folder& right) { return left.name < right.name; });
     }
   }
   shelf_cache = listing;
   return listing;
+}
+
+bool is_orphan(const ShelfListing& listing, const std::string& path) {
+  return std::any_of(listing.orphans.begin(), listing.orphans.end(),
+                     [&](const ShelfListing::Folder& folder) { return folder.path == path; });
 }
 
 // 详情页实时读到的安装情况和游戏库列表缓存的不一样时，改掉列表缓存里的这一项，回到列表就是新的。
@@ -726,9 +745,14 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   };
   std::vector<Row> rows;
   std::size_t installed = 0;
-  for (const auto& folder : listing->folders) {
+  std::vector<std::pair<const ShelfListing::Folder*, bool>> entries;
+  for (const auto& folder : listing->folders) entries.emplace_back(&folder, true);
+  for (const auto& folder : listing->orphans) entries.emplace_back(&folder, false);
+  for (const auto& [entry, on_drive] : entries) {
+    const ShelfListing::Folder& folder = *entry;
     std::string state = "need-settings";
-    if (listing->sink_ready) state = shelf_state(placement, folder.name, folder.title_id, folder.path);
+    if (!on_drive) state = "installed";
+    else if (listing->sink_ready) state = shelf_state(placement, folder.name, folder.title_id, folder.path);
     else if (listing->dest_ready) state = "install";
     // 有没有新补丁要读网盘目录和完成标记，列表不读，用详情页上次读到的。
     if (state == "installed") {
@@ -751,9 +775,9 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     if (multi_only && !(store.found && store.players >= 2)) continue;
     const std::string shown = search_text.substr(0, search_text.find('\n'));
     // 打开过详情、读过压缩包的才知道指纹；没读过的不查，列表不为这个多发请求。
-    std::string review_field;
+    std::string review_field = on_drive ? "" : ",\"on_drive\":false";
     if (const auto review = find_review(listed_fingerprint(listing->key, folder.path))) {
-      review_field = std::string(",\"review_state\":\"") + (review->playable ? "good" : "bad") + "\"";
+      review_field += std::string(",\"review_state\":\"") + (review->playable ? "good" : "bad") + "\"";
     }
     rows.push_back({folder_json(folder.name, folder.path, folder.title_id, state, meta + review_field),
                     shown.empty() ? folder.name : shown, std::move(store)});
@@ -786,7 +810,7 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   }
   const std::size_t matched = rows.size();
   return "{\"games\":[" + items + "],\"offset\":" + std::to_string(offset) + ",\"total\":" + std::to_string(matched) +
-         ",\"all\":" + std::to_string(listing->folders.size()) + ",\"installed\":" + std::to_string(installed) +
+         ",\"all\":" + std::to_string(entries.size()) + ",\"installed\":" + std::to_string(installed) +
          ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + "}";
 }
 
@@ -1087,11 +1111,21 @@ std::string one_game_json(const std::string& path, bool cached) {
   std::optional<GameDetail> detail = cached_game_detail(key, path);
   std::string source = detail ? "cache" : "none";
   std::string state = detail ? detail->state : "";
-  if (cached && detail) {
+  std::shared_ptr<const ShelfListing> listing = cached_shelf(settings);
+  if (!listing && !cached) {
+    std::string listing_error;
+    listing = shelf_listing(*open_drive(), false, &listing_error);
+  }
+  const bool orphan = listing && is_orphan(*listing, path);
+  if (orphan) {
+    detail = GameDetail{};
+    detail->state = "installed";
+    source = "live";
+    state = detail->state;
+  } else if (cached && detail) {
     // 是否装在主机上以列表读到的为准（和格子上显示的一致），详情缓存只补上列表不知道的“有更新”。
     const bool placement = state == "install" || state == "continue" || state == "installed" || state == "update" ||
                            state == "other";
-    const auto listing = cached_shelf(settings);
     if (placement && listing && listing->sink_ready) {
       const std::string listed = shelf_state(listing->placement, name, title_id, path);
       state = listed == "installed" && (state == "update" || state == "other") ? state : listed;
@@ -1113,6 +1147,7 @@ std::string one_game_json(const std::string& path, bool cached) {
                      "\",\"game_dir\":\"" + panplay::json_escape(panplay::game_dir_of(path)) + "\",\"variant\":\"" +
                      panplay::json_escape(panplay::variant_format(path)) + "\",\"title_id\":\"" +
                      panplay::json_escape(title_id) + "\",\"source\":\"" + source + "\"";
+  if (orphan) json += ",\"on_drive\":false";
   if (detail) {
     json += ",\"variants\":" + (detail->variants.empty() ? std::string("[]") : detail->variants) +
             ",\"installed_variant\":\"" + panplay::json_escape(detail->installed_variant) + "\"";

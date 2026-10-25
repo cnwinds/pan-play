@@ -870,6 +870,7 @@ function detailFacts(game) {
   if (regionText[game.region]) facts.push(regionText[game.region]);
   if (game.formats) facts.push(game.formats.toUpperCase());
   if (game.archive_bytes) facts.push(formatBytes(game.archive_bytes));
+  if (game.on_drive === false) facts.push("网盘已删除");
   return facts;
 }
 
@@ -1525,7 +1526,7 @@ function openDetail(game, opener) {
     }
     if (game.state === "other" && game.installed_variant) label = `主机上装的是${variantLabel(game.installed_variant)}版`;
     if (waitingLayers) label = "正在读取压缩包…";
-    if (unshelved) label = "已从网盘删除";
+    if (unshelved) label = game.on_drive === false ? "已删除" : "已从网盘删除";
     const onConsole = game.console && ["installed", "update"].includes(game.state) ? consoleSummary(game.console) : null;
     if (game.state === "installed" && onConsole && onConsole.healthy) label = "已安装 · 已在主机桌面";
     action.textContent = label;
@@ -1548,7 +1549,7 @@ function openDetail(game, opener) {
     const installedNow = ["installed", "update"].includes(game.state);
     reviewItem.hidden = !game.fingerprint || busy || (!game.review && !installedNow);
     reviewItem.textContent = game.review ? "修改评价" : "评价这个版本";
-    unshelve.hidden = !game.path || busy || game.state === "continue";
+    unshelve.hidden = !game.path || busy || game.state === "continue" || game.on_drive === false;
     paintReview(installedNow, busy || unshelved);
     moreWrap.hidden = unshelved || [adjust, registerItem, reviewItem, discard, remove, unshelve].every((item) => item.hidden);
     if (moreWrap.hidden && menuOpen) setMenu(false);
@@ -1703,9 +1704,11 @@ function openDetail(game, opener) {
     if (!detail || detail.game !== game) return;
     confirm.close();
     say(error ? "" : done);
+    // 网盘里已经没有的游戏，删掉后游戏库里也就没有它了，没什么可重读的。
+    if (!error && game.on_drive === false) unshelved = true;
     paint();
     if (error) detail.fail(error);
-    else reload();
+    else if (!unshelved) reload();
     (error ? focusAfter : action).focus();
   };
   const askRemove = (steps, endpoint, done, focusAfter) => {
@@ -1739,7 +1742,9 @@ function openDetail(game, opener) {
       { head: `删除「${displayName(game)}」？`, body: first, button: "删除" },
       {
         head: "再确认一次",
-        body: [el("p", "", `删除后不能恢复，想再玩要从网盘重新下载安装${size}。`)],
+        body: [el("p", "", game.on_drive === false
+          ? "删除后不能恢复。网盘里已经没有这个游戏，盘游没法再把它装回来。"
+          : `删除后不能恢复，想再玩要从网盘重新下载安装${size}。`)],
         button: "确认删除",
       },
     ], "/api/uninstall", "已从存放位置删除。", more);
@@ -1756,7 +1761,7 @@ function openDetail(game, opener) {
     body.push(el("p", "", oneFormat
       ? `${installedNow ? "主机上装好的游戏不受影响。" : ""}别的格式（${others.map((item) => variantLabel(item.format)).join("、")}）还留在网盘里。`
       : installedNow
-        ? "主机上装好的游戏不受影响，照样能玩；但它会从盘游的游戏库里消失，以后在盘游里就删不了它了。"
+        ? "主机上装好的游戏不受影响，照样能玩，也还留在盘游的游戏库里，以后可以在这里删掉它。"
         : "删除后它会从游戏库里消失。"));
     if (game.review && !game.review.playable) {
       body.push(el("p", "", "你标的「有问题」会留着，盘架看到同一份文件时不会再转存回来。"));
