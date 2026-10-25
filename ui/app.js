@@ -524,7 +524,25 @@ function finishClock(seconds) {
 // 正在解压时的平均速度和剩余时间；刚开始几秒还没算出来时没有。
 function taskPace(task) {
   if (!task || task.state !== "running" || task.message !== "正在安装" || !(task.speed > 0)) return null;
-  return { speed: formatBytes(task.speed) + "/s", left: task.eta >= 0 ? task.eta : null };
+  const recent = task.recent_speed > 0 ? task.recent_speed : task.speed;
+  return { speed: formatBytes(recent) + "/s", average: formatBytes(task.speed) + "/s", left: steadyLeft(task) };
+}
+
+// 预计装完的时刻。服务端每秒给一次估计，和正在显示的差得不多就沿用，免得时间每秒都在变。
+let finishPlan = null;
+
+function steadyLeft(task) {
+  if (!(task.eta >= 0)) return null;
+  const now = Date.now();
+  const at = now + task.eta * 1000;
+  const shown = finishPlan && finishPlan.path === task.path ? finishPlan.at : 0;
+  if (!shown || Math.abs(at - shown) > Math.max(60000, (shown - now) * 0.1)) finishPlan = { path: task.path, at };
+  return Math.max(0, Math.round((finishPlan.at - now) / 1000));
+}
+
+// 剩余时间：10 分钟以上按 5 分钟取整。
+function roughDuration(seconds) {
+  return formatDuration(seconds >= 600 ? Math.round(seconds / 300) * 300 : seconds);
 }
 
 // 最近 10 秒安装主要卡在哪，由安装线程按各项占用的时间判断。
@@ -562,7 +580,8 @@ function jobText(current, inDetail = false) {
       const parts = [`${formatBytes(current.bytes_done)} / ${formatBytes(current.bytes_total)}`];
       const pace = taskPace(current);
       if (inDetail && pace) parts.push(pace.speed);
-      else if (!inDetail && pace && pace.left !== null) parts.push(`剩余 ${formatDuration(pace.left)}`);
+      else if (!inDetail && pace && pace.left !== null) parts.push(`剩余 ${roughDuration(pace.left)}`);
+      else if (!inDetail && pace) parts.push("正在估算剩余时间");
       else parts.push(`${current.files_done} 个文件`);
       return parts.join(" · ");
     }
@@ -777,7 +796,7 @@ function paintDock() {
   dockTitle.textContent = displayName(summary.head);
   dockStatus.textContent = summary.text;
   const pace = taskPace(running);
-  dockStatus.title = pace && pace.left !== null ? `平均 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : queuePauseReason;
+  dockStatus.title = pace && pace.left !== null ? `最近 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : queuePauseReason;
   const artKey = summary.head.path + "\n" + (summary.head.cover_url || "");
   if (dockArtKey !== artKey) {
     dockArtKey = artKey;
@@ -1651,8 +1670,8 @@ function openDetail(game, opener) {
       const pace = taskPace(task);
       progressTop.hidden = !taskStarted(task);
       progressPct.textContent = Math.round(taskFraction(task) * 100) + "%";
-      progressEta.textContent = pace && pace.left !== null ? `预计 ${finishClock(pace.left)} 装完` : "";
-      progressEta.title = pace ? `从开始解压算的平均速度 ${pace.speed}` : "";
+      progressEta.textContent = pace ? (pace.left !== null ? `预计 ${finishClock(pace.left)} 装完` : "正在估算剩余时间…") : "";
+      progressEta.title = pace ? `最近的速度 ${pace.speed}，从开始解压算的平均 ${pace.average}` : "";
       progressNote.textContent = paceNote(task);
       progressNote.hidden = !progressNote.textContent;
     }

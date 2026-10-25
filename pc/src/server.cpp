@@ -31,6 +31,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -255,6 +256,12 @@ struct InstallTask {
   std::int64_t rate_base = -1;
   std::chrono::steady_clock::time_point rate_since;
   std::chrono::steady_clock::time_point rate_last;
+  // 剩余时间按最近的速度估：每秒取一次样，做时间常数 60 秒的指数加权平均。recent_bytes 为 -1 时没在取样
+  // （还没开始解压、在核对已装文件、在等自动续装），下次正在安装时重新起头，中间停着的时间不算。
+  double recent_rate = 0;
+  double recent_seconds = 0;
+  std::int64_t recent_bytes = -1;
+  std::chrono::steady_clock::time_point recent_at;
   // 全部暂停时停下的：装完这一轮回到队首，不进已完成。
   bool pausing = false;
 };
@@ -1224,6 +1231,27 @@ std::string one_game_json(const std::string& path, bool cached) {
   return json + game_meta_fields(name, title_id, load_name_overrides(), true) + "}";
 }
 
+constexpr double kRecentRateSeconds = 60;
+// 取样不满这么多秒不给剩余时间：刚开始几十秒的速度常常比后面快，估出来的时间太乐观。
+constexpr double kRecentRateWarmup = 20;
+
+void sample_recent_rate(InstallTask& task, std::int64_t done, std::chrono::steady_clock::time_point now) {
+  // 续装退回到上一个装完的文件时进度会变小，也重新起头。
+  if (task.recent_bytes < 0 || done < task.recent_bytes) {
+    task.recent_bytes = done;
+    task.recent_at = now;
+    return;
+  }
+  const double seconds = std::chrono::duration<double>(now - task.recent_at).count();
+  if (seconds < 1) return;
+  const double rate = static_cast<double>(done - task.recent_bytes) / seconds;
+  const double weight = 1 - std::exp(-seconds / kRecentRateSeconds);
+  task.recent_rate = task.recent_seconds > 0 ? task.recent_rate + weight * (rate - task.recent_rate) : rate;
+  task.recent_seconds += seconds;
+  task.recent_bytes = done;
+  task.recent_at = now;
+}
+
 InstallProgress progress_of(const panplay::InstallResult& result) {
   InstallProgress progress;
   progress.bytes_done = result.bytes_done;
@@ -1253,6 +1281,9 @@ void publish_progress(const panplay::InstallResult& snapshot) {
         task->rate_base = snapshot.bytes_done;
         task->rate_since = task->rate_last;
       }
+      sample_recent_rate(*task, snapshot.bytes_done, task->rate_last);
+    } else {
+      task->recent_bytes = -1;
     }
     path = task->path;
   }
@@ -1389,6 +1420,9 @@ void queue_worker() {
       installs.current->cancel = std::make_shared<panplay::CancelToken>();
       installs.current->result = {};
       installs.current->rate_base = -1;
+      installs.current->recent_rate = 0;
+      installs.current->recent_seconds = 0;
+      installs.current->recent_bytes = -1;
       installs.current->pausing = false;
       installs.current->result.message = "正在读取压缩包…";
       path = installs.current->path;
@@ -1524,15 +1558,18 @@ double average_speed(const InstallTask& task, bool running, double* seconds) {
   return *seconds >= 3 && moved > 0 ? static_cast<double>(moved) / *seconds : 0;
 }
 
-// 平均速度、预计还要几秒、解压了几秒。
+// 平均速度、最近的速度、预计还要几秒、解压了几秒。剩余时间按最近的速度算，还在估算时为 -1。
 std::string rate_fields(const InstallTask& task, bool running) {
-  if (task.rate_base < 0) return ",\"speed\":0,\"eta\":-1,\"elapsed\":0";
+  if (task.rate_base < 0) return ",\"speed\":0,\"recent_speed\":0,\"eta\":-1,\"elapsed\":0";
   const panplay::InstallResult& r = task.result;
   double seconds = 0;
   const double speed = average_speed(task, running, &seconds);
+  const bool estimated = task.recent_seconds >= kRecentRateWarmup && task.recent_rate > 0;
+  const double recent = estimated ? task.recent_rate : 0;
   const std::int64_t left = std::max<std::int64_t>(0, r.bytes_total - r.bytes_done);
-  const long long eta = running && speed > 0 ? static_cast<long long>(static_cast<double>(left) / speed) : -1;
-  return ",\"speed\":" + std::to_string(static_cast<long long>(speed)) + ",\"eta\":" + std::to_string(eta) +
+  const long long eta = running && recent > 0 ? static_cast<long long>(static_cast<double>(left) / recent) : -1;
+  return ",\"speed\":" + std::to_string(static_cast<long long>(speed)) +
+         ",\"recent_speed\":" + std::to_string(static_cast<long long>(recent)) + ",\"eta\":" + std::to_string(eta) +
          ",\"elapsed\":" + std::to_string(static_cast<long long>(seconds));
 }
 
