@@ -1078,6 +1078,9 @@ int install_clock_test() {
     return fail("安装耗时总账不对: " + line);
   }
   if (percent("等下载") < 60 || percent("等下载") > 85 || percent("解压") < 12) return fail("安装耗时占比不对: " + line);
+  InstallClock::note_dictionary(64u << 20);
+  if (clock.dictionary() != (64u << 20)) return fail("安装计时没记下字典大小");
+  if (!clock.slow().empty()) return fail("不到 10 秒就判断了慢在哪: " + clock.slow());
   return 0;
 }
 

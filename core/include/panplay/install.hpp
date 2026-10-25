@@ -35,6 +35,10 @@ struct InstallResult {
   // 意外停下（网络断开、主机休眠唤醒、存放位置连接断了），等一会儿再装多半能接着装，安装队列会自动继续。
   // 用户取消、压缩包有问题、字典超过上限、解压内存不够、网盘没登录这些，自动再装也一样，为 false。
   bool auto_resume = false;
+  // 安装中给界面看：正在解压的这层要多大的字典（字节，不用大字典的为 0），最近 10 秒主要卡在哪
+  // （download / decode / memory / write，分不出时为空）。
+  std::uint64_t dictionary = 0;
+  std::string slow;
 };
 
 struct InstallRequest {

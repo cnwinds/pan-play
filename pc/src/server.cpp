@@ -1202,6 +1202,8 @@ void publish_progress(const panplay::InstallResult& snapshot) {
     task->result.bytes_total = snapshot.bytes_total;
     task->result.files_checked = snapshot.files_checked;
     task->result.files_to_check = snapshot.files_to_check;
+    task->result.dictionary = snapshot.dictionary;
+    task->result.slow = snapshot.slow;
     if (snapshot.message == "正在安装" && snapshot.bytes_total > 0) {
       task->rate_last = std::chrono::steady_clock::now();
       if (task->rate_base < 0) {
@@ -1501,6 +1503,7 @@ std::string task_json(const InstallTask& task, const char* state, const NameOver
          "\",\"files_done\":" + std::to_string(r.files_done) + ",\"files_total\":" + std::to_string(r.files_total) +
          ",\"bytes_done\":" + std::to_string(r.bytes_done) + ",\"bytes_total\":" + std::to_string(r.bytes_total) +
          ",\"files_checked\":" + std::to_string(r.files_checked) + ",\"files_to_check\":" + std::to_string(r.files_to_check) +
+         ",\"dictionary\":" + std::to_string(r.dictionary) + ",\"slow\":\"" + panplay::json_escape(r.slow) + "\"" +
          ",\"retryable\":" + (r.retryable ? "true" : "false") + rate_fields(task, std::strcmp(state, "running") == 0) +
          game_meta_fields(name, title_id, overrides, false) + "}";
 }

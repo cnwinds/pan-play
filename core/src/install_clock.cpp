@@ -166,6 +166,11 @@ void InstallClock::note_write_time(double ms) {
   bound->window_.longest_write_ms = std::max(bound->window_.longest_write_ms, ms);
 }
 
+void InstallClock::note_dictionary(std::uint64_t bytes) {
+  if (bound == nullptr) return;
+  bound->dictionary_.store(bytes, std::memory_order_relaxed);
+}
+
 void InstallClock::charge(Clock::time_point now) {
   const double ms = std::chrono::duration<double, std::milli>(now - since_).count();
   total_.ms[static_cast<int>(current_)] += ms;
@@ -216,6 +221,7 @@ InstallPhase InstallClock::switch_to(InstallPhase phase) {
   current_ = phase;
   if (phase == InstallPhase::decode) extracted_ = true;
   if (now - window_at_ >= std::chrono::seconds(10)) {
+    if (extracted_) slow_.store(window_slow(now), std::memory_order_relaxed);
     if (extracted_ && log_enabled(LogLevel::debug)) {
       const double all = sum_ms(window_);
       log_line(LogLevel::debug,
@@ -258,6 +264,31 @@ std::string InstallClock::window_details(Clock::time_point now) const {
   if (const std::string memory = memory_summary(); !memory.empty()) text += "；" + memory;
   return text;
 }
+
+namespace {
+constexpr const char* kSlowNames[] = {"", "download", "decode", "memory", "write"};
+// 大字典被系统换出到硬盘后，解出每一页都要先读回来：PS5 上换页时每秒 1000 多次，平时接近 0。
+constexpr double kSwappingFaultsPerSecond = 100;
+}  // namespace
+
+// 哪一项占了这段时间一半以上就算卡在哪。解压时缺页要读盘的次数多，是在等内存换页而不是算不过来。
+int InstallClock::window_slow(Clock::time_point now) const {
+  const double all = sum_ms(window_);
+  if (all <= 0) return 0;
+  const auto share = [&](InstallPhase phase) { return window_.ms[static_cast<int>(phase)] / all; };
+  if (share(InstallPhase::download) >= 0.5) return 1;
+  if (share(InstallPhase::decode) >= 0.5) {
+    const double seconds = std::chrono::duration<double>(now - window_at_).count();
+    const long long hard = usage_now().hard_faults;
+    const bool swapping = window_usage_.hard_faults >= 0 && hard >= 0 && seconds > 0 &&
+                          static_cast<double>(hard - window_usage_.hard_faults) / seconds >= kSwappingFaultsPerSecond;
+    return swapping ? 3 : 2;
+  }
+  if (share(InstallPhase::write) + share(InstallPhase::files) >= 0.5) return 4;
+  return 0;
+}
+
+std::string InstallClock::slow() const { return kSlowNames[slow_.load(std::memory_order_relaxed)]; }
 
 std::string InstallClock::summary(const std::string& name, const std::string& outcome) {
   charge(Clock::now());

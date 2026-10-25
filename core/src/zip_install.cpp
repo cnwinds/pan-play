@@ -761,6 +761,7 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
   // 解压一层到暂存区。进度按要解压的压缩包字节算，所以开始解压时才把这层的大小加进总数。
   const auto extract = [&](Source& source) -> std::string {
     PhaseScope decoding(InstallPhase::decode);
+    InstallClock::note_dictionary(0);
     source.extracted = true;
     source.start = result.bytes_total;
     for (const auto& part : source.set->parts) result.bytes_total += part.size;
@@ -979,7 +980,16 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request) {
   InstallClock clock;
   const auto timed = timed_sink(sink);
-  const InstallResult result = install_layers(drive, *timed, request);
+  InstallRequest paced = request;
+  if (request.on_progress) {
+    paced.on_progress = [&](const InstallResult& snapshot) {
+      InstallResult with_pace = snapshot;
+      with_pace.dictionary = clock.dictionary();
+      with_pace.slow = clock.slow();
+      request.on_progress(with_pace);
+    };
+  }
+  const InstallResult result = install_layers(drive, *timed, paced);
   const std::string summary = clock.summary(base_name(request.source_dir), result.status == "installed"     ? "已装好"
                                                                          : result.status == "interrupted" ? "中断"
                                                                                                           : "出错");

@@ -1,5 +1,6 @@
 #include "panplay/install.hpp"
 
+#include "install_clock.hpp"
 #include "install_common.hpp"
 #include "panplay/library.hpp"
 #include "panplay/prefetch.hpp"
@@ -574,6 +575,7 @@ std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vecto
     const std::uint64_t dictionary = static_cast<std::uint64_t>(header.DictSize) << 10;
     if (dictionary > largest_dictionary) {
       largest_dictionary = dictionary;
+      InstallClock::note_dictionary(dictionary);
       PANPLAY_DEBUG("RAR 字典 " + std::to_string(dictionary >> 20) + " MB" + (solid ? "（固实）" : "") + "，解压需要这么多内存");
     }
     if (options.max_dictionary > 0 && dictionary > options.max_dictionary) {

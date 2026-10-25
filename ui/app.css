@@ -848,6 +848,12 @@ body.drawer-open { overflow: hidden; }
   white-space: nowrap;
 }
 
+.progress-note {
+  margin: 0;
+  color: var(--faint);
+  font-size: 0.8rem;
+}
+
 .action-row {
   display: flex;
   gap: 0.6rem;
@@ -2099,6 +2105,8 @@ body.drawer-open { overflow: hidden; }
   color: var(--faint);
   font-size: 0.82rem;
 }
+
+.scale-note.warn { color: var(--amber); }
 
 .log-file {
   display: flex;

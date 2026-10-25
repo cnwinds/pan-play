@@ -2,6 +2,7 @@
 
 #include "panplay/sink.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -33,6 +34,13 @@ class InstallClock {
   static void note_read(std::size_t bytes);
   // 一次写调用用了多久，记下每 10 秒里最长的一次：系统回写跟不上时个别写调用会卡很久。
   static void note_write_time(double ms);
+  // 正在解压的这层压缩包要多大的字典（字节），ZIP 这类不用大字典的记 0。
+  static void note_dictionary(std::uint64_t bytes);
+
+  // 给界面看，可以从别的线程调用。slow 是最近 10 秒安装主要卡在哪：download 等下载、decode 解压、
+  // memory 解压在等内存换页（字典比系统给的内存大）、write 写盘，分不出或还没满 10 秒时为空。
+  std::string slow() const;
+  std::uint64_t dictionary() const { return dictionary_.load(std::memory_order_relaxed); }
 
  private:
   friend class PhaseScope;
@@ -59,6 +67,7 @@ class InstallClock {
   InstallPhase switch_to(InstallPhase phase);
   void charge(Clock::time_point now);
   std::string window_details(Clock::time_point now) const;
+  int window_slow(Clock::time_point now) const;
 
   InstallClock* outer_;
   InstallPhase current_ = InstallPhase::other;
@@ -71,6 +80,8 @@ class InstallClock {
   double cpu_at_start_;
   double thread_cpu_at_start_;
   long long faults_at_start_;
+  std::atomic<std::uint64_t> dictionary_{0};
+  std::atomic<int> slow_{0};
 };
 
 // 在这个作用域里的时间记到 phase 上，离开时换回原来那项。

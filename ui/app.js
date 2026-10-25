@@ -511,6 +511,23 @@ function taskPace(task) {
   return { speed: formatBytes(task.speed) + "/s", left: task.eta >= 0 ? task.eta : null };
 }
 
+// 最近 10 秒安装主要卡在哪，由安装线程按各项占用的时间判断。
+const slowText = {
+  download: "主要在等下载",
+  decode: "主要在解压",
+  memory: "主要在解压：内存放不下整个字典，在等换页",
+  write: "主要在写盘",
+};
+
+// 详情页进度条下面一行小字：这层压缩包的字典多大、慢在哪。
+function paceNote(task) {
+  if (!task || task.message !== "正在安装") return "";
+  const parts = [];
+  if (task.dictionary > 0) parts.push(`字典 ${dictionaryText(Math.max(1, Math.round(task.dictionary / 1048576)))}`);
+  if (slowText[task.slow]) parts.push(slowText[task.slow]);
+  return parts.join(" · ");
+}
+
 // inDetail：详情页上方已经有百分比和预计几点装完，这一行只写进度和速度；底部进度栏没有，写剩余时间。
 // 文字要短：PS5 自带浏览器里这行太长会把整个抽屉撑宽，每秒变一次就跟着晃。
 function jobText(current, inDetail = false) {
@@ -1156,7 +1173,8 @@ function openDetail(game, opener) {
   progressRow.append(progressText, cancel);
   const meter = el("span", "meter");
   meter.append(el("span"));
-  progress.append(progressTop, meter, progressRow);
+  const progressNote = el("p", "progress-note");
+  progress.append(progressTop, meter, progressRow, progressNote);
   const resume = el("div", "progress resume");
   const resumeMeter = el("span", "meter");
   resumeMeter.append(el("span"));
@@ -1578,6 +1596,8 @@ function openDetail(game, opener) {
       progressPct.textContent = Math.round(taskFraction(task) * 100) + "%";
       progressEta.textContent = pace && pace.left !== null ? `预计 ${finishClock(pace.left)} 装完` : "";
       progressEta.title = pace ? `从开始解压算的平均速度 ${pace.speed}` : "";
+      progressNote.textContent = paceNote(task);
+      progressNote.hidden = !progressNote.textContent;
     }
     queueRow.hidden = !queued;
     if (queued) {
@@ -2180,6 +2200,13 @@ function paintDictionaryNote() {
     ? `字典超过 ${dictionaryText(mb)} 的 RAR / 7z 不装。WinRAR 默认字典 32 MB，7-Zip 最高压缩 64 MB，大多数游戏包都在这以内。`
     : "再大的字典也照装。主机给不了那么多内存时会停下报「内存不够」，不自动重试。";
   $("#dict-note").textContent = `${text}带圆点的 ${dictionaryText(defaultDictionary)} 是这台设备的默认值。`;
+  // 主机上大字典放不进盘游能用的内存，多出来的部分被系统换到硬盘，解压时反复读回来。
+  const slower = runsOnConsole && defaultDictionary > 0 && (!mb || mb > defaultDictionary);
+  const warn = $("#dict-warn");
+  warn.hidden = !slower;
+  warn.textContent = slower
+    ? `字典超过 ${dictionaryText(defaultDictionary)} 的压缩包也能装，代价是装得更慢：主机只给盘游约 1.5 GB 内存，放不下的那部分字典要和硬盘来回交换，解压可能掉到 10 MB/s 左右。这样不挤占游戏的内存，玩游戏不受影响。`
+    : "";
 }
 
 function renderDictionary(value, fallback) {

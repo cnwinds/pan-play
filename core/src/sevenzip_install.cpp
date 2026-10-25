@@ -2,6 +2,7 @@
 #include "panplay/trace.hpp"
 
 #include "big_memory.hpp"
+#include "install_clock.hpp"
 #include "install_common.hpp"
 
 #include "7z.h"
@@ -616,6 +617,9 @@ std::string read_7z_archive(DrivePlugin& drive, const std::vector<DriveEntry>& p
 std::string extract_7z_entries(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
                                const SevenZipArchive& archive, const SevenZipExtract& options,
                                std::vector<FinishedFile>* done) {
+  std::uint64_t largest = 0;
+  for (const auto& folder : archive.folders) largest = std::max(largest, needed_dictionary(folder));
+  InstallClock::note_dictionary(largest);
   std::int64_t local_written = 0;
   std::int64_t* written = options.written != nullptr ? options.written : &local_written;
   const std::int64_t stop = options.stop_after_output_bytes;
