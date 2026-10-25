@@ -537,7 +537,11 @@ function jobText(current, inDetail = false) {
     return current.message || "正在读取压缩包…";
   }
   if (current.status === "installed" && current.speed > 0 && current.elapsed > 0) {
-    return `${current.message || "安装完成"} · 用时 ${formatDuration(current.elapsed)} · 平均 ${formatBytes(current.speed)}/s`;
+    const message = current.message || "";
+    const parts = [message.startsWith("已更新") ? "已更新" : "已安装", `用时 ${formatDuration(current.elapsed)}`,
+      `${formatBytes(current.speed)}/s`];
+    const skipped = message.match(/（游戏目录外的 \d+ 个文件没有装）/);
+    return parts.join(" · ") + (skipped ? skipped[0] : "");
   }
   if (current.message) return current.message;
   if (current.status === "installed" || current.status === "already") return "安装完成";
