@@ -2308,9 +2308,10 @@ int run_install_pipeline_self_test() {
     }
     if (journal_text.find("\"next\":") == std::string::npos) return fail("进度日志里没有记续装点");
     // 模拟续装点之前已经走过的目录：一个包里有、续装途中还会再遇到，一个只在日志里。
-    const std::string first_file = "d1/f0.bin\"";
-    const auto first_at = journal_text.find(first_file);
-    const auto name_at = journal_text.rfind("\"name\":\"", first_at);
+    // Linux 上 rar 按目录遍历顺序打包，先装好的不一定是 d1/f0.bin。
+    std::size_t first_at = std::string::npos;
+    for (int i = 0; i < 6 && first_at == std::string::npos; ++i) first_at = journal_text.find(many_name(i) + "\"");
+    const auto name_at = first_at == std::string::npos ? std::string::npos : journal_text.rfind("\"name\":\"", first_at);
     if (first_at == std::string::npos || name_at == std::string::npos) return fail("进度日志里没有第一个文件");
     const std::string prefix = journal_text.substr(name_at + 8, first_at - name_at - 8);
     journal_text = "{\"dir\":\"" + prefix + "a_empty\"}\n{\"dir\":\"" + prefix + "zz_journal_only\"}\n" + journal_text;
