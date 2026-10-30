@@ -340,6 +340,15 @@ bool looks_like_image(const std::string& body) {
   return jpeg || png || webp || avif;
 }
 
+// PS5 浏览器认不出 AVIF 和 WebP。
+bool ps5_unreadable_file(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  char head[12] = {};
+  if (!in.read(head, sizeof(head))) return false;
+  const std::string bytes(head, sizeof(head));
+  return (bytes.compare(0, 4, "RIFF") == 0 && bytes.compare(8, 4, "WEBP") == 0) || bytes.compare(4, 4, "ftyp") == 0;
+}
+
 HttpRequest store_request(const std::string& url) {
   HttpRequest request;
   request.url = url;
@@ -597,7 +606,9 @@ void StoreMetaCache::process(std::int64_t concept_id) {
   bool cover_offline = false;
   if (meta.found && !meta.cover_url.empty() && ((full && !upgrade) || !std::filesystem::exists(cover_path))) {
     throttle();
-    const std::string url = meta.cover_url + (meta.cover_url.find('?') == std::string::npos ? "?w=440" : "&w=440");
+    // 图床按源图回 AVIF 或 WebP，与后缀和请求头无关，只有 fmt=jpg 能让它转成 JPEG。
+    const std::string url =
+        meta.cover_url + (meta.cover_url.find('?') == std::string::npos ? "?w=440&fmt=jpg" : "&w=440&fmt=jpg");
     const HttpResponse image = fetch_(store_request(url));
     if (image.error.empty() && image.status == 200 && looks_like_image(image.body)) {
       std::filesystem::path tmp = cover_path;
@@ -664,6 +675,11 @@ void StoreMetaCache::load() {
     meta.edition = node.str("edition");
     meta.meta_ver = static_cast<int>(node.num("meta_ver"));
     meta.fetched_at = static_cast<std::int64_t>(node.num("fetched_at"));
+    // 早先存下的 AVIF、WebP 封面删掉，查询时会按缺封面补下 JPEG。
+    std::error_code ec;
+    if (meta.found && !meta.cover_url.empty() && ps5_unreadable_file(cover_file(meta.concept_id))) {
+      std::filesystem::remove(cover_file(meta.concept_id), ec);
+    }
     meta.has_cover = meta.found && std::filesystem::exists(cover_file(meta.concept_id));
     if (drop_coverless && meta.found && !meta.has_cover) meta.fetched_at = 0;
     entries_[meta.concept_id] = meta;

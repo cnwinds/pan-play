@@ -536,7 +536,8 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
   if (search_text != nullptr) *search_text = display_name + "\n" + (match.found ? match.entry.name : "");
 
   std::string cover_url;
-  if (meta.has_cover) cover_url = "/api/cover/" + std::to_string(concept_id) + "?v=" + std::to_string(meta.fetched_at);
+  // 封面从 AVIF、WebP 换成 JPEG 时抓取时间不变，加上 jpg 让浏览器别用缓存的旧图。
+  if (meta.has_cover) cover_url = "/api/cover/" + std::to_string(concept_id) + "?v=" + std::to_string(meta.fetched_at) + "jpg";
   else if (match.found) cover_url = match.entry.cover_url;
 
   std::string json = ",\"display_name\":\"" + panplay::json_escape(display_name) + "\",\"name_source\":\"" + name_source +

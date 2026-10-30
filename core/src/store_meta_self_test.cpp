@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <vector>
 
@@ -95,7 +96,7 @@ int check_cache() {
   std::map<std::string, HttpResponse> routes;
   routes["https://store.playstation.com/zh-hans-hk/concept/1"] = {200, empty_page(), ""};
   routes["https://store.playstation.com/zh-hant-hk/concept/1"] = {200, sample_page(1, "測試遊戲"), ""};
-  routes["https://img.test/m.png?w=440"] = {200, std::string("\xFF\xD8\xFF\xE0jpeg", 8), ""};
+  routes["https://img.test/m.png?w=440&fmt=jpg"] = {200, std::string("\xFF\xD8\xFF\xE0jpeg", 8), ""};
   routes["https://store.playstation.com/zh-hans-hk/concept/2"] = {404, "", ""};
   routes["https://store.playstation.com/zh-hant-hk/concept/2"] = {200, empty_page(), ""};
   routes["https://store.playstation.com/en-us/concept/2"] = {200, empty_page(), ""};
@@ -103,7 +104,7 @@ int check_cache() {
   routes["https://store.playstation.com/zh-hans-hk/concept/4"] = {200, sample_page(4, "封面挂了", "https://img.test/down.png"), ""};
   routes["https://store.playstation.com/zh-hans-hk/concept/5"] = {200, sample_page(5, "处理中又刷新"), ""};
   routes["https://store.playstation.com/zh-hans-hk/concept/6"] = {200, sample_page(6, "AVIF封面", "https://img.test/a.png"), ""};
-  routes["https://img.test/a.png?w=440"] = {200, std::string("\0\0\0\x1C" "ftypavif\0\0\0\0", 16), ""};
+  routes["https://img.test/a.png?w=440&fmt=jpg"] = {200, std::string("\0\0\0\x1C" "ftypavif\0\0\0\0", 16), ""};
   int requests = 0;
   StoreMetaCache* active = nullptr;
   bool refreshed_mid_flight = false;
@@ -257,13 +258,68 @@ int check_upgrade() {
   return result;
 }
 
+// 早先缓存的 AVIF、WebP 封面 PS5 显示不了，重开后只重下封面，换成 JPEG。
+int check_legacy_cover() {
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / ("panplay-store-meta-cover-" + std::to_string(std::rand()));
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir / "covers");
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch()).count();
+  const auto entry = [&](const char* image) {
+    return std::string("{\"found\":true,\"locale\":\"zh-hans-hk\",\"name\":\"旧封面\",\"cover_url\":\"") + image +
+           "\",\"meta_ver\":" + std::to_string(kStoreMetaVersion) + ",\"fetched_at\":" + std::to_string(now) + "}";
+  };
+  {
+    std::ofstream out(dir / "store-meta.json", std::ios::binary);
+    out << "{\"version\":3,\"concepts\":{\"9\":" << entry("https://img.test/avif.jpg") << ",\"10\":"
+        << entry("https://img.test/webp.png") << ",\"11\":" << entry("https://img.test/ok.jpg") << "}}";
+    std::ofstream(dir / "covers" / "9.img", std::ios::binary) << std::string("\0\0\0\x1C" "ftypavif\0\0\0\0", 16);
+    std::ofstream(dir / "covers" / "10.img", std::ios::binary) << std::string("RIFF\0\0\0\0WEBPVP8 ", 16);
+    std::ofstream(dir / "covers" / "11.img", std::ios::binary) << std::string("\xFF\xD8\xFF\xE0jpeg", 8);
+  }
+
+  const std::string jpeg("\xFF\xD8\xFF\xE0new", 7);
+  std::vector<std::string> requested;
+  const HttpFetch fake = [&](const HttpRequest& request) {
+    requested.push_back(request.url);
+    if (request.url.find("img.test/avif.jpg?w=440&fmt=jpg") != std::string::npos ||
+        request.url.find("img.test/webp.png?w=440&fmt=jpg") != std::string::npos) {
+      return HttpResponse{200, jpeg, ""};
+    }
+    return HttpResponse{0, "", "unexpected " + request.url};
+  };
+
+  int result = 0;
+  {
+    StoreMetaCache cache(dir, fake, 0);
+    StoreMeta meta;
+    if (cache.lookup(9, &meta) != StoreMetaState::ready || meta.name != "旧封面") result = fail("换封面期间应照常显示资料");
+    cache.lookup(10, nullptr);
+    cache.lookup(11, nullptr);
+    while (cache.run_once()) {
+    }
+    if (!result && requested.size() != 2) result = fail("应只重下两张旧格式封面，实际请求 " + std::to_string(requested.size()));
+    for (const char* id : {"9", "10"}) {
+      std::ifstream in(dir / "covers" / (std::string(id) + ".img"), std::ios::binary);
+      const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      if (!result && bytes != jpeg) result = fail(std::string("封面 ") + id + " 没有换成 JPEG");
+    }
+    if (!result && (cache.lookup(9, &meta) != StoreMetaState::ready || !meta.has_cover)) result = fail("换完应有封面");
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  return result;
+}
+
 }  // namespace
 
 int run_store_meta_self_test() {
   if (const int code = check_names()) return code;
   if (const int code = check_parse()) return code;
   if (const int code = check_cache()) return code;
-  return check_upgrade();
+  if (const int code = check_upgrade()) return code;
+  return check_legacy_cover();
 }
 
 }  // namespace panplay
