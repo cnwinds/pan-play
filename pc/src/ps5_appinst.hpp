@@ -26,8 +26,9 @@ extern const char* const kOtherAppRunning;
 
 // 在主机上启动应用（同 websrv）：取前台用户，有别的全屏应用在运行时 close_running 为 false 就不动它、
 // 把它的 Title ID 写进 *running_title 并返回 kOtherAppRunning，为 true 时先关掉它、等它退出再启动。
+// 盘游自己的页面（全屏应用或盖在上面的小应用）直接关掉；from_console 表示是在主机浏览器里点的，这时开着的小应用就是那个浏览器，也关掉。
 // 和 load_app_inst_util 一样不能在 with_privileged_auth 里调用。返回错误，成功为空。
-std::string launch_app(const std::string& title_id, bool close_running, std::string* running_title);
+std::string launch_app(const std::string& title_id, bool close_running, bool from_console, std::string* running_title);
 
 // 把进程身份临时换成能注册应用、挂载目录的特权身份，执行完换回。同一时间只有一个在执行。
 std::string with_privileged_auth(const std::function<std::string()>& action);

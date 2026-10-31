@@ -1881,8 +1881,6 @@ function openDetail(game, opener) {
       game.console = (await api("/api/console/launch", { path: game.path, close_running: closeRunning })).console;
       launching = false;
       watchLaunch();
-      // 在主机自己的浏览器里点的：通常盘游启动前已经把这个页面关了；没关掉时自己关，免得挡在游戏前面。
-      if (["127.0.0.1", "localhost"].includes(window.location.hostname)) window.setTimeout(() => window.close(), 1500);
     } catch (error) {
       launching = false;
       if (!detail || detail.game !== game) return;

@@ -2484,7 +2484,7 @@ void handle_client(SOCKET client, bool local_peer) {
                                        std::chrono::system_clock::now().time_since_epoch())
                                        .count();
           panplay::game_launches().requested(title.title_id, now);
-          error = launch_app(title.title_id, close_running, &running_title);
+          error = launch_app(title.title_id, close_running, local_request(local_peer, header), &running_title);
           if (!error.empty()) panplay::game_launches().request_failed(title.title_id, error);
         }
       }
