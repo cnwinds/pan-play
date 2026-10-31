@@ -3,6 +3,7 @@
 #include "ps5_appinst.hpp"
 
 #include "panplay/trace.hpp"
+#include "ps5_dashboard.hpp"
 
 #include <dlfcn.h>
 #include <ps5/kernel.h>
@@ -45,6 +46,7 @@ struct SystemService {
   int (*app_id)() = nullptr;
   int (*title_id)(int, char*) = nullptr;
   int (*kill)(int, int, int, int) = nullptr;
+  int (*lnc_kill)(std::uint32_t) = nullptr;
   int (*launch)(const char*, char**, LaunchParam*) = nullptr;
   int (*foreground_user)(std::int32_t*) = nullptr;
 };
@@ -61,10 +63,25 @@ void resolve_system_service() {
     running.kill = reinterpret_cast<int (*)(int, int, int, int)>(dlsym(lib, "sceSystemServiceKillApp"));
     running.launch =
         reinterpret_cast<int (*)(const char*, char**, LaunchParam*)>(dlsym(lib, "sceSystemServiceLaunchApp"));
+    // 同一个库里的 LncUtil 版本（ps5-unified-autoloader 用的），上面的找不到时用。
+    if (running.app_id == nullptr) {
+      running.app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceLncUtilGetAppIdOfRunningBigApp"));
+    }
+    if (running.title_id == nullptr) {
+      running.title_id = reinterpret_cast<int (*)(int, char*)>(dlsym(lib, "sceLncUtilGetAppTitleId"));
+    }
+    running.lnc_kill = reinterpret_cast<int (*)(std::uint32_t)>(dlsym(lib, "sceLncUtilKillApp"));
   }
   if (void* lib = dlopen("libSceUserService.sprx", RTLD_LAZY); lib != nullptr) {
     running.foreground_user = reinterpret_cast<int (*)(std::int32_t*)>(dlsym(lib, "sceUserServiceGetForegroundUser"));
   }
+  const auto found = [](const void* function) { return function != nullptr ? "有" : "无"; };
+  panplay::log_info(std::string("系统服务：查运行中的应用 ") + found(reinterpret_cast<const void*>(running.app_id)) +
+                    "、查 Title ID " + found(reinterpret_cast<const void*>(running.title_id)) + "、关应用 " +
+                    found(reinterpret_cast<const void*>(running.kill)) + "/" +
+                    found(reinterpret_cast<const void*>(running.lnc_kill)) + "、启动 " +
+                    found(reinterpret_cast<const void*>(running.launch)) + "、前台用户 " +
+                    found(reinterpret_cast<const void*>(running.foreground_user)));
   if (running.app_id == nullptr || running.title_id == nullptr) {
     panplay::log_warn("这个固件上查不了正在运行的游戏，删除前不检查游戏开没开着");
   }
@@ -170,16 +187,21 @@ std::string launch_app(const std::string& title_id, bool close_running, std::str
     resolve_system_service();
     if (running.launch == nullptr || running.foreground_user == nullptr) return "这个固件上找不到启动游戏的接口";
     const std::string current = running_title_locked(&app);
+    panplay::log_info("启动 " + title_id + " 前正在运行的全屏应用：" +
+                      (app <= 0 ? std::string("没有") : (current.empty() ? "查不到 Title ID" : current) + "（" + hex_code(app) + "）"));
     if (app > 0) {
       if (current == title_id) return "这个游戏已经在主机上运行了";
-      if (!close_running) {
+      // 主机浏览器里开着的盘游页面不用问，关掉它游戏才会到前台（同 websrv）。
+      if (!close_running && current != kDashboardTitleId) {
         *running_title = current;
         return kOtherAppRunning;
       }
-      if (running.kill == nullptr) return "这个固件上关不了正在运行的游戏，先在主机上关掉它";
-      const int code = running.kill(app, -1, 0, 0);
-      panplay::log_info("关掉正在运行的 " + current + " 返回 " + hex_code(code));
-      if (code != 0) return "关掉正在运行的游戏失败，系统返回 " + hex_code(code);
+      int code = 0;
+      if (running.kill != nullptr) code = running.kill(app, -1, 0, 0);
+      else if (running.lnc_kill != nullptr) code = running.lnc_kill(static_cast<std::uint32_t>(app));
+      else return "这个固件上关不了正在运行的应用，先在主机上关掉它";
+      panplay::log_info("关掉正在运行的 " + (current.empty() ? hex_code(app) : current) + " 返回 " + hex_code(code));
+      if (code != 0) return "关掉正在运行的应用失败，系统返回 " + hex_code(code);
     }
   }
   if (app > 0) {

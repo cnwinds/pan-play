@@ -21,6 +21,7 @@
 
 #if defined(PANPLAY_PS5)
 #include "ps5_appinst.hpp"
+#include "ps5_dashboard.hpp"
 #include "ps5_notify.hpp"
 #include "ps5_titles.hpp"
 #endif
@@ -2473,7 +2474,7 @@ void handle_client(SOCKET client, bool local_peer) {
         if (error.empty() && !close_running) {
           // 先问清楚：用户在确认框里取消时不该留下一条「正在启动」。
           const std::string current = running_app_title_id();
-          if (!current.empty() && current != title.title_id) {
+          if (!current.empty() && current != title.title_id && current != kDashboardTitleId) {
             error = kOtherAppRunning;
             running_title = current;
           }
