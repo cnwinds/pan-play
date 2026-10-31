@@ -1632,6 +1632,7 @@ body.drawer-open { overflow: hidden; }
 }
 
 .queue-item:hover { background: rgba(255, 255, 255, 0.04); }
+.queue-item[data-state="running"] { background: rgba(255, 255, 255, 0.05); }
 
 .queue-open {
   display: flex;
@@ -1670,6 +1671,7 @@ body.drawer-open { overflow: hidden; }
   overflow: hidden;
   color: var(--muted);
   font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1726,6 +1728,24 @@ body.drawer-open { overflow: hidden; }
 }
 
 .dock-meter { grid-column: 1 / -1; grid-row: 2; height: 4px; }
+
+/* 展开后底栏只剩队列汇总和两个按钮，正在装的游戏在列表里 */
+.dock-summary {
+  display: none;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.84rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dock.open .dock-bar { grid-template-rows: auto; row-gap: 0; padding: 0.55rem 0.85rem; }
+.dock.open .dock-open,
+.dock.open .dock-meter { display: none; }
+.dock.open .dock-summary { display: block; grid-column: 1; grid-row: 1; }
+.dock-summary[data-state="paused"] { color: var(--amber); }
+.dock-summary[data-state="error"] { color: var(--danger); }
+.dock-summary[data-state="installed"] { color: var(--mint); }
 #dock-action { grid-column: 3; grid-row: 1; }
 .dock[data-state="installed"] .dock-meter > span { background: var(--mint); }
 .dock[data-state="error"] .dock-meter > span { background: var(--danger); }

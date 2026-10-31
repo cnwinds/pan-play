@@ -31,6 +31,7 @@ const dockToggle = $("#dock-toggle");
 const dockPanel = $("#dock-panel");
 const dockClear = $("#dock-clear");
 const dockHeading = $("#dock-heading");
+const dockOverviewText = $("#dock-summary");
 const queueList = $("#queue-list");
 const form = $("#settings-form");
 const settingsNote = $("#settings-note");
@@ -800,6 +801,25 @@ function dockSummary() {
   return { head: done[0], state: failed ? "error" : "installed", text, p: 1 };
 }
 
+// 展开时底栏不再重复列表里的游戏，只说整个队列的情况。
+function dockOverview() {
+  const running = runningTask();
+  const queued = queuedTasks();
+  const done = tasks.filter((task) => task.state === "done");
+  const failed = done.filter((task) => settledState(task) !== "installed").length;
+  if (!running && queued.length && queuePaused) {
+    if (queuePauseReason) return { text: queuePauseReason, state: "error" };
+    return { text: `已全部暂停 · ${queued.length} 个等待继续`, state: "paused" };
+  }
+  const parts = [];
+  if (running) parts.push("正在装 1 个");
+  if (queued.length) parts.push(`排队 ${queued.length} 个`);
+  if (done.length - failed) parts.push(`装好 ${done.length - failed} 个`);
+  if (failed) parts.push(`${failed} 个没装完`);
+  const state = running || queued.length ? "" : failed ? "error" : "installed";
+  return { text: parts.join(" · "), state };
+}
+
 function paintDock() {
   dock.hidden = tasks.length === 0;
   if (dock.hidden) {
@@ -831,10 +851,16 @@ function paintDock() {
   dockAction.className = "btn small " + (resume ? "primary" : "quiet");
   dockAction.disabled = pausing;
   dockAction.title = pending && !resume && !pausing ? "正在装的停在能续装的地方，排队的都先不开始" : "";
-  dockHeading.textContent = queuePaused && pending ? (queuePauseReason ? "安装队列 · 空间不够，已全部暂停" : "安装队列 · 已暂停") : "安装队列";
+  dockHeading.textContent = tasks.length > 1 ? `安装队列 · ${tasks.length} 个` : "安装队列";
   dockToggle.setAttribute("aria-expanded", String(dockOpen));
   dockToggle.setAttribute("aria-label", dockOpen ? "收起安装队列" : "展开安装队列");
+  dock.classList.toggle("open", dockOpen);
   dockPanel.hidden = !dockOpen;
+  if (dockOpen) {
+    const overview = dockOverview();
+    dockOverviewText.textContent = overview.text;
+    dockOverviewText.dataset.state = overview.state;
+  }
   dockClear.hidden = !tasks.some((task) => task.state === "done");
   if (dockOpen) paintQueueList();
 }
