@@ -859,14 +859,35 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
   };
 
   // 已装过的层带不带 param 记在完成标记里，不用为了排顺序再解压一遍（RAR 要解压完才知道）。
-  // 第一轮只解压新的层。
-  for (auto& source : sources) {
-    const auto known = old_param.find(source.id);
+  // 第一轮只解压新的层，按猜得到的叠放顺序下载：主游戏（游戏目录里直接放的最大那组，都在子目录里时取最大的）、
+  // 子目录里的补丁按子目录名、游戏目录里其他的（多是 backport）。真正的叠放顺序等解压完知道带不带 param 再排。
+  const auto set_bytes = [](const Source& source) {
+    std::int64_t bytes = 0;
+    for (const auto& part : source.set->parts) bytes += part.size;
+    return bytes;
+  };
+  const Source* main_source = nullptr;
+  for (const auto& source : sources) {
+    const bool better = main_source == nullptr ||
+                        (source.folder.empty() != main_source->folder.empty() ? source.folder.empty()
+                                                                              : set_bytes(source) > set_bytes(*main_source));
+    if (better) main_source = &source;
+  }
+  std::vector<Source*> download_order;
+  for (auto& source : sources) download_order.push_back(&source);
+  std::stable_sort(download_order.begin(), download_order.end(), [&](const Source* left, const Source* right) {
+    const auto rank = [&](const Source* source) { return source == main_source ? 0 : source->folder.empty() ? 2 : 1; };
+    if (rank(left) != rank(right)) return rank(left) < rank(right);
+    if (const int order = natural_compare(left->folder, right->folder); order != 0) return order < 0;
+    return natural_compare(left->set->parts.front().name, right->set->parts.front().name) < 0;
+  });
+  for (Source* source : download_order) {
+    const auto known = old_param.find(source->id);
     if (!old_layers.empty() && known != old_param.end()) {
-      if (source.rar) source.has_param = known->second;
+      if (source->rar) source->has_param = known->second;
       continue;
     }
-    if (auto stop = extract_or_stop(source)) return *stop;
+    if (auto stop = extract_or_stop(*source)) return *stop;
   }
 
   // 叠放顺序（规则见 docs/game-folder-guide.md）：带 param 的（游戏本体、正式补丁）在前，不带的（固件补丁）在后；

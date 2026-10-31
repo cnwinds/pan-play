@@ -173,6 +173,12 @@ class FakeDrive final : public DrivePlugin {
   void forget_streams() {
     std::lock_guard<std::mutex> lock(streamed_mu_);
     streamed_from_.clear();
+    stream_order_.clear();
+  }
+  // 各文件第一次被顺序读的先后。
+  std::vector<std::string> stream_order() {
+    std::lock_guard<std::mutex> lock(streamed_mu_);
+    return stream_order_;
   }
 
   std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std::int64_t offset, std::string* error,
@@ -181,6 +187,7 @@ class FakeDrive final : public DrivePlugin {
     {
       std::lock_guard<std::mutex> lock(streamed_mu_);
       const auto it = streamed_from_.find(file_id);
+      if (it == streamed_from_.end()) stream_order_.push_back(file_id);
       if (it == streamed_from_.end() || offset < it->second) streamed_from_[file_id] = offset;
     }
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(latency_ms.load());
@@ -279,6 +286,7 @@ class FakeDrive final : public DrivePlugin {
 
   std::mutex streamed_mu_;
   std::map<std::string, std::int64_t> streamed_from_;
+  std::vector<std::string> stream_order_;
 
   static std::string trim(std::string path) {
     while (path.size() > 1 && path.back() == '/') path.pop_back();
@@ -1266,6 +1274,13 @@ int game_root_test() {
   auto shelf = library(true, false);
   InstallResult stacked = install_game(*shelf, counted, layered_request);
   if (stacked.status != "installed") return fail("主游戏加补丁没装上: " + stacked.message);
+  // 按叠放顺序下载：主游戏、子目录里的补丁、游戏目录里的 backport。
+  const std::vector<std::string> expected_order = {dir + "/game.zip", dir + "/补丁2 v1.05/patch.zip", dir + "/backport.zip"};
+  if (shelf->stream_order() != expected_order) {
+    std::string got;
+    for (const auto& path : shelf->stream_order()) got += " " + path;
+    return fail("下载顺序不对，应先主游戏、再补丁、最后 backport，实际:" + got);
+  }
   if (install_outdated(counted, "/data/homebrew", dir, scan_library(*shelf, "/apps/panplay", &scan_error).front().sets)) {
     return fail("刚装好就说有更新");
   }
