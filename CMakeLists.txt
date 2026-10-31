@@ -77,6 +77,25 @@ target_link_libraries(panplay PRIVATE panplay_lzma)
 target_compile_definitions(panplay PRIVATE RARDLL _FILE_OFFSET_BITS=64 _LARGEFILE_SOURCE)
 set_source_files_properties(${UNRAR_SOURCES} PROPERTIES CXX_STANDARD 11)
 
+# 版本号显示在设置页和启动通知里。CI 在 v 标签上编译时用标签名，其他时候用 git describe，都取不到时程序显示「开发版」。
+set(PANPLAY_VERSION "" CACHE STRING "程序版本号；为空时按标签或 git 推算")
+set(panplay_version "${PANPLAY_VERSION}")
+if(NOT panplay_version AND "$ENV{GITHUB_REF_TYPE}" STREQUAL "tag")
+  set(panplay_version "$ENV{GITHUB_REF_NAME}")
+endif()
+if(NOT panplay_version)
+  find_package(Git QUIET)
+  if(GIT_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                    OUTPUT_VARIABLE panplay_version OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  endif()
+endif()
+if(panplay_version)
+  message(STATUS "panplay 版本 ${panplay_version}")
+  set_source_files_properties(core/src/version.cpp PROPERTIES COMPILE_DEFINITIONS "PANPLAY_VERSION=\"${panplay_version}\"")
+endif()
+
 if(PS5)
   set_target_properties(panplay PROPERTIES OUTPUT_NAME panplay.elf)
   # UnRAR 默认按核数开最多 8 个解压线程，主机上会抢系统界面的 CPU；网盘下载才是瓶颈，2 个够用。

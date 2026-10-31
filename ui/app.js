@@ -2386,6 +2386,7 @@ function renderTarget(mode) {
 
 async function loadSettings() {
   const settings = await api("/api/settings");
+  $("#app-version").textContent = settings.version ? `版本 ${settings.version}` : "";
   driveDrafts = new Map(settings.drives.map((drive) => [drive.id, {
     library_path: drive.library_path,
     fields: drive.fields.map((field) => ({ ...field })),

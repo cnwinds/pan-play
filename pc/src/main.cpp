@@ -10,6 +10,7 @@
 #include "panplay/sink.hpp"
 #include "panplay/store_meta.hpp"
 #include "panplay/trace.hpp"
+#include "panplay/version.hpp"
 
 #include "server.hpp"
 #include "settings.hpp"
@@ -102,8 +103,8 @@ void start_service_log(bool capture_stdio, int argc) {
   panplay::open_log_file(panplay::app_data_dir() / "panplay.log", capture_stdio);
   panplay::set_log_level(panplay::log_level_from_env(panplay::LogLevel::info));
   panplay::install_crash_trace();
-  panplay::log_info("==== 盘游启动，参数 " + std::to_string(argc) + " 个，编译于 " + __DATE__ + " " + __TIME__ + "，" +
-                    panplay::memory_summary());
+  panplay::log_info(std::string("==== 盘游 ") + panplay::app_version() + " 启动，参数 " + std::to_string(argc) + " 个，编译于 " +
+                    __DATE__ + " " + __TIME__ + "，" + panplay::memory_summary());
   panplay::start_trace_heartbeat();
 }
 
@@ -390,8 +391,10 @@ int main(int argc, char** argv) {
     std::string running_code;
     PANPLAY_DEBUG("检查端口 " + std::to_string(options.port) + " 上是否已有盘游");
     if (running_instance(options.port, &running_url, &running_code)) {
-      panplay::log_info("已有盘游在运行 " + running_url + "，本次退出");
-      notify("盘游已经在运行 " + running_url + (running_code.empty() ? "" : " 口令 " + running_code));
+      panplay::log_info("已有盘游在运行 " + running_url + "，本次发送的 " + panplay::app_version() + " 退出");
+      // 发了新版却还是旧版在跑最容易让人糊涂：说清楚这次发的没启动、怎么换。
+      notify("盘游已经在运行 " + running_url + (running_code.empty() ? "" : " 口令 " + running_code) + "。这次发送的 " +
+             panplay::app_version() + " 没有启动，要换版本先在设置里点「退出盘游」再发送");
       // 走正常退出时，系统库在析构全局对象时抛 resource deadlock would occur 并中止进程，这里什么都不用清理。
       std::fflush(nullptr);
       std::_Exit(0);
@@ -401,7 +404,7 @@ int main(int argc, char** argv) {
     restore_console_mounts();
     start_game_watch();
     options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
-      notify("盘游已启动 " + url + (code.empty() ? "" : " 口令 " + code));
+      notify(std::string("盘游 ") + panplay::app_version() + " 已启动 " + url + (code.empty() ? "" : " 口令 " + code));
     };
     options.on_quit = [] { notify("盘游已退出"); };
     const int code = run_server(options);

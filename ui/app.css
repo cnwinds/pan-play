@@ -1793,6 +1793,13 @@ body.drawer-open { overflow: hidden; }
   padding: 0 1rem;
 }
 
+.app-version {
+  color: var(--faint);
+  font-size: 0.8rem;
+}
+
+.app-version:empty { display: none; }
+
 .settings-tab {
   position: relative;
   display: grid;

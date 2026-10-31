@@ -18,6 +18,7 @@
 #include "panplay/disk_test.hpp"
 #include "panplay/store_meta.hpp"
 #include "panplay/trace.hpp"
+#include "panplay/version.hpp"
 
 #if defined(PANPLAY_PS5)
 #include "ps5_appinst.hpp"
@@ -102,7 +103,8 @@ std::string settings_json(const AppSettings& settings) {
           "\",\"max_dictionary_mb\":" + std::to_string(settings.max_dictionary_mb) +
           ",\"default_dictionary_mb\":" + std::to_string(kDefaultMaxDictionaryMb) +
           ",\"verbose_log\":" + (settings.verbose_log ? "true" : "false") + ",\"log_path\":\"" +
-          json_escape((panplay::app_data_dir() / "panplay.log").u8string()) + "\"}";
+          json_escape((panplay::app_data_dir() / "panplay.log").u8string()) + "\",\"version\":\"" +
+          json_escape(panplay::app_version()) + "\"}";
   return json;
 }
 
