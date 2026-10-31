@@ -132,11 +132,7 @@ async function api(path, body) {
     response = await send();
     data = await response.json().catch(() => ({}));
   }
-  if (!response.ok) {
-    const error = new Error(data.error || "请求没有完成");
-    error.data = data;
-    throw error;
-  }
+  if (!response.ok) throw new Error(data.error || "请求没有完成");
   return data;
 }
 
@@ -983,12 +979,6 @@ function launchSummary(info) {
   const report = info.launch;
   const by = info.fakelib_by === "panplay" ? "盘游" : info.fakelib_by;
   if (!report) return info.fakelib ? { text: `带 backport 库（${info.fakelib}），游戏启动时由${by}叠到系统库上`, state: "info" } : null;
-  if (report.launch_error) return { text: `没能启动：${report.launch_error}`, state: "warn" };
-  if (!report.pid) {
-    return (info.now || Date.now()) - report.at < 20000
-      ? { text: "正在启动…", state: "info" }
-      : { text: "已经让主机启动，但没看到游戏进程起来，看看主机上有没有报错", state: "warn" };
-  }
   let lib = "";
   if (report.fakelib_error) lib = `backport 库没挂上：${report.fakelib_error}`;
   else if (report.fakelib && report.fakelib_by === "panplay") lib = `backport 库已挂上（用时 ${report.mount_ms} 毫秒）`;
@@ -998,8 +988,7 @@ function launchSummary(info) {
     if (ran < quickExitSeconds) return { text: `启动后 ${ran} 秒就退出了，多半是崩溃` + (lib ? `；${lib}` : ""), state: "warn" };
     return report.fakelib_error ? { text: lib, state: "warn" } : null;
   }
-  const running = report.requested ? "已启动" : "正在主机上运行";
-  return { text: running + (lib ? ` · ${lib}` : ""), state: report.fakelib_error ? "warn" : "info" };
+  return { text: "正在主机上运行" + (lib ? ` · ${lib}` : ""), state: report.fakelib_error ? "warn" : "info" };
 }
 
 function detailFacts(game) {
@@ -1326,7 +1315,6 @@ function openDetail(game, opener) {
   };
   const adjust = menuItem("调整要装的补丁");
   const registerItem = menuItem("注册到主机桌面");
-  const launchItem = menuItem("在主机上启动");
   const discard = menuItem("删除已装的部分", "danger");
   const remove = menuItem("删除游戏", "danger");
   const unshelve = menuItem("从网盘删除", "danger");
@@ -1337,7 +1325,7 @@ function openDetail(game, opener) {
   more.innerHTML = '<svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true" fill="currentColor"><circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13" cy="8" r="1.5"/></svg>';
   const menu = el("div", "more-menu");
   menu.setAttribute("role", "menu");
-  menu.append(launchItem, adjust, registerItem, discard, remove, unshelve);
+  menu.append(adjust, registerItem, discard, remove, unshelve);
   const moreWrap = el("div", "more-wrap");
   moreWrap.append(more, menu);
   let menuOpen = false;
@@ -1402,7 +1390,6 @@ function openDetail(game, opener) {
   consoleAction.type = "button";
   consoleRow.append(consoleText, consoleAction);
   let consoleBusy = false;
-  let launching = false;
 
   // 评价：自己装过的版本能不能玩。评过的显示一条横幅；装好还没评的问一句；有问题时写一句说明。
   // 元素只建一次，paint 只改显隐和文字，队列每秒刷新时正在写的说明不会被冲掉。
@@ -1671,12 +1658,10 @@ function openDetail(game, opener) {
     if (waitingLayers) label = "正在读取压缩包…";
     if (unshelved) label = game.on_drive === false ? "已删除" : "已从网盘删除";
     const onConsole = game.console && ["installed", "update"].includes(game.state) ? consoleSummary(game.console) : null;
-    const launchable = !unshelved && game.state === "installed" && Boolean(onConsole && onConsole.healthy);
-    if (launchable) label = launching ? "正在启动…" : "启动游戏";
+    if (game.state === "installed" && onConsole && onConsole.healthy) label = "已安装 · 已在主机桌面";
     action.textContent = label;
-    action.classList.toggle("done", game.state === "installed" && !launchable);
-    action.disabled = unshelved || waitingLayers || running || queued || refused ||
-      (game.state === "installed" ? !launchable || launching : ["unsupported", "empty", "other"].includes(game.state)) ||
+    action.classList.toggle("done", game.state === "installed");
+    action.disabled = unshelved || waitingLayers || running || queued || refused || ["installed", "unsupported", "empty", "other"].includes(game.state) ||
       (game.state !== "need-settings" && archivesRead && !game.formats);
     if (picking && (running || queued)) {
       picking = false;
@@ -1691,13 +1676,12 @@ function openDetail(game, opener) {
     adjust.hidden = game.state !== "installed" || busy || (game.layers || []).length < 2;
     registerItem.hidden = !onConsole || Boolean(game.console.problem) || busy || consoleBusy;
     registerItem.textContent = onConsole && onConsole.healthy ? "重新注册到主机桌面" : "注册到主机桌面";
-    launchItem.hidden = game.state !== "update" || !onConsole || !onConsole.healthy || busy || launching || unshelved;
     const installedNow = ["installed", "update"].includes(game.state);
     reviewItem.hidden = !game.fingerprint || busy || (!game.review && !installedNow);
     reviewItem.textContent = game.review ? "修改评价" : "评价这个版本";
     unshelve.hidden = !game.path || busy || game.state === "continue" || game.on_drive === false;
     paintReview(installedNow, busy || unshelved);
-    moreWrap.hidden = unshelved || [launchItem, adjust, registerItem, reviewItem, discard, remove, unshelve].every((item) => item.hidden);
+    moreWrap.hidden = unshelved || [adjust, registerItem, reviewItem, discard, remove, unshelve].every((item) => item.hidden);
     if (moreWrap.hidden && menuOpen) setMenu(false);
     // 注册有问题时说注册的事，没问题时说 backport 库和最近一次启动的经过。
     let consoleNote = null;
@@ -1794,10 +1778,6 @@ function openDetail(game, opener) {
     startInstall(game);
   };
   action.addEventListener("click", () => {
-    if (game.state === "installed") {
-      launchGame(false);
-      return;
-    }
     if (game.state === "need-settings") {
       show("settings", "target");
       return;
@@ -1825,79 +1805,6 @@ function openDetail(game, opener) {
   };
   consoleAction.addEventListener("click", registerConsole);
   registerItem.addEventListener("click", registerConsole);
-
-  // 启动后隔一会儿问一次主机，看游戏进程起来没有、backport 库挂没挂上、是不是很快就退出了。
-  let launchPoll = 0;
-  const watchLaunch = () => {
-    window.clearTimeout(launchPoll);
-    let rounds = 0;
-    const tick = async () => {
-      if (!detail || detail.game !== game) return;
-      try {
-        game.console = (await api("/api/console/status", { path: game.path })).console;
-      } catch (error) {
-        return;
-      }
-      if (!detail || detail.game !== game) return;
-      paint();
-      const report = game.console && game.console.launch;
-      rounds += 1;
-      const settled = report && (report.exited_at || report.launch_error);
-      const ranLong = report && report.pid && (game.console.now - report.at) / 1000 > quickExitSeconds + 5;
-      if (!settled && !ranLong && rounds < 40) launchPoll = window.setTimeout(tick, 2000);
-    };
-    launchPoll = window.setTimeout(tick, 1500);
-  };
-  const askCloseRunning = (titleId) => {
-    const other = games.find((item) => titleId && item.title_id === titleId);
-    const name = other ? displayName(other) : titleId || "别的游戏";
-    status.hidden = true;
-    confirm.ask({
-      steps: [{
-        head: `关掉正在运行的「${name}」？`,
-        body: [el("p", "", "主机上同一时间只能运行一个游戏。关掉后再启动这个，没存的进度会丢。")],
-        button: "关掉并启动",
-      }],
-      busy: "正在启动…",
-      onConfirm: async () => {
-        await launchGame(true);
-        if (!detail || detail.game !== game) return;
-        confirm.close();
-        paint();
-      },
-      onCancel: () => {
-        paint();
-        action.focus();
-      },
-    });
-    paint();
-  };
-  const launchGame = async (closeRunning) => {
-    if (launching) return;
-    launching = true;
-    clearFailure();
-    paint();
-    try {
-      game.console = (await api("/api/console/launch", { path: game.path, close_running: closeRunning })).console;
-      launching = false;
-      watchLaunch();
-    } catch (error) {
-      launching = false;
-      if (!detail || detail.game !== game) return;
-      if (error.data && "running_title_id" in error.data && !closeRunning) {
-        askCloseRunning(error.data.running_title_id);
-        return;
-      }
-      detail.fail(error.message);
-      try {
-        game.console = (await api("/api/console/status", { path: game.path })).console;
-      } catch (statusError) {
-        // 刷新不了主机状态时照旧显示
-      }
-    }
-    if (detail && detail.game === game) paint();
-  };
-  launchItem.addEventListener("click", () => launchGame(false));
 
   // 立即向商店重新取中文名、封面和简介：服务端把这款插到最前面，这里每秒问一次，取完就刷新详情和封面。
   refreshMeta.addEventListener("click", async () => {

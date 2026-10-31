@@ -11,11 +11,9 @@
 
 #include "panplay_icon0.inc"
 
-const char* const kDashboardTitleId = "PANP00001";
-
 namespace {
 
-const char* const kTitleId = kDashboardTitleId;
+constexpr const char* kTitleId = "PANP00001";
 
 std::string param_json(int port) {
   return std::string("{\n") +

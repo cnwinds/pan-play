@@ -54,33 +54,16 @@ std::string sandbox_lib_dir(const fs::path& sandbox_root, const std::string& tit
   return "";
 }
 
-void LaunchTracker::requested(const std::string& title_id, std::int64_t now_ms) {
-  std::lock_guard<std::mutex> lock(mu_);
-  LaunchReport report;
-  report.title_id = title_id;
-  report.at = now_ms;
-  report.requested = true;
-  reports_[title_id] = report;
-}
-
-void LaunchTracker::request_failed(const std::string& title_id, const std::string& error) {
-  std::lock_guard<std::mutex> lock(mu_);
-  const auto it = reports_.find(title_id);
-  if (it == reports_.end() || !it->second.requested || it->second.pid != 0) return;
-  it->second.launch_error = error;
-}
-
 void LaunchTracker::exec(const std::string& title_id, std::int64_t pid, std::int64_t now_ms) {
   std::lock_guard<std::mutex> lock(mu_);
   const auto it = reports_.find(title_id);
   if (it != reports_.end()) {
     LaunchReport& report = it->second;
     if (report.pid == pid && report.exited_at == 0) return;
-    const bool restart = report.pid != 0 && report.exited_at != 0 && now_ms - report.exited_at <= kRestartMs;
-    const bool awaited = report.requested && report.pid == 0 && report.launch_error.empty() && now_ms - report.at <= kRequestMs;
+    const bool restart = report.exited_at != 0 && now_ms - report.exited_at <= kRestartMs;
     // 换执行文件时新进程有可能比旧进程的退出先到。
-    const bool replacing = report.pid != 0 && report.exited_at == 0;
-    if (restart || awaited || replacing) {
+    const bool replacing = report.exited_at == 0;
+    if (restart || replacing) {
       report.pid = pid;
       report.exited_at = 0;
       // 新进程的沙盒要重新叠，结果由监视线程再报。
@@ -134,8 +117,7 @@ LaunchTracker& game_launches() {
 }
 
 std::string launch_report_json(const LaunchReport& report) {
-  return "{\"at\":" + std::to_string(report.at) + ",\"requested\":" + (report.requested ? "true" : "false") +
-         ",\"launch_error\":\"" + json_escape(report.launch_error) + "\",\"pid\":" + std::to_string(report.pid) +
+  return "{\"at\":" + std::to_string(report.at) + ",\"pid\":" + std::to_string(report.pid) +
          ",\"fakelib\":\"" + json_escape(report.fakelib) + "\",\"fakelib_by\":\"" + json_escape(report.fakelib_by) +
          "\",\"fakelib_error\":\"" + json_escape(report.fakelib_error) + "\",\"mount_ms\":" +
          std::to_string(report.mount_ms) + ",\"exited_at\":" + std::to_string(report.exited_at) + "}";

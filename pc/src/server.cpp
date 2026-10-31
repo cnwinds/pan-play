@@ -21,7 +21,6 @@
 
 #if defined(PANPLAY_PS5)
 #include "ps5_appinst.hpp"
-#include "ps5_dashboard.hpp"
 #include "ps5_notify.hpp"
 #include "ps5_titles.hpp"
 #endif
@@ -1123,14 +1122,10 @@ std::string console_json(const std::string& path, const std::string& game_dir) {
          ",\"mounted\":" + (title.mounted ? "true" : "false") + ",\"files_ok\":" + (title.files_ok ? "true" : "false") +
          ",\"problem\":\"" + json_escape(title.problem) + "\",\"error\":\"" + json_escape(error) + "\",\"fakelib\":\"" +
          json_escape(title.fakelib) + "\",\"fakelib_by\":\"" + json_escape(title.fakelib_by) + "\",\"launch\":" +
-         (launch ? panplay::launch_report_json(*launch) : "null") + ",\"now\":" +
-         std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count()) +
-         "}";
+         (launch ? panplay::launch_report_json(*launch) : "null") + "}";
 }
 
-// 重新注册、启动和删除共用一张占用表：删到一半时不能又挂上、注册回去；查队列和占用在同一把锁里，中间插不进安装。
+// 重新注册和删除共用一张占用表：删到一半时不能又挂上、注册回去；查队列和占用在同一把锁里，中间插不进安装。
 // 占上了返回空，调用方用完要 release_console_path；占不上返回原因，还在安装队列里时返回 queued_reason。
 std::string claim_console_path(const std::string& path, const std::string& queued_reason) {
   std::lock_guard<std::mutex> lock(installs.mu);
@@ -2420,80 +2415,6 @@ void handle_client(SOCKET client, bool local_peer) {
       error = register_console_title(game_dir);
     }
     remember_console_error(path, error);
-    if (!error.empty()) {
-      reply_json(client, 500, json_error(error));
-      return;
-    }
-    reply_json(client, 200, "{\"console\":" + console_json(path, game_dir) + "}");
-    return;
-  }
-  // 主机上的注册状态和最近一次启动的经过，启动后详情页隔一会儿问一次。
-  if (method == "POST" && target == "/api/console/status") {
-    std::string parse_error;
-    const panplay::Json json = panplay::Json::parse(body, &parse_error);
-    const std::string path = json.str("path");
-    const std::string game_dir = console_game_dir(load_settings(), path);
-    if (!parse_error.empty() || path.empty() || game_dir.empty()) {
-      reply_json(client, 400, json_error("只有装在主机本机文件夹里的游戏有主机状态"));
-      return;
-    }
-    reply_json(client, 200, "{\"console\":" + console_json(path, game_dir) + "}");
-    return;
-  }
-  // 在主机上启动游戏（ADR 0008）。注册不完整、挂载丢了、缺执行位时先重新注册修好；
-  // 别的游戏在运行、又没让关掉时返回 409 和它的 Title ID（running_title_id），页面问过用户后带 close_running 再来。
-  if (method == "POST" && target == "/api/console/launch") {
-    std::string parse_error;
-    const panplay::Json json = panplay::Json::parse(body, &parse_error);
-    const std::string path = json.str("path");
-    const std::string game_dir = console_game_dir(load_settings(), path);
-    if (!parse_error.empty() || path.empty() || game_dir.empty()) {
-      reply_json(client, 400, json_error("只有装在主机本机文件夹里的游戏能在这里启动"));
-      return;
-    }
-    if (const std::string busy = claim_console_path(path, "这个游戏还在安装队列里，装完再启动"); !busy.empty()) {
-      reply_json(client, 409, json_error(busy));
-      return;
-    }
-    std::string error;
-    std::string running_title;
-    {
-      const ConsolePathClaim claim{path};
-      const ConsoleTitle title = inspect_console_title(game_dir);
-      if (!title.problem.empty()) {
-        error = title.problem;
-      } else if (title.title_id.empty()) {
-        error = "读不到这个游戏的 Title ID";
-      } else {
-        if (!title.registered || !title.mounted || !title.files_ok) {
-          panplay::log_info("启动 " + title.title_id + " 前先重新注册修好");
-          error = register_console_title(game_dir);
-          remember_console_error(path, error);
-        }
-        const bool close_running = json.boolean_or("close_running", false);
-        if (error.empty() && !close_running) {
-          // 先问清楚：用户在确认框里取消时不该留下一条「正在启动」。
-          const std::string current = running_app_title_id();
-          if (!current.empty() && current != title.title_id && current != kDashboardTitleId) {
-            error = kOtherAppRunning;
-            running_title = current;
-          }
-        }
-        if (error.empty()) {
-          const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       std::chrono::system_clock::now().time_since_epoch())
-                                       .count();
-          panplay::game_launches().requested(title.title_id, now);
-          error = launch_app(title.title_id, close_running, local_request(local_peer, header), &running_title);
-          if (!error.empty()) panplay::game_launches().request_failed(title.title_id, error);
-        }
-      }
-    }
-    if (error == kOtherAppRunning) {
-      reply_json(client, 409, "{\"error\":\"" + panplay::json_escape(error) + "\",\"running_title_id\":\"" +
-                                  panplay::json_escape(running_title) + "\"}");
-      return;
-    }
     if (!error.empty()) {
       reply_json(client, 500, json_error(error));
       return;

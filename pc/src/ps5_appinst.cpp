@@ -3,7 +3,6 @@
 #include "ps5_appinst.hpp"
 
 #include "panplay/trace.hpp"
-#include "ps5_dashboard.hpp"
 
 #include <dlfcn.h>
 #include <ps5/kernel.h>
@@ -32,91 +31,13 @@ AppInstUtil util;
 std::atomic<bool> util_ready{false};
 std::mutex auth_mu;
 
-// sceSystemServiceLaunchApp 的参数，布局同 websrv。
-struct LaunchParam {
-  std::uint32_t size;
-  std::uint32_t user_id;
-  std::uint32_t app_opt;
-  std::uint64_t crash_report;
-  std::uint32_t check_flag;
-};
-
-struct SystemService {
+struct RunningApp {
   bool resolved = false;
   int (*app_id)() = nullptr;
-  int (*mini_app_id)() = nullptr;
   int (*title_id)(int, char*) = nullptr;
-  int (*kill)(int, int, int, int) = nullptr;
-  int (*lnc_kill)(std::uint32_t) = nullptr;
-  int (*launch)(const char*, char**, LaunchParam*) = nullptr;
-  int (*foreground_user)(std::int32_t*) = nullptr;
 };
 
-SystemService running;
-
-// 要拿着 auth_mu 调用。
-void resolve_system_service() {
-  if (running.resolved) return;
-  running.resolved = true;
-  if (void* lib = dlopen("libSceSystemService.sprx", RTLD_LAZY); lib != nullptr) {
-    running.app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceSystemServiceGetAppIdOfRunningBigApp"));
-    running.title_id = reinterpret_cast<int (*)(int, char*)>(dlsym(lib, "sceSystemServiceGetAppTitleId"));
-    running.kill = reinterpret_cast<int (*)(int, int, int, int)>(dlsym(lib, "sceSystemServiceKillApp"));
-    running.launch =
-        reinterpret_cast<int (*)(const char*, char**, LaunchParam*)>(dlsym(lib, "sceSystemServiceLaunchApp"));
-    // 同一个库里的 LncUtil 版本（ps5-unified-autoloader 用的），上面的找不到时用。
-    if (running.app_id == nullptr) {
-      running.app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceLncUtilGetAppIdOfRunningBigApp"));
-    }
-    if (running.title_id == nullptr) {
-      running.title_id = reinterpret_cast<int (*)(int, char*)>(dlsym(lib, "sceLncUtilGetAppTitleId"));
-    }
-    running.lnc_kill = reinterpret_cast<int (*)(std::uint32_t)>(dlsym(lib, "sceLncUtilKillApp"));
-    // 主机浏览器不是全屏应用，是盖在上面的小应用。
-    running.mini_app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceLncUtilGetAppIdOfMiniApp"));
-  }
-  if (void* lib = dlopen("libSceUserService.sprx", RTLD_LAZY); lib != nullptr) {
-    running.foreground_user = reinterpret_cast<int (*)(std::int32_t*)>(dlsym(lib, "sceUserServiceGetForegroundUser"));
-  }
-  const auto found = [](const void* function) { return function != nullptr ? "有" : "无"; };
-  panplay::log_info(std::string("系统服务：查运行中的应用 ") + found(reinterpret_cast<const void*>(running.app_id)) +
-                    "、查小应用 " + found(reinterpret_cast<const void*>(running.mini_app_id)) + "、查 Title ID " +
-                    found(reinterpret_cast<const void*>(running.title_id)) + "、关应用 " +
-                    found(reinterpret_cast<const void*>(running.kill)) + "/" +
-                    found(reinterpret_cast<const void*>(running.lnc_kill)) + "、启动 " +
-                    found(reinterpret_cast<const void*>(running.launch)) + "、前台用户 " +
-                    found(reinterpret_cast<const void*>(running.foreground_user)));
-  if (running.app_id == nullptr || running.title_id == nullptr) {
-    panplay::log_warn("这个固件上查不了正在运行的游戏，删除前不检查游戏开没开着");
-  }
-}
-
-// 要拿着 auth_mu 调用。查不到时为空。
-std::string app_title_locked(int app) {
-  if (running.title_id == nullptr) return "";
-  char title[32] = {};
-  if (running.title_id(app, title) != 0) return "";
-  return std::string(title, strnlen(title, sizeof(title)));
-}
-
-// 要拿着 auth_mu 调用。返回系统的结果码，接口都没有时返回 -1。
-int kill_app_locked(int app) {
-  if (running.kill != nullptr) return running.kill(app, -1, 0, 0);
-  if (running.lnc_kill != nullptr) return running.lnc_kill(static_cast<std::uint32_t>(app));
-  return -1;
-}
-
-// 要拿着 auth_mu 调用。没有游戏在运行时 app 为 0。
-std::string running_title_locked(int* app) {
-  *app = 0;
-  if (running.app_id == nullptr || running.title_id == nullptr) return "";
-  const int id = running.app_id();
-  if (id <= 0) return "";
-  *app = id;
-  char title[32] = {};
-  if (running.title_id(id, title) != 0) return "";
-  return std::string(title, strnlen(title, sizeof(title)));
-}
+RunningApp running;
 
 unsigned bcd(unsigned value) { return ((value >> 4) & 0xFu) * 10u + (value & 0xFu); }
 
@@ -190,89 +111,29 @@ std::string load_app_inst_util() {
 
 std::string running_app_title_id() {
   std::lock_guard<std::mutex> lock(auth_mu);
-  resolve_system_service();
-  int app = 0;
-  return running_title_locked(&app);
-}
-
-const char* const kOtherAppRunning = "主机上正在运行别的游戏";
-
-namespace {
-
-// 等 current() 不再是 app，最多等 limit。等到了返回 true。
-bool wait_closed(const std::function<int()>& current, int app, std::chrono::seconds limit) {
-  const auto deadline = std::chrono::steady_clock::now() + limit;
-  for (;;) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    int still = 0;
-    {
-      std::lock_guard<std::mutex> lock(auth_mu);
-      still = current();
-    }
-    if (still != app) return true;
-    if (std::chrono::steady_clock::now() >= deadline) return false;
-  }
-}
-
-}  // namespace
-
-std::string launch_app(const std::string& title_id, bool close_running, bool from_console, std::string* running_title) {
-  // 用户服务要先初始化，前台用户才取得到。
-  if (auto error = load_app_inst_util(); !error.empty()) return error;
-  int app = 0;
-  int mini = 0;
-  {
-    std::lock_guard<std::mutex> lock(auth_mu);
-    resolve_system_service();
-    if (running.launch == nullptr || running.foreground_user == nullptr) return "这个固件上找不到启动游戏的接口";
-    const std::string current = running_title_locked(&app);
-    panplay::log_info("启动 " + title_id + " 前正在运行的全屏应用：" +
-                      (app <= 0 ? std::string("没有") : (current.empty() ? "查不到 Title ID" : current) + "（" + hex_code(app) + "）"));
-    if (app > 0) {
-      if (current == title_id) return "这个游戏已经在主机上运行了";
-      // 盘游页面不用问，关掉它游戏才会到前台（同 websrv）。
-      if (!close_running && current != kDashboardTitleId) {
-        *running_title = current;
-        return kOtherAppRunning;
+  if (!running.resolved) {
+    running.resolved = true;
+    if (void* lib = dlopen("libSceSystemService.sprx", RTLD_LAZY); lib != nullptr) {
+      running.app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceSystemServiceGetAppIdOfRunningBigApp"));
+      running.title_id = reinterpret_cast<int (*)(int, char*)>(dlsym(lib, "sceSystemServiceGetAppTitleId"));
+      // 同一个库里的 LncUtil 版本（ps5-unified-autoloader 用的），上面的找不到时用。
+      if (running.app_id == nullptr) {
+        running.app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceLncUtilGetAppIdOfRunningBigApp"));
       }
-      const int code = kill_app_locked(app);
-      panplay::log_info("关掉正在运行的 " + (current.empty() ? hex_code(app) : current) + " 返回 " + hex_code(code));
-      if (code != 0) return "关掉正在运行的应用失败，系统返回 " + hex_code(code);
-    }
-    // 主机浏览器是盖在全屏应用上面的小应用：不关掉它，游戏起来了也在浏览器下面。
-    // 盘游页面关掉；在主机浏览器里点的启动，开着的小应用就是这个浏览器，也关掉。
-    if (running.mini_app_id != nullptr && (mini = running.mini_app_id()) > 0) {
-      const std::string mini_title = app_title_locked(mini);
-      const bool ours = mini_title == kDashboardTitleId || from_console;
-      panplay::log_info("启动 " + title_id + " 前开着的小应用：" + (mini_title.empty() ? "查不到 Title ID" : mini_title) +
-                        "（" + hex_code(mini) + "）" + (ours ? "，先关掉" : "，不是盘游页面，不动"));
-      if (ours) {
-        const int code = kill_app_locked(mini);
-        panplay::log_info("关掉小应用 " + hex_code(mini) + " 返回 " + hex_code(code));
-        if (code != 0) mini = 0;
-      } else {
-        mini = 0;
+      if (running.title_id == nullptr) {
+        running.title_id = reinterpret_cast<int (*)(int, char*)>(dlsym(lib, "sceLncUtilGetAppTitleId"));
       }
-    } else {
-      mini = 0;
+    }
+    if (running.app_id == nullptr || running.title_id == nullptr) {
+      panplay::log_warn("这个固件上查不了正在运行的游戏，删除前不检查游戏开没开着");
     }
   }
-  if (app > 0 && !wait_closed([] { int id = 0; running_title_locked(&id); return id; }, app, std::chrono::seconds(10))) {
-    return "正在运行的游戏 10 秒内没关掉，稍后再试";
-  }
-  if (mini > 0 && !wait_closed([] { return running.mini_app_id(); }, mini, std::chrono::seconds(5))) {
-    panplay::log_warn("小应用 " + hex_code(mini) + " 5 秒内没关掉，照样启动");
-  }
-  std::lock_guard<std::mutex> lock(auth_mu);
-  std::int32_t user = -1;
-  if (running.foreground_user(&user) != 0 || user <= 0) return "主机上还没有登录的用户，先在主机上选好用户";
-  LaunchParam param{};
-  param.user_id = static_cast<std::uint32_t>(user);
-  char* argv[] = {nullptr};
-  const int code = running.launch(title_id.c_str(), argv, &param);
-  panplay::log_info("启动 " + title_id + " 返回 " + hex_code(code));
-  if (code < 0) return "启动失败，系统返回 " + hex_code(code);
-  return "";
+  if (running.app_id == nullptr || running.title_id == nullptr) return "";
+  const int app = running.app_id();
+  if (app <= 0) return "";
+  char id[32] = {};
+  if (running.title_id(app, id) != 0) return "";
+  return std::string(id, strnlen(id, sizeof(id)));
 }
 
 std::string with_privileged_auth(const std::function<std::string()>& action) {

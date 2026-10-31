@@ -26,7 +26,7 @@
 
 注册过的游戏每次开机要由盘游先挂好才能启动，所以建议把盘游放进自动加载（比如 plk-autoloader 的 `autoload.txt`），桌面上的盘游图标不用重装。盘游会接管 ShadowMountPlus 注册过的游戏，两者不要同时运行：ShadowMountPlus 开着时，盘游不注册也不挂载，交给它处理。
 
-游戏的 backport 带了 `fakelib`（新固件的系统库）时，游戏启动时盘游会把它叠到游戏的系统库目录上，不用另外开 BackPork；BackPork 或 ShadowMountPlus 开着时交给它们。在 PS5 上打开盘游，已注册的游戏详情页里可以直接点「启动游戏」，有别的游戏在运行时会先问要不要关掉；详情页会显示最近一次启动的结果，比如 backport 库挂没挂上、游戏是不是启动后很快就退出了。
+游戏的 backport 带了 `fakelib`（新固件的系统库）时，游戏启动时盘游会把它叠到游戏的系统库目录上，不用另外开 BackPork；BackPork 或 ShadowMountPlus 开着时交给它们。游戏在主机桌面上启动，盘游的详情页会显示最近一次启动的结果，比如 backport 库挂没挂上、游戏是不是启动后很快就退出了。
 
 ### 跑在 Windows 电脑上
 

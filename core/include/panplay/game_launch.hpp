@@ -22,10 +22,8 @@ std::string sandbox_lib_dir(const std::filesystem::path& sandbox_root, const std
 // 一次启动的经过。时间都是 Unix 毫秒。
 struct LaunchReport {
   std::string title_id;
-  std::int64_t at = 0;            // 盘游发起启动、或者看到进程执行的时间
-  bool requested = false;         // 在盘游里点的启动
-  std::string launch_error;       // 启动接口的错误
-  std::int64_t pid = 0;           // 游戏进程，没起来时为 0
+  std::int64_t at = 0;            // 看到进程执行的时间
+  std::int64_t pid = 0;           // 游戏进程
   std::string fakelib;            // 叠上去的目录名（fakelib、fakelib2），没有 backport 库时为空
   std::string fakelib_by;         // 谁挂的：panplay、ShadowMountPlus、BackPork
   std::string fakelib_error;      // 盘游挂的时候出的错
@@ -38,11 +36,7 @@ class LaunchTracker {
  public:
   // 同一游戏退出后这么久之内又执行，算同一次启动（游戏自己换执行文件）。
   static constexpr std::int64_t kRestartMs = 5000;
-  // 盘游发起启动后这么久之内看到进程执行，算这次启动的。
-  static constexpr std::int64_t kRequestMs = 60000;
 
-  void requested(const std::string& title_id, std::int64_t now_ms);
-  void request_failed(const std::string& title_id, const std::string& error);
   void exec(const std::string& title_id, std::int64_t pid, std::int64_t now_ms);
   void fakelib(std::int64_t pid, const std::string& dir, const std::string& by, const std::string& error,
                std::int64_t mount_ms);
