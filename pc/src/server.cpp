@@ -797,6 +797,7 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   };
   std::vector<Row> rows;
   std::size_t installed = 0;
+  std::size_t continuing = 0;
   std::vector<std::pair<const ShelfListing::Folder*, bool>> entries;
   for (const auto& folder : listing->folders) entries.emplace_back(&folder, true);
   for (const auto& folder : listing->orphans) entries.emplace_back(&folder, false);
@@ -813,6 +814,7 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     }
     const bool on_console = state == "installed" || state == "update";
     if (on_console) ++installed;
+    if (state == "continue") ++continuing;
     if (filter == "installed" && !on_console) continue;
     if (filter == "todo" && (on_console || state == "continue")) continue;
     if (filter == "continue" && state != "continue") continue;
@@ -863,7 +865,7 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   const std::size_t matched = rows.size();
   return "{\"games\":[" + items + "],\"offset\":" + std::to_string(offset) + ",\"total\":" + std::to_string(matched) +
          ",\"all\":" + std::to_string(entries.size()) + ",\"installed\":" + std::to_string(installed) +
-         ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + ",\"version\":" + std::to_string(version) + "}";
+         ",\"continue\":" + std::to_string(continuing) + ",\"need_settings\":" + (listing->dest_ready ? "false" : "true") + ",\"version\":" + std::to_string(version) + "}";
 }
 
 // 能装的每组压缩包一项，供安装前挑选补丁。主游戏是直接放在游戏目录里最大的那组（都在子目录里时取最大的），

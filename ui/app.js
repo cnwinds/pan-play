@@ -64,7 +64,7 @@ let searchTimer = 0;
 // 游戏库按页从服务器取：loaded 是已经取到的位置，total 是符合当前筛选的总数，counts 是整个游戏库的数量。
 let loaded = 0;
 let total = 0;
-let counts = { all: 0, installed: 0, need_settings: false };
+let counts = { all: 0, installed: 0, continue: 0, need_settings: false };
 let pageToken = 0;
 let pageLoading = false;
 let loggedIn = false;
@@ -278,6 +278,17 @@ function paintArt(art, game) {
 
 function renderCounts() {
   gameCount.textContent = counts.all ? String(counts.all) : "";
+  // 筛选按钮上的数量按整个游戏库算，不受搜索和「有中文」这类筛选影响。
+  const byFilter = {
+    all: counts.all,
+    installed: counts.installed,
+    continue: counts.continue,
+    todo: Math.max(0, counts.all - counts.installed - counts.continue),
+  };
+  for (const button of filterButtons) {
+    const slot = button.querySelector(".filter-count");
+    if (slot) slot.textContent = counts.all ? String(byFilter[button.dataset.filter] ?? "") : "";
+  }
   shelfEmpty.hidden = loaded > 0;
   if (!counts.all) shelfEmpty.textContent = "游戏库目录里还没有游戏文件夹。";
   else if (query) shelfEmpty.textContent = `没有找到“${search.value.trim()}”。`;
@@ -343,7 +354,12 @@ async function fetchShelf({ reset = false, fresh = false, keep = false } = {}) {
     if (openerPath && tiles.has(openerPath) && detail) detail.opener = tiles.get(openerPath).tile;
     loaded = (data.offset || 0) + page.length;
     total = data.total || 0;
-    counts = { all: data.all || 0, installed: data.installed || 0, need_settings: Boolean(data.need_settings) };
+    counts = {
+      all: data.all || 0,
+      installed: data.installed || 0,
+      continue: data.continue || 0,
+      need_settings: Boolean(data.need_settings),
+    };
     renderCounts();
     scheduleMetaPoll(reset && !keep);
     if (reset && Number.isFinite(data.version)) shelfVersion = data.version;

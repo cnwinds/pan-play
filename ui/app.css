@@ -345,6 +345,14 @@ button:disabled { cursor: default; }
 
 .filter:hover { color: var(--text); }
 
+.filter-count:not(:empty) {
+  margin-left: 0.4rem;
+  color: var(--faint);
+  font-size: 0.85em;
+}
+
+.filter[aria-pressed="true"] .filter-count { color: var(--muted); }
+
 .filter[aria-pressed="true"] {
   background: var(--raise);
   color: var(--text);
