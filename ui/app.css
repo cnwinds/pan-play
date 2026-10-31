@@ -419,7 +419,7 @@ button:disabled { cursor: default; }
 
 .shelf {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(164px, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 2rem 1.35rem;
 }
 
@@ -533,24 +533,31 @@ button:disabled { cursor: default; }
   font-weight: 700;
 }
 
-.badge.installed { color: var(--mint); }
+.badge.size {
+  border-color: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+}
+
+.badge.size.installed {
+  border-color: var(--mint);
+  background: var(--mint);
+  color: #10151f;
+}
 .badge.continue { color: var(--amber); }
 .badge.queued { color: var(--signal-hi); }
 
-/* 自己评价过的版本，封面左下角 */
-.review-mark {
+/* 自己评价过有问题的版本：封面红色描边。盖在封面、进度和角标上面，不挡点击 */
+.art[data-review="bad"]::after {
+  content: "";
   position: absolute;
-  left: 8px;
-  bottom: 8px;
-  padding: 0.12rem 0.5rem;
-  border-radius: 6px;
-  color: #10151f;
-  font-size: 0.72rem;
-  font-weight: 700;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: inherit;
+  box-shadow: 0 0 0 3px var(--danger) inset;
+  pointer-events: none;
 }
-
-.review-mark.good { background: var(--mint); }
-.review-mark.bad { background: var(--danger); }
 
 .tile[data-state="queued"] .art .cover,
 .tile[data-state="queued"] .art .fallback { opacity: 0.55; }

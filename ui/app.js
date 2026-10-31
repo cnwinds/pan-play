@@ -261,14 +261,16 @@ function paintArt(art, game) {
   const label = art.querySelector(".fill span");
   if (label) label.textContent = taskStarted(task) ? Math.round(taskFraction(task) * 100) + "%" : "…";
   art.querySelector(".badge")?.remove();
-  if (game.state === "installed") art.append(el("span", "badge installed", "已安装"));
-  if (game.state === "continue") art.append(el("span", "badge continue", "未装完"));
-  if (game.state === "update") art.append(el("span", "badge continue", "有更新"));
-  if (game.state === "queued") art.append(el("span", "badge queued num", "排队 " + (queuePosition(game.path) || "")));
-  // 自己评价过这个版本：左下角标出能不能玩。
-  art.querySelector(".review-mark")?.remove();
-  if (game.review_state === "good") art.append(el("span", "review-mark good", "能玩"));
-  if (game.review_state === "bad") art.append(el("span", "review-mark bad", "有问题"));
+  // 平时显示容量，绿底表示已经装在主机上；装到一半、有更新、排队这些要处理的状态才换成文字，安装中看进度。
+  const size = formatBytes(game.archive_bytes);
+  if (game.state === "installed") art.append(el("span", "badge size installed num", size || "已安装"));
+  else if (game.state === "continue") art.append(el("span", "badge continue", "未装完"));
+  else if (game.state === "update") art.append(el("span", "badge continue", "有更新"));
+  else if (game.state === "queued") art.append(el("span", "badge queued num", "排队 " + (queuePosition(game.path) || "")));
+  else if (game.state !== "installing" && size) art.append(el("span", "badge size num", size));
+  // 自己评价过这个版本有问题：封面画红色描边。
+  if (game.review_state === "bad") art.dataset.review = "bad";
+  else delete art.dataset.review;
 }
 
 /* 游戏库 */
