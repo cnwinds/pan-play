@@ -9,6 +9,8 @@
 #include <map>
 #include <vector>
 
+#include <zlib.h>
+
 namespace panplay {
 namespace {
 
@@ -294,7 +296,9 @@ int check_legacy_cover() {
   {
     StoreMetaCache cache(dir, fake, 0);
     StoreMeta meta;
-    if (cache.lookup(9, &meta) != StoreMetaState::ready || meta.name != "旧封面") result = fail("换封面期间应照常显示资料");
+    if (cache.lookup(9, &meta) != StoreMetaState::pending || meta.name != "旧封面") {
+      result = fail("换封面期间应照常显示资料，并让页面等封面");
+    }
     cache.lookup(10, nullptr);
     cache.lookup(11, nullptr);
     while (cache.run_once()) {
@@ -312,11 +316,60 @@ int check_legacy_cover() {
   return result;
 }
 
+std::string gzip_text(const std::string& text) {
+  z_stream stream{};
+  deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 16 + MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+  std::string out(deflateBound(&stream, static_cast<uLong>(text.size())), '\0');
+  stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(text.data()));
+  stream.avail_in = static_cast<uInt>(text.size());
+  stream.next_out = reinterpret_cast<Bytef*>(out.data());
+  stream.avail_out = static_cast<uInt>(out.size());
+  deflate(&stream, Z_FINISH);
+  out.resize(stream.total_out);
+  deflateEnd(&stream);
+  return out;
+}
+
+// 概念页要 gzip 并能解开；连接中途断掉时重试，连着断三次才算取不到。
+int check_page_transfer() {
+  int requests = 0;
+  bool asked_gzip = false;
+  const HttpFetch gzipped = [&](const HttpRequest& request) {
+    ++requests;
+    for (const auto& [name, value] : request.headers) asked_gzip = asked_gzip || (name == "Accept-Encoding" && value == "gzip");
+    return HttpResponse{200, gzip_text(sample_page(12, "压缩页面")), ""};
+  };
+  StoreMeta meta;
+  std::string error;
+  if (!fetch_store_meta(12, gzipped, &meta, &error) || meta.name != "压缩页面") return fail("gzip 页面没解开: " + error);
+  if (!asked_gzip) return fail("概念页应要 gzip");
+
+  requests = 0;
+  const HttpFetch flaky = [&](const HttpRequest&) {
+    return ++requests < 3 ? HttpResponse{0, "", "下载连接中断"} : HttpResponse{200, sample_page(13, "断了两次"), ""};
+  };
+  if (!fetch_store_meta(13, flaky, &meta, &error) || meta.name != "断了两次" || requests != 3) {
+    return fail("连接中途断掉应重试，实际请求 " + std::to_string(requests));
+  }
+
+  requests = 0;
+  const HttpFetch down = [&](const HttpRequest&) {
+    ++requests;
+    return HttpResponse{0, "", "下载连接中断"};
+  };
+  error.clear();
+  if (fetch_store_meta(14, down, &meta, &error) || error.empty() || requests != 3) {
+    return fail("连着断三次应算取不到，实际请求 " + std::to_string(requests));
+  }
+  return 0;
+}
+
 }  // namespace
 
 int run_store_meta_self_test() {
   if (const int code = check_names()) return code;
   if (const int code = check_parse()) return code;
+  if (const int code = check_page_transfer()) return code;
   if (const int code = check_cache()) return code;
   if (const int code = check_upgrade()) return code;
   return check_legacy_cover();

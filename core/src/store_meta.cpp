@@ -11,6 +11,9 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <thread>
+
+#include <zlib.h>
 
 namespace panplay {
 namespace {
@@ -20,7 +23,9 @@ constexpr const char* kUserAgent =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 constexpr std::int64_t kFoundTtlSeconds = 30LL * 24 * 3600;
 constexpr std::int64_t kMissingTtlSeconds = 7LL * 24 * 3600;
-constexpr auto kOfflineRetry = std::chrono::minutes(10);
+constexpr auto kOfflineRetry = std::chrono::minutes(2);
+// 概念页一次要读几百 KB，装游戏时网络挤，连接中途断掉很常见；断了隔一会儿重连，不算商店连不上。
+constexpr int kPageAttempts = 3;
 
 std::int64_t unix_now() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -357,6 +362,37 @@ HttpRequest store_request(const std::string& url) {
   return request;
 }
 
+// 概念页要 gzip：原样 500～700 KB，压缩后约 100 KB。WinHTTP 和 PS5 的客户端都不会自己解压。
+HttpRequest page_request(const std::string& url) {
+  HttpRequest request = store_request(url);
+  request.headers.push_back({"Accept-Encoding", "gzip"});
+  return request;
+}
+
+bool gunzip_body(std::string* body) {
+  if (body->size() < 2 || static_cast<unsigned char>((*body)[0]) != 0x1F ||
+      static_cast<unsigned char>((*body)[1]) != 0x8B) {
+    return true;
+  }
+  z_stream stream{};
+  if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) return false;
+  stream.next_in = reinterpret_cast<Bytef*>(body->data());
+  stream.avail_in = static_cast<uInt>(body->size());
+  std::string out;
+  std::vector<char> buffer(1 << 16);
+  int status = Z_OK;
+  while (status == Z_OK) {
+    stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+    stream.avail_out = static_cast<uInt>(buffer.size());
+    status = inflate(&stream, Z_NO_FLUSH);
+    if (status == Z_OK || status == Z_STREAM_END) out.append(buffer.data(), buffer.size() - stream.avail_out);
+  }
+  inflateEnd(&stream);
+  if (status != Z_STREAM_END) return false;
+  *body = std::move(out);
+  return true;
+}
+
 }  // namespace
 
 const char* store_meta_state_name(StoreMetaState state) {
@@ -434,13 +470,21 @@ bool StoreMeta::has_cn_sub() const { return any_chinese(screen_langs); }
 bool StoreMeta::has_cn_voice() const { return any_chinese(spoken_langs); }
 
 bool fetch_store_meta(std::int64_t concept_id, const HttpFetch& fetch, StoreMeta* out, std::string* error,
-                      const std::function<void()>& before_request) {
+                      const std::function<void()>& before_request, std::chrono::milliseconds retry_wait) {
   StoreMeta meta;
   meta.concept_id = concept_id;
   for (const char* locale : kLocales) {
-    if (before_request) before_request();
-    const HttpResponse response = fetch(store_request("https://store.playstation.com/" + std::string(locale) +
-                                                      "/concept/" + std::to_string(concept_id)));
+    const std::string url = "https://store.playstation.com/" + std::string(locale) + "/concept/" + std::to_string(concept_id);
+    HttpResponse response;
+    for (int attempt = 1; attempt <= kPageAttempts; ++attempt) {
+      if (before_request) before_request();
+      if (attempt > 1 && retry_wait.count() > 0) std::this_thread::sleep_for(retry_wait * (attempt - 1));
+      response = fetch(page_request(url));
+      if (response.error.empty() && !gunzip_body(&response.body)) response.error = "商店页面解压失败";
+      if (response.error.empty() || attempt == kPageAttempts) break;
+      log_info("商店资料 " + std::to_string(concept_id) + " 第 " + std::to_string(attempt) + " 次没取到（" + response.error +
+               "），重试");
+    }
     if (!response.error.empty() || (response.status != 200 && response.status != 404)) {
       if (error) {
         *error = response.error.empty() ? "商店返回 HTTP " + std::to_string(response.status) : "连接商店失败: " + response.error;
@@ -502,9 +546,9 @@ StoreMetaState StoreMetaCache::lookup(std::int64_t concept_id, StoreMeta* out) {
     const bool cover_missing = meta.found && !meta.has_cover && !meta.cover_url.empty();
     const bool outdated = meta.found && meta.meta_ver < kStoreMetaVersion;
     if (!backing_off && !busy() && (stale || cover_missing || outdated)) enqueue_locked(concept_id);
-    // 已有资料在后台更新时照常显示；用户点了重新获取才算补齐中。
+    // 已有资料在后台更新时照常显示；用户点了重新获取、或者封面还在下载，才算补齐中，页面会接着问，封面下好就换上。
     const bool user_refresh = forced_.count(concept_id) != 0 || forced_running_.count(concept_id) != 0;
-    if (busy() && (!meta.found || user_refresh)) return StoreMetaState::pending;
+    if (busy() && (!meta.found || user_refresh || cover_missing)) return StoreMetaState::pending;
     return meta.found ? StoreMetaState::ready : StoreMetaState::missing;
   }
   if (busy()) return StoreMetaState::pending;
@@ -589,7 +633,8 @@ void StoreMetaCache::process(std::int64_t concept_id) {
   if (full) {
     std::string error;
     PANPLAY_DEBUG("商店资料：抓取 " + std::to_string(concept_id));
-    if (!fetch_store_meta(concept_id, fetch_, &meta, &error, [this] { throttle(); })) {
+    if (!fetch_store_meta(concept_id, fetch_, &meta, &error, [this] { throttle(); },
+                          std::chrono::milliseconds(min_interval_ms_ * 3))) {
       log_warn("商店资料 " + std::to_string(concept_id) + " 暂时取不到: " + error);
       std::lock_guard<std::mutex> lock(mu_);
       retry_after_[concept_id] = std::chrono::steady_clock::now() + kOfflineRetry;

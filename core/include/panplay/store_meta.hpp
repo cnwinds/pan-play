@@ -62,8 +62,10 @@ std::string clean_store_name(const std::string& name);
 StoreMeta parse_concept_page(const std::string& html, std::int64_t concept_id);
 
 // 依次试港服简体、港服繁体、美服。网络失败或被拒时返回 false，没收录时返回 true 且 found 为 false。
+// 连接中途断掉的页面隔 retry_wait（第二次再加倍）重试，三次都断才算失败。
 bool fetch_store_meta(std::int64_t concept_id, const HttpFetch& fetch, StoreMeta* out, std::string* error,
-                      const std::function<void()>& before_request = {});
+                      const std::function<void()>& before_request = {},
+                      std::chrono::milliseconds retry_wait = std::chrono::milliseconds(0));
 
 class StoreMetaCache {
  public:
