@@ -2,6 +2,7 @@
 
 #include "ps5_titles.hpp"
 
+#include "panplay/game_launch.hpp"
 #include "panplay/json.hpp"
 #include "panplay/trace.hpp"
 #include "ps5_appinst.hpp"
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <vector>
 
@@ -40,7 +42,8 @@ constexpr int kMaxNullfsLayers = 4;
 // PS5 基于 FreeBSD 11，statfs 里记挂载来源的 f_mntfromname 只有 88 字节，长路径会被截断。
 constexpr std::size_t kMountNameMax = 88;
 
-// PS5 上 kinfo_proc 里线程名的位置（同 ShadowMountPlus）。
+// PS5 上 kinfo_proc 里进程号、线程名的位置（同 ShadowMountPlus、BackPork）。
+constexpr std::size_t kKinfoPidOffset = 72;
 constexpr std::size_t kKinfoThreadNameOffset = 447;
 
 std::string read_text(const fs::path& path) {
@@ -660,30 +663,51 @@ bool console_title_running(const std::string& game_dir) {
   return running_app_title_id() == id;
 }
 
-bool shadowmount_running() {
+int find_process(std::initializer_list<const char*> thread_names) {
   int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
   std::vector<std::uint8_t> buffer;
   std::size_t size = 0;
   // 两次调用之间进程变多时第二次会报 ENOMEM，重试几次。
   bool listed = false;
   for (int attempt = 0; attempt < 4 && !listed; ++attempt) {
-    if (sysctl(mib, 4, nullptr, &size, nullptr, 0) != 0 || size == 0) return false;
+    if (sysctl(mib, 4, nullptr, &size, nullptr, 0) != 0 || size == 0) return -1;
     buffer.resize(size + size / 4);
     size = buffer.size();
     listed = sysctl(mib, 4, buffer.data(), &size, nullptr, 0) == 0;
-    if (!listed && errno != ENOMEM) return false;
+    if (!listed && errno != ENOMEM) return -1;
   }
-  if (!listed) return false;
+  if (!listed) return -1;
   for (std::size_t at = 0; at + kKinfoThreadNameOffset < size;) {
     int struct_size = 0;
     std::memcpy(&struct_size, buffer.data() + at, sizeof(struct_size));
     if (struct_size <= static_cast<int>(kKinfoThreadNameOffset) || at + static_cast<std::size_t>(struct_size) > size) break;
     const char* name = reinterpret_cast<const char*>(buffer.data() + at + kKinfoThreadNameOffset);
     const std::string thread(name, strnlen(name, static_cast<std::size_t>(struct_size) - kKinfoThreadNameOffset));
-    if (thread == "shadowmountplus.elf" || thread == "shadowmount.elf") return true;
+    for (const char* wanted : thread_names) {
+      if (thread == wanted) {
+        int pid = -1;
+        std::memcpy(&pid, buffer.data() + at + kKinfoPidOffset, sizeof(pid));
+        return pid;
+      }
+    }
     at += static_cast<std::size_t>(struct_size);
   }
-  return false;
+  return -1;
+}
+
+bool shadowmount_running() { return find_process({"shadowmountplus.elf", "shadowmount.elf"}) > 0; }
+
+bool backpork_running() { return find_process({"backpork.elf"}) > 0; }
+
+std::string fakelib_mounter() {
+  if (shadowmount_running()) return "ShadowMountPlus";
+  if (backpork_running()) return "BackPork";
+  return "panplay";
+}
+
+std::string managed_game_source(const std::string& title_id) {
+  if (!valid_title_id(title_id) || official_install(title_id)) return "";
+  return read_link(title_id);
 }
 
 ConsoleTitle inspect_console_title(const std::string& install_dir) {
@@ -701,6 +725,8 @@ ConsoleTitle inspect_console_title(const std::string& install_dir) {
   title.mounted = mounted_from(id, game_dir);
   // 镜像里文件的权限由挂载决定，补不了，不看。
   title.files_ok = game_dir != install_dir || eboot_runnable(game_dir);
+  title.fakelib = panplay::pick_fakelib(fs::u8path(game_dir));
+  if (!title.fakelib.empty()) title.fakelib_by = fakelib_mounter();
   if (foreign_title(id)) title.problem = "主机上已经有这个游戏（正式版或别的工具装的），不能再注册这个目录";
   else if (shadowmount_running()) title.problem = "ShadowMountPlus 在运行，注册交给它；想让盘游来管，先停掉它";
   return title;

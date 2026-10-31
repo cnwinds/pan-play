@@ -1,5 +1,6 @@
 #pragma once
 
+#include <initializer_list>
 #include <string>
 
 // 把装好的游戏文件夹注册到主机桌面，和 ShadowMountPlus 对文件夹游戏的做法一致，两边可以互相接管：
@@ -13,6 +14,8 @@ struct ConsoleTitle {
   bool mounted = false;     // 游戏目录正挂在 /system_ex/app/<ID>
   bool files_ok = true;     // eboot.bin 别的用户能读、能执行；旧版盘游装的游戏缺执行位，主机会提示无法开始
   std::string problem;      // 不能注册的原因，能注册时为空
+  std::string fakelib;      // backport 带的系统库目录（fakelib2、fakelib），游戏启动时要叠到沙盒上；没有时为空
+  std::string fakelib_by;   // 谁来叠：panplay、ShadowMountPlus、BackPork
 };
 
 ConsoleTitle inspect_console_title(const std::string& game_dir);
@@ -37,3 +40,12 @@ void restore_console_mounts();
 
 // ShadowMountPlus 在运行时注册、挂载都交给它，盘游不动手，免得两边抢同一个游戏。
 bool shadowmount_running();
+
+// 按线程名找进程，返回第一个对上的进程号，找不到时为 -1。
+int find_process(std::initializer_list<const char*> thread_names);
+
+// 游戏启动时谁把 fakelib 叠到沙盒上：ShadowMountPlus 或 BackPork 在运行时交给它们，否则是 panplay。
+std::string fakelib_mounter();
+
+// 盘游注册的游戏（mount.lnk 在、不是正式版）的游戏目录，别的为空。
+std::string managed_game_source(const std::string& title_id);

@@ -41,7 +41,7 @@ PS5 上存放方式是本机文件夹时，盘游自己做 ShadowMountPlus 对�
 ## 不做
 
 - 改 `app.db` 补背景音乐信息（要引入 sqlite）。
-- backport 的 fakelib 覆盖、kstuff 自动暂停、镜像格式。
+- kstuff 自动暂停、镜像格式（镜像后来由 ADR 0007 支持，backport 的 fakelib 覆盖由 ADR 0008 支持）。
 - 固件 12 起逐个注册（ShadowMountPlus 借 SceShellCore 做的 TitleDir bridge）。
 
 ## 影响

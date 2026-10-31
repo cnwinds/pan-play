@@ -2,6 +2,7 @@
 #include "panplay/catalog.hpp"
 #include "panplay/drive.hpp"
 #include "panplay/dummy_ftp.hpp"
+#include "panplay/game_launch.hpp"
 #include "panplay/http.hpp"
 #include "panplay/install.hpp"
 #include "panplay/json.hpp"
@@ -31,6 +32,7 @@
 
 #if defined(PANPLAY_PS5)
 #include "ps5_dashboard.hpp"
+#include "ps5_game_watch.hpp"
 #include "ps5_notify.hpp"
 #include "ps5_thread.hpp"
 #include "ps5_titles.hpp"
@@ -397,6 +399,7 @@ int main(int argc, char** argv) {
     PANPLAY_DEBUG("没有已在运行的盘游，开始启动服务");
     // 注册过的游戏靠 nullfs 挂载才能启动，挂载重启就没了，开机后要先挂回去。
     restore_console_mounts();
+    start_game_watch();
     options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
       notify("盘游已启动 " + url + (code.empty() ? "" : " 口令 " + code));
     };
@@ -454,6 +457,7 @@ int main(int argc, char** argv) {
   if (command == "self-test") {
     if (const int json = self_test()) return json;
     if (const int store = panplay::run_store_meta_self_test()) return store;
+    if (const int launch = panplay::run_game_launch_self_test()) return launch;
     if (const int sink = panplay::run_install_sink_self_test()) return sink;
     return panplay::run_install_pipeline_self_test();
   }

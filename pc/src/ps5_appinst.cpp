@@ -31,13 +31,56 @@ AppInstUtil util;
 std::atomic<bool> util_ready{false};
 std::mutex auth_mu;
 
-struct RunningApp {
+// sceSystemServiceLaunchApp 的参数，布局同 websrv。
+struct LaunchParam {
+  std::uint32_t size;
+  std::uint32_t user_id;
+  std::uint32_t app_opt;
+  std::uint64_t crash_report;
+  std::uint32_t check_flag;
+};
+
+struct SystemService {
   bool resolved = false;
   int (*app_id)() = nullptr;
   int (*title_id)(int, char*) = nullptr;
+  int (*kill)(int, int, int, int) = nullptr;
+  int (*launch)(const char*, char**, LaunchParam*) = nullptr;
+  int (*foreground_user)(std::int32_t*) = nullptr;
 };
 
-RunningApp running;
+SystemService running;
+
+// 要拿着 auth_mu 调用。
+void resolve_system_service() {
+  if (running.resolved) return;
+  running.resolved = true;
+  if (void* lib = dlopen("libSceSystemService.sprx", RTLD_LAZY); lib != nullptr) {
+    running.app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceSystemServiceGetAppIdOfRunningBigApp"));
+    running.title_id = reinterpret_cast<int (*)(int, char*)>(dlsym(lib, "sceSystemServiceGetAppTitleId"));
+    running.kill = reinterpret_cast<int (*)(int, int, int, int)>(dlsym(lib, "sceSystemServiceKillApp"));
+    running.launch =
+        reinterpret_cast<int (*)(const char*, char**, LaunchParam*)>(dlsym(lib, "sceSystemServiceLaunchApp"));
+  }
+  if (void* lib = dlopen("libSceUserService.sprx", RTLD_LAZY); lib != nullptr) {
+    running.foreground_user = reinterpret_cast<int (*)(std::int32_t*)>(dlsym(lib, "sceUserServiceGetForegroundUser"));
+  }
+  if (running.app_id == nullptr || running.title_id == nullptr) {
+    panplay::log_warn("这个固件上查不了正在运行的游戏，删除前不检查游戏开没开着");
+  }
+}
+
+// 要拿着 auth_mu 调用。没有游戏在运行时 app 为 0。
+std::string running_title_locked(int* app) {
+  *app = 0;
+  if (running.app_id == nullptr || running.title_id == nullptr) return "";
+  const int id = running.app_id();
+  if (id <= 0) return "";
+  *app = id;
+  char title[32] = {};
+  if (running.title_id(id, title) != 0) return "";
+  return std::string(title, strnlen(title, sizeof(title)));
+}
 
 unsigned bcd(unsigned value) { return ((value >> 4) & 0xFu) * 10u + (value & 0xFu); }
 
@@ -111,22 +154,57 @@ std::string load_app_inst_util() {
 
 std::string running_app_title_id() {
   std::lock_guard<std::mutex> lock(auth_mu);
-  if (!running.resolved) {
-    running.resolved = true;
-    if (void* lib = dlopen("libSceSystemService.sprx", RTLD_LAZY); lib != nullptr) {
-      running.app_id = reinterpret_cast<int (*)()>(dlsym(lib, "sceSystemServiceGetAppIdOfRunningBigApp"));
-      running.title_id = reinterpret_cast<int (*)(int, char*)>(dlsym(lib, "sceSystemServiceGetAppTitleId"));
-    }
-    if (running.app_id == nullptr || running.title_id == nullptr) {
-      panplay::log_warn("这个固件上查不了正在运行的游戏，删除前不检查游戏开没开着");
+  resolve_system_service();
+  int app = 0;
+  return running_title_locked(&app);
+}
+
+const char* const kOtherAppRunning = "主机上正在运行别的游戏";
+
+std::string launch_app(const std::string& title_id, bool close_running, std::string* running_title) {
+  // 用户服务要先初始化，前台用户才取得到。
+  if (auto error = load_app_inst_util(); !error.empty()) return error;
+  int app = 0;
+  {
+    std::lock_guard<std::mutex> lock(auth_mu);
+    resolve_system_service();
+    if (running.launch == nullptr || running.foreground_user == nullptr) return "这个固件上找不到启动游戏的接口";
+    const std::string current = running_title_locked(&app);
+    if (app > 0) {
+      if (current == title_id) return "这个游戏已经在主机上运行了";
+      if (!close_running) {
+        *running_title = current;
+        return kOtherAppRunning;
+      }
+      if (running.kill == nullptr) return "这个固件上关不了正在运行的游戏，先在主机上关掉它";
+      const int code = running.kill(app, -1, 0, 0);
+      panplay::log_info("关掉正在运行的 " + current + " 返回 " + hex_code(code));
+      if (code != 0) return "关掉正在运行的游戏失败，系统返回 " + hex_code(code);
     }
   }
-  if (running.app_id == nullptr || running.title_id == nullptr) return "";
-  const int app = running.app_id();
-  if (app <= 0) return "";
-  char id[32] = {};
-  if (running.title_id(app, id) != 0) return "";
-  return std::string(id, strnlen(id, sizeof(id)));
+  if (app > 0) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      int still = 0;
+      {
+        std::lock_guard<std::mutex> lock(auth_mu);
+        running_title_locked(&still);
+      }
+      if (still != app) break;
+      if (std::chrono::steady_clock::now() >= deadline) return "正在运行的游戏 10 秒内没关掉，稍后再试";
+    }
+  }
+  std::lock_guard<std::mutex> lock(auth_mu);
+  std::int32_t user = -1;
+  if (running.foreground_user(&user) != 0 || user <= 0) return "主机上还没有登录的用户，先在主机上选好用户";
+  LaunchParam param{};
+  param.user_id = static_cast<std::uint32_t>(user);
+  char* argv[] = {nullptr};
+  const int code = running.launch(title_id.c_str(), argv, &param);
+  panplay::log_info("启动 " + title_id + " 返回 " + hex_code(code));
+  if (code < 0) return "启动失败，系统返回 " + hex_code(code);
+  return "";
 }
 
 std::string with_privileged_auth(const std::function<std::string()>& action) {

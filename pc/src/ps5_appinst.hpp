@@ -21,6 +21,14 @@ std::string load_app_inst_util();
 // 和 load_app_inst_util 一样不能在 with_privileged_auth 里调用。
 std::string running_app_title_id();
 
+// 别的游戏在运行、又没让关掉它时 launch_app 返回的就是这句。
+extern const char* const kOtherAppRunning;
+
+// 在主机上启动应用（同 websrv）：取前台用户，有别的全屏应用在运行时 close_running 为 false 就不动它、
+// 把它的 Title ID 写进 *running_title 并返回 kOtherAppRunning，为 true 时先关掉它、等它退出再启动。
+// 和 load_app_inst_util 一样不能在 with_privileged_auth 里调用。返回错误，成功为空。
+std::string launch_app(const std::string& title_id, bool close_running, std::string* running_title);
+
 // 把进程身份临时换成能注册应用、挂载目录的特权身份，执行完换回。同一时间只有一个在执行。
 std::string with_privileged_auth(const std::function<std::string()>& action);
 

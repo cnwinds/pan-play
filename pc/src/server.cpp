@@ -9,6 +9,7 @@
 #include "panplay/catalog.hpp"
 #include "panplay/catalog_sync.hpp"
 #include "panplay/drive.hpp"
+#include "panplay/game_launch.hpp"
 #include "panplay/install.hpp"
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
@@ -1114,11 +1115,39 @@ std::string console_json(const std::string& path, const std::string& game_dir) {
     if (found != console_errors.end()) error = found->second;
   }
   using panplay::json_escape;
+  const auto launch = title.title_id.empty() ? std::nullopt : panplay::game_launches().last(title.title_id);
   return "{\"title_id\":\"" + json_escape(title.title_id) + "\",\"registered\":" + (title.registered ? "true" : "false") +
          ",\"mounted\":" + (title.mounted ? "true" : "false") + ",\"files_ok\":" + (title.files_ok ? "true" : "false") +
-         ",\"problem\":\"" + json_escape(title.problem) +
-         "\",\"error\":\"" + json_escape(error) + "\"}";
+         ",\"problem\":\"" + json_escape(title.problem) + "\",\"error\":\"" + json_escape(error) + "\",\"fakelib\":\"" +
+         json_escape(title.fakelib) + "\",\"fakelib_by\":\"" + json_escape(title.fakelib_by) + "\",\"launch\":" +
+         (launch ? panplay::launch_report_json(*launch) : "null") + ",\"now\":" +
+         std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count()) +
+         "}";
 }
+
+// 重新注册、启动和删除共用一张占用表：删到一半时不能又挂上、注册回去；查队列和占用在同一把锁里，中间插不进安装。
+// 占上了返回空，调用方用完要 release_console_path；占不上返回原因，还在安装队列里时返回 queued_reason。
+std::string claim_console_path(const std::string& path, const std::string& queued_reason) {
+  std::lock_guard<std::mutex> lock(installs.mu);
+  const bool queued = (installs.current && installs.current->path == path) ||
+                      std::any_of(installs.waiting.begin(), installs.waiting.end(),
+                                  [&](const InstallTask& task) { return task.path == path; });
+  if (queued) return queued_reason;
+  if (!installs.discarding.insert(path).second) return "正在处理这个游戏，稍等再试";
+  return "";
+}
+
+void release_console_path(const std::string& path) {
+  std::lock_guard<std::mutex> lock(installs.mu);
+  installs.discarding.erase(path);
+}
+
+struct ConsolePathClaim {
+  const std::string& path;
+  ~ConsolePathClaim() { release_console_path(path); }
+};
 
 // 装完后注册到主机桌面。这次写了文件（新装、装了更新）就重新注册，主机上显示的版本才会跟着变；
 // 本来就装好的，已经注册好、挂载也在时不重做。返回现在是不是已经注册在主机上。
@@ -2378,34 +2407,90 @@ void handle_client(SOCKET client, bool local_peer) {
       reply_json(client, 400, json_error("只有装在主机本机文件夹里的游戏能注册"));
       return;
     }
-    // 和删除共用一张占用表：删到一半时不能又挂上、注册回去；查队列和占用在同一把锁里，中间插不进安装。
-    {
-      std::lock_guard<std::mutex> lock(installs.mu);
-      const bool queued = (installs.current && installs.current->path == path) ||
-                          std::any_of(installs.waiting.begin(), installs.waiting.end(),
-                                      [&](const InstallTask& task) { return task.path == path; });
-      if (queued) {
-        reply_json(client, 409, json_error("这个游戏还在安装队列里，装完会自动注册"));
-        return;
-      }
-      if (!installs.discarding.insert(path).second) {
-        reply_json(client, 409, json_error("正在处理这个游戏，稍等再试"));
-        return;
-      }
+    if (const std::string busy = claim_console_path(path, "这个游戏还在安装队列里，装完会自动注册"); !busy.empty()) {
+      reply_json(client, 409, json_error(busy));
+      return;
     }
-    struct ReleaseBusy {
-      const std::string& path;
-      ~ReleaseBusy() {
-        std::lock_guard<std::mutex> lock(installs.mu);
-        installs.discarding.erase(path);
-      }
-    };
     std::string error;
     {
-      const ReleaseBusy release{path};
+      const ConsolePathClaim claim{path};
       error = register_console_title(game_dir);
     }
     remember_console_error(path, error);
+    if (!error.empty()) {
+      reply_json(client, 500, json_error(error));
+      return;
+    }
+    reply_json(client, 200, "{\"console\":" + console_json(path, game_dir) + "}");
+    return;
+  }
+  // 主机上的注册状态和最近一次启动的经过，启动后详情页隔一会儿问一次。
+  if (method == "POST" && target == "/api/console/status") {
+    std::string parse_error;
+    const panplay::Json json = panplay::Json::parse(body, &parse_error);
+    const std::string path = json.str("path");
+    const std::string game_dir = console_game_dir(load_settings(), path);
+    if (!parse_error.empty() || path.empty() || game_dir.empty()) {
+      reply_json(client, 400, json_error("只有装在主机本机文件夹里的游戏有主机状态"));
+      return;
+    }
+    reply_json(client, 200, "{\"console\":" + console_json(path, game_dir) + "}");
+    return;
+  }
+  // 在主机上启动游戏（ADR 0008）。注册不完整、挂载丢了、缺执行位时先重新注册修好；
+  // 别的游戏在运行、又没让关掉时返回 409 和它的 Title ID（running_title_id），页面问过用户后带 close_running 再来。
+  if (method == "POST" && target == "/api/console/launch") {
+    std::string parse_error;
+    const panplay::Json json = panplay::Json::parse(body, &parse_error);
+    const std::string path = json.str("path");
+    const std::string game_dir = console_game_dir(load_settings(), path);
+    if (!parse_error.empty() || path.empty() || game_dir.empty()) {
+      reply_json(client, 400, json_error("只有装在主机本机文件夹里的游戏能在这里启动"));
+      return;
+    }
+    if (const std::string busy = claim_console_path(path, "这个游戏还在安装队列里，装完再启动"); !busy.empty()) {
+      reply_json(client, 409, json_error(busy));
+      return;
+    }
+    std::string error;
+    std::string running_title;
+    {
+      const ConsolePathClaim claim{path};
+      const ConsoleTitle title = inspect_console_title(game_dir);
+      if (!title.problem.empty()) {
+        error = title.problem;
+      } else if (title.title_id.empty()) {
+        error = "读不到这个游戏的 Title ID";
+      } else {
+        if (!title.registered || !title.mounted || !title.files_ok) {
+          panplay::log_info("启动 " + title.title_id + " 前先重新注册修好");
+          error = register_console_title(game_dir);
+          remember_console_error(path, error);
+        }
+        const bool close_running = json.boolean_or("close_running", false);
+        if (error.empty() && !close_running) {
+          // 先问清楚：用户在确认框里取消时不该留下一条「正在启动」。
+          const std::string current = running_app_title_id();
+          if (!current.empty() && current != title.title_id) {
+            error = kOtherAppRunning;
+            running_title = current;
+          }
+        }
+        if (error.empty()) {
+          const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+          panplay::game_launches().requested(title.title_id, now);
+          error = launch_app(title.title_id, close_running, &running_title);
+          if (!error.empty()) panplay::game_launches().request_failed(title.title_id, error);
+        }
+      }
+    }
+    if (error == kOtherAppRunning) {
+      reply_json(client, 409, "{\"error\":\"" + panplay::json_escape(error) + "\",\"running_title_id\":\"" +
+                                  panplay::json_escape(running_title) + "\"}");
+      return;
+    }
     if (!error.empty()) {
       reply_json(client, 500, json_error(error));
       return;
