@@ -2,10 +2,11 @@
 
 #include "panplay/dummy_ftp.hpp"
 #include "panplay/library.hpp"
-#include "panplay/prefetch.hpp"
+#include "panplay/download.hpp"
 #include "panplay/speed_test.hpp"
 
 #include "big_memory.hpp"
+#include "download_sim.hpp"
 #include "install_clock.hpp"
 #include "install_common.hpp"
 
@@ -15,6 +16,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -687,340 +689,293 @@ int resume_on(InstallSink& raw, FakeDrive& drive, const std::vector<std::uint8_t
   return 0;
 }
 
-int prefetch_tests() {
+// 下载会话的 I/O 外壳（ADR 0009）：数据顺序、断线重连、跳转、取消、多段拼接、卡住或很慢的连接及时让出。
+// 调条数的逻辑在 download_sim_tests 里用虚拟时间测。
+int download_tests() {
   FakeDrive drive;
   const std::int64_t size = (64ll << 20) + 12345;
   const auto byte_at = [](std::int64_t offset) { return static_cast<std::uint8_t>((offset * 131) ^ (offset >> 13)); };
   drive.add_generated("/big.bin", size, [&](std::int64_t offset, std::uint8_t* dst, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) dst[i] = byte_at(offset + static_cast<std::int64_t>(i));
   });
-  PrefetchOptions options;
+  const std::vector<DownloadExtent> whole{DownloadExtent{"/big.bin", 0, size, size}};
+  DownloadOptions options;
   options.retry_base_ms = 1;
-  options.connections = 1;
-  options.block_size = 4u << 20;
-  options.max_blocks = 8;
-
-  {
-    PrefetchReader reader(drive, "/big.bin", size, nullptr, options);
-    std::vector<std::uint8_t> buffer(7919);
-    std::int64_t at = 0;
-    while (true) {
-      std::string error;
-      const std::size_t got = reader.read(buffer.data(), buffer.size(), &error);
-      if (!error.empty()) return fail(error);
-      if (got == 0) break;
-      for (std::size_t i = 0; i < got; i += 997) {
-        if (buffer[i] != byte_at(at + static_cast<std::int64_t>(i))) return fail("预读数据不对");
+  options.max_connections = 1;
+  options.adaptive = false;
+  options.window_max = 16ll << 20;
+  // 一直读到 limit 或超时，边读边核对，返回读到哪。
+  const auto drain = [](DownloadSession& session, const std::function<std::uint8_t(std::int64_t)>& expect, std::int64_t limit,
+                        double seconds, std::size_t chunk, std::string* error) {
+    std::vector<std::uint8_t> buffer(chunk);
+    std::int64_t at = session.position();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+    while (at < limit && std::chrono::steady_clock::now() < until) {
+      const std::size_t want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(chunk), limit - at));
+      const std::size_t got = session.read(buffer.data(), want, error);
+      if (!error->empty() || got == 0) break;
+      for (std::size_t i = 0; i < got; i += 4093) {
+        if (buffer[i] != expect(at + static_cast<std::int64_t>(i))) {
+          *error = "数据不对 @" + std::to_string(at + static_cast<std::int64_t>(i));
+          return at;
+        }
+      }
+      if (buffer[got - 1] != expect(at + static_cast<std::int64_t>(got) - 1)) {
+        *error = "数据不对 @" + std::to_string(at + static_cast<std::int64_t>(got) - 1);
+        return at;
       }
       at += static_cast<std::int64_t>(got);
     }
-    if (at != size) return fail("预读没有读到文件结尾");
+    return at;
+  };
+
+  {
+    DownloadSession session(drive, whole, nullptr, options);
+    std::string error;
+    const std::int64_t at = drain(session, byte_at, size, 30, 7919, &error);
+    if (!error.empty()) return fail("单连接顺序读: " + error);
+    if (at != size) return fail("单连接没有读到结尾");
+    std::uint8_t byte = 0;
+    if (session.read(&byte, 1, &error) != 0 || !error.empty()) return fail("读完以后还有数据");
     if (drive.stream_opens != 1 || drive.read_at_calls != 0) {
-      return fail("顺序读 64 MB 打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
+      return fail("单连接顺序读 64 MB 打开了 " + std::to_string(drive.stream_opens.load()) + " 次流");
     }
   }
 
   drive.stream_opens = 0;
   drive.break_next_stream_after = 10ll << 20;
   {
-    PrefetchReader reader(drive, "/big.bin", size, nullptr, options);
-    if (auto error = reader.seek(1000); !error.empty()) return fail(error);
-    std::vector<std::uint8_t> buffer(1 << 20);
-    std::int64_t at = 1000;
-    while (true) {
-      std::string error;
-      const std::size_t got = reader.read(buffer.data(), buffer.size(), &error);
-      if (!error.empty()) return fail("断线后没有自动重连: " + error);
-      if (got == 0) break;
-      if (buffer[0] != byte_at(at) || buffer[got - 1] != byte_at(at + static_cast<std::int64_t>(got) - 1)) {
-        return fail("断线重连后数据错位");
-      }
-      at += static_cast<std::int64_t>(got);
-    }
+    DownloadSession session(drive, whole, nullptr, options);
+    if (auto error = session.seek(1000); !error.empty()) return fail(error);
+    std::string error;
+    const std::int64_t at = drain(session, byte_at, size, 30, 1 << 20, &error);
+    if (!error.empty()) return fail("断线后没有自动重连: " + error);
     if (at != size) return fail("断线重连后没有读完");
     if (drive.stream_opens != 2) return fail("断线一次应该重连一次，实际打开 " + std::to_string(drive.stream_opens.load()) + " 次");
   }
 
   drive.stream_opens = 0;
   {
-    PrefetchReader reader(drive, "/big.bin", size, nullptr, options);
+    DownloadSession session(drive, whole, nullptr, options);
     std::uint8_t byte = 0;
     std::string error;
-    reader.read(&byte, 1, &error);
-    if (auto seek_error = reader.seek(100); !seek_error.empty()) return fail(seek_error);
-    reader.read(&byte, 1, &error);
-    if (!error.empty() || byte != byte_at(100)) return fail("缓冲内向前跳转后数据不对");
-    if (auto seek_error = reader.seek(3ll << 20); !seek_error.empty()) return fail(seek_error);
-    reader.read(&byte, 1, &error);
-    if (!error.empty() || byte != byte_at(3ll << 20)) return fail("近距离向前跳转后数据不对");
-    if (drive.stream_opens != 1) return fail("近距离向前跳转不该重连");
-    if (auto seek_error = reader.seek((3ll << 20) - 50); !seek_error.empty()) return fail(seek_error);
-    reader.read(&byte, 1, &error);
-    if (!error.empty() || byte != byte_at((3ll << 20) - 50)) return fail("块内往回跳后数据不对");
-    if (auto seek_error = reader.seek((4ll << 20) + 20); !seek_error.empty()) return fail(seek_error);
-    reader.read(&byte, 1, &error);
-    if (auto seek_error = reader.seek((4ll << 20) - 30); !seek_error.empty()) return fail(seek_error);
-    std::vector<std::uint8_t> span(100);
-    std::size_t got_span = 0;
-    while (got_span < span.size()) {
-      const std::size_t got = reader.read(span.data() + got_span, span.size() - got_span, &error);
-      if (got == 0) break;
-      got_span += got;
+    const auto read_at = [&](std::int64_t offset) {
+      if (auto seek_error = session.seek(offset); !seek_error.empty()) return seek_error;
+      if (session.read(&byte, 1, &error) != 1 || !error.empty()) return "跳到 " + std::to_string(offset) + " 后没读到: " + error;
+      if (byte != byte_at(offset)) return "跳到 " + std::to_string(offset) + " 后数据不对";
+      return std::string();
+    };
+    session.read(&byte, 1, &error);
+    if (auto message = read_at(100); !message.empty()) return fail(message);
+    // 等下载跑到前面：往前跳到已下好的地方，再往回跳一小段，都用缓冲里的。
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (const std::int64_t offset : {3ll << 20, (3ll << 20) - 50, (4ll << 20) + 20}) {
+      if (auto message = read_at(offset); !message.empty()) return fail(message);
     }
-    for (std::size_t i = 0; i < span.size(); ++i) {
-      if (span[i] != byte_at((4ll << 20) - 30 + static_cast<std::int64_t>(i))) return fail("跨块往回跳后数据不对");
+    if (drive.stream_opens != 1) return fail("近处跳转不该重连");
+    if (auto seek_error = session.seek((4ll << 20) - 30); !seek_error.empty()) return fail(seek_error);
+    if (drain(session, byte_at, (4ll << 20) + 70, 5, 100, &error) != (4ll << 20) + 70 || !error.empty()) {
+      return fail("往回跳一小段后数据不对: " + error);
     }
     if (drive.stream_opens != 1) return fail("往回跳一小段不该重连");
-    if (auto seek_error = reader.seek(60ll << 20); !seek_error.empty()) return fail(seek_error);
-    reader.read(&byte, 1, &error);
-    if (!error.empty() || byte != byte_at(60ll << 20)) return fail("远距离跳转后数据不对");
-    if (drive.stream_opens != 2) return fail("跳转次数不对");
+    if (auto message = read_at(60ll << 20); !message.empty()) return fail(message);
+    if (drive.stream_opens != 2) return fail("远处跳转应该重连一次，实际打开 " + std::to_string(drive.stream_opens.load()) + " 次");
   }
 
   for (const int connections : {2, 4}) {
-    PrefetchOptions multi = options;
-    multi.connections = connections;
-    multi.adaptive = false;
-    multi.max_blocks = static_cast<std::size_t>(connections) * 2;
+    DownloadOptions multi = options;
+    multi.max_connections = connections;
     drive.stream_opens = 0;
     drive.latency_ms = 2;
     drive.break_next_stream_after = 3ll << 20;
-    PrefetchReader reader(drive, "/big.bin", size, nullptr, multi);
-    if (auto error = reader.seek(777); !error.empty()) return fail(error);
-    std::vector<std::uint8_t> buffer(300000);
-    std::int64_t at = 777;
-    bool jumped = false;
-    while (true) {
-      std::string error;
-      const std::size_t got = reader.read(buffer.data(), buffer.size(), &error);
-      if (!error.empty()) return fail("多连接读取出错: " + error);
-      if (got == 0) break;
-      for (std::size_t i = 0; i < got; i += 4099) {
-        if (buffer[i] != byte_at(at + static_cast<std::int64_t>(i))) return fail("多连接数据顺序不对");
-      }
-      if (buffer[got - 1] != byte_at(at + static_cast<std::int64_t>(got) - 1)) return fail("多连接数据顺序不对");
-      at += static_cast<std::int64_t>(got);
-      if (!jumped && at > (20ll << 20)) {
-        jumped = true;
-        at = 5ll << 20;
-        if (auto seek_error = reader.seek(at); !seek_error.empty()) return fail(seek_error);
-      }
-    }
+    DownloadSession session(drive, whole, nullptr, multi);
+    if (auto error = session.seek(777); !error.empty()) return fail(error);
+    std::string error;
+    std::int64_t at = drain(session, byte_at, 20ll << 20, 30, 300000, &error);
+    if (!error.empty()) return fail(std::to_string(connections) + " 条连接读取出错: " + error);
+    if (auto seek_error = session.seek(5ll << 20); !seek_error.empty()) return fail(seek_error);
+    at = drain(session, byte_at, size, 30, 300000, &error);
     drive.latency_ms = 0;
-    if (at != size) return fail("多连接没有读到文件结尾");
+    if (!error.empty()) return fail(std::to_string(connections) + " 条连接往回跳后出错: " + error);
+    if (at != size) return fail(std::to_string(connections) + " 条连接没有读到结尾");
+    if (session.connections() != connections) return fail("固定条数时条数变了");
   }
 
   {
     CancelToken cancel;
     drive.latency_ms = 50;
-    PrefetchReader reader(drive, "/big.bin", size, &cancel, options);
+    DownloadSession session(drive, whole, &cancel, options);
     cancel.cancel();
     std::uint8_t byte = 0;
     std::string error;
     const auto started = std::chrono::steady_clock::now();
-    reader.read(&byte, 1, &error);
+    session.read(&byte, 1, &error);
     const auto spent = std::chrono::steady_clock::now() - started;
     drive.latency_ms = 0;
-    if (error != "interrupted") return fail("取消后没有返回中断");
+    if (error != "interrupted") return fail("取消后没有返回中断: " + error);
     if (spent > std::chrono::seconds(1)) return fail("取消后没有很快停下");
   }
 
   for (const int connections : {1, 4}) {
-    PrefetchOptions slow = options;
-    slow.connections = connections;
-    slow.adaptive = false;
+    DownloadOptions slow = options;
+    slow.max_connections = connections;
     const auto started = std::chrono::steady_clock::now();
     {
-      PrefetchReader reader(drive, "/big.bin", size, nullptr, slow);
+      DownloadSession session(drive, whole, nullptr, slow);
       std::uint8_t byte = 0;
       std::string error;
-      reader.read(&byte, 1, &error);
+      session.read(&byte, 1, &error);
       drive.latency_ms = 10000;
-      if (auto seek_error = reader.seek(60ll << 20); !seek_error.empty()) return fail(seek_error);
+      if (auto seek_error = session.seek(60ll << 20); !seek_error.empty()) return fail(seek_error);
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       drive.latency_ms = 0;
-      if (auto seek_error = reader.seek(50ll << 20); !seek_error.empty()) return fail(seek_error);
-      reader.read(&byte, 1, &error);
+      if (auto seek_error = session.seek(50ll << 20); !seek_error.empty()) return fail(seek_error);
+      session.read(&byte, 1, &error);
       if (!error.empty() || byte != byte_at(50ll << 20)) return fail("连接中跳转后数据不对");
       drive.latency_ms = 10000;
-      if (auto seek_error = reader.seek(10ll << 20); !seek_error.empty()) return fail(seek_error);
+      if (auto seek_error = session.seek(10ll << 20); !seek_error.empty()) return fail(seek_error);
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     drive.latency_ms = 0;
     if (std::chrono::steady_clock::now() - started > std::chrono::seconds(2)) return fail("连接还没建立时跳转或关闭要等很久");
   }
-  return 0;
-}
 
-// 先单连接、一条吃不满才加（ADR 0005）：带宽限在主机这边时试过要退回 1 条，服务器按连接限速时往上加，
-// 解压器等着的那段卡住时很快重派。调速用的时间都调小了。
-int tuning_tests() {
-  FakeDrive drive;
-  const std::int64_t size = 512ll << 20;
-  const auto byte_at = [](std::int64_t offset) { return static_cast<std::uint8_t>(offset * 7 + (offset >> 20)); };
-  drive.add_generated("/tune.bin", size, [&](std::int64_t offset, std::uint8_t* dst, std::size_t n) {
-    for (std::size_t i = 0; i < n; ++i) dst[i] = byte_at(offset + static_cast<std::int64_t>(i));
-  });
-  const auto base = [] {
-    PrefetchOptions options;
-    options.retry_base_ms = 1;
-    options.block_size = 1u << 20;
-    options.max_blocks = 32;
-    options.connections = 8;
-    options.settle_ms = 200;
-    options.measure_ms = 400;
-    options.review_ms = 400;
-    options.backoff_ms = 600000;
-    options.segment_ms = 300;
-    options.stall_ms = 300;
-    return options;
-  };
-  // 一直读到 limit 字节或者超时，边读边核对内容，返回读到哪。
-  const auto drain = [&](PrefetchReader& reader, std::int64_t limit, double seconds, std::string* error) {
-    std::vector<std::uint8_t> buffer(1 << 20);
-    std::int64_t at = reader.position();
-    const auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
-    while (at < limit && std::chrono::steady_clock::now() < until) {
-      const std::size_t got = reader.read(buffer.data(), buffer.size(), error);
-      if (!error->empty() || got == 0) break;
-      for (std::size_t i = 0; i < got; i += 4093) {
-        if (buffer[i] != byte_at(at + static_cast<std::int64_t>(i))) {
-          *error = "数据不对 @" + std::to_string(at + static_cast<std::int64_t>(i));
-          return at;
-        }
+  // 几段首尾相接：两个文件，中间那段从文件中间开始、不到结尾，最后一段到文件结尾。
+  {
+    const std::int64_t other_size = 9ll << 20;
+    const auto other_at = [](std::int64_t offset) { return static_cast<std::uint8_t>(offset * 7 + (offset >> 16) + 1); };
+    drive.add_generated("/other.bin", other_size, [&](std::int64_t offset, std::uint8_t* dst, std::size_t n) {
+      for (std::size_t i = 0; i < n; ++i) dst[i] = other_at(offset + static_cast<std::int64_t>(i));
+    });
+    const std::vector<DownloadExtent> parts{DownloadExtent{"/big.bin", 0, 5ll << 20, size},
+                                            DownloadExtent{"/other.bin", 1ll << 20, 6ll << 20, other_size},
+                                            DownloadExtent{"/big.bin", 7ll << 20, size - (7ll << 20), size}};
+    const auto expect = [&](std::int64_t at) {
+      if (at < (5ll << 20)) return byte_at(at);
+      at -= 5ll << 20;
+      if (at < (6ll << 20)) return other_at(at + (1ll << 20));
+      return byte_at(at - (6ll << 20) + (7ll << 20));
+    };
+    for (const int connections : {1, 3}) {
+      DownloadOptions multi = options;
+      multi.max_connections = connections;
+      drive.stream_opens = 0;
+      DownloadSession session(drive, parts, nullptr, multi);
+      if (session.size() != size + (4ll << 20)) return fail("几段拼起来的长度不对");
+      std::string error;
+      const std::int64_t at = drain(session, expect, session.size(), 30, 65536 + 17, &error);
+      if (!error.empty()) return fail(std::to_string(connections) + " 条连接读几段: " + error);
+      if (at != session.size()) return fail(std::to_string(connections) + " 条连接没读完几段");
+      if (connections == 1 && drive.stream_opens != 3) {
+        return fail("单连接读三段应该请求三次，实际 " + std::to_string(drive.stream_opens.load()) + " 次");
       }
-      at += static_cast<std::int64_t>(got);
     }
-    return at;
-  };
+  }
+
+  // 文件打不开：重试几次后报错，不会一直等。
+  {
+    DownloadOptions broken = options;
+    broken.max_retries = 2;
+    DownloadSession session(drive, {DownloadExtent{"/missing.bin", 0, 1 << 20, 1 << 20}}, nullptr, broken);
+    std::uint8_t byte = 0;
+    std::string error;
+    const auto started = std::chrono::steady_clock::now();
+    if (session.read(&byte, 1, &error) != 0 || error.empty()) return fail("文件打不开时没有报错");
+    if (std::chrono::steady_clock::now() - started > std::chrono::seconds(3)) return fail("文件打不开时报错太慢");
+  }
+
+  // 卡住（每秒 16 KB）和一直有数据但很慢（每 40 毫秒 16 KB）：读取方要的那段要及时让别的连接接手或重连。
   const auto reset_limits = [&] {
     drive.total_kbps = 0;
     drive.stream_kbps = 0;
     drive.stall_next_stream_after = -1;
     drive.stall_piece_ms = 1000;
   };
-
-  {
-    reset_limits();
-    drive.total_kbps = 24 * 1024;
-    PrefetchOptions options = base();
-    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
-    std::string error;
-    drain(reader, size, 3.0, &error);
-    if (!error.empty()) return fail("总带宽受限时读取出错: " + error);
-    int failures = 0;
-    {
-      std::lock_guard<std::mutex> lock(options.tuning->mu);
-      failures = options.tuning->failures;
-    }
-    if (failures < 1) return fail("总带宽受限、解压器一直在等时应该试过多开");
-    if (reader.connections() != 1) {
-      return fail("带宽限在主机这边时多开只是分流，应该退回 1 条，实际 " + std::to_string(reader.connections()) + " 条");
-    }
-  }
-
-  {
-    reset_limits();
-    drive.stream_kbps = 6 * 1024;
-    PrefetchOptions options = base();
-    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
-    std::string error;
-    drain(reader, size, 5.0, &error);
-    if (!error.empty()) return fail("按连接限速时读取出错: " + error);
-    if (reader.connections() < 3) {
-      return fail("服务器按连接限速时应该加到 3 条以上，实际 " + std::to_string(reader.connections()) + " 条");
-    }
-  }
-
-  // 加到上限以后读取方一直在等下载：少一条只会更慢，过了定期复核的时间也不能试着减。
-  {
-    reset_limits();
-    drive.stream_kbps = 6 * 1024;
-    PrefetchOptions options = base();
-    options.connections = 4;
-    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
-    std::string error;
-    bool reached = false;
-    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(9);
-    while (std::chrono::steady_clock::now() < until) {
-      drain(reader, size, 0.05, &error);
-      if (!error.empty()) return fail("按连接限速、加到上限后读取出错: " + error);
-      const int now_connections = reader.connections();
-      if (now_connections == 4) reached = true;
-      if (reached && now_connections < 4) {
-        return fail("读取方一直在等下载时不该减连接，从 4 条减到了 " + std::to_string(now_connections) + " 条");
-      }
-    }
-    if (!reached) return fail("按连接限速时应该加到 4 条上限");
-  }
-
-  // 解压一时跟不上减了连接，恢复后读取方又在等：直接回到之前试过更快的条数，不等加连接的退避（这里 10 分钟）。
-  {
-    reset_limits();
-    drive.stream_kbps = 6 * 1024;
-    PrefetchOptions options = base();
-    options.connections = 4;
-    PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
-    std::string error;
-    auto until = std::chrono::steady_clock::now() + std::chrono::seconds(6);
-    while (reader.connections() < 4 && std::chrono::steady_clock::now() < until) {
-      drain(reader, size, 0.05, &error);
-      if (!error.empty()) return fail("恢复测试加连接时读取出错: " + error);
-    }
-    if (reader.connections() != 4) return fail("恢复测试没能加到 4 条");
-    std::vector<std::uint8_t> piece(256 << 10);
-    until = std::chrono::steady_clock::now() + std::chrono::seconds(8);
-    while (reader.connections() == 4 && std::chrono::steady_clock::now() < until) {
-      reader.read(piece.data(), piece.size(), &error);
-      if (!error.empty()) return fail("解压慢时读取出错: " + error);
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    const int lowered = reader.connections();
-    if (lowered >= 4) return fail("解压一直跟不上时应该减连接");
-    until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (reader.connections() < 4 && std::chrono::steady_clock::now() < until) {
-      drain(reader, size, 0.05, &error);
-      if (!error.empty()) return fail("解压恢复后读取出错: " + error);
-      const int now_connections = reader.connections();
-      if (now_connections > lowered && now_connections < 4) {
-        return fail("解压恢复后应该一步回到 4 条，却从 " + std::to_string(lowered) + " 条一档档往上试");
-      }
-    }
-    if (reader.connections() != 4) {
-      return fail("解压恢复、读取方又在等时应该直接回到 4 条，实际停在 " + std::to_string(reader.connections()) + " 条（减到过 " +
-                  std::to_string(lowered) + " 条）");
-    }
-  }
-
-  // 卡住（每秒 16 KB）和一直有数据但很慢（每 40 毫秒 16 KB，400 KB/s，高于卡住的下限）：
-  // 很慢的那段每次只交一点，解压器拿到一点又等，不能只看它连续等了多久。
   for (const int piece_ms : {1000, 40}) {
     for (const int connections : {1, 4}) {
       reset_limits();
       drive.stall_piece_ms = piece_ms;
+      // 只有一条时没有别的连接可比，要先正常下一阵（16 MB，半秒），才知道它后来慢了。
+      std::int64_t want = 24ll << 20;
       if (connections == 1) {
         drive.total_kbps = 32 * 1024;
-        drive.stall_next_stream_after = 3ll << 20;
+        drive.stall_next_stream_after = 16ll << 20;
+        want = 40ll << 20;
       } else {
         drive.stream_kbps = 4 * 1024;
         drive.stall_next_stream_after = 256 << 10;
       }
-      PrefetchOptions options = base();
-      options.adaptive = false;
-      options.connections = connections;
-      PrefetchReader reader(drive, "/tune.bin", size, nullptr, options);
+      DownloadOptions stalled = options;
+      stalled.max_connections = connections;
+      stalled.window_max = 0;
+      DownloadSession session(drive, whole, nullptr, stalled);
       std::string error;
       const auto started = std::chrono::steady_clock::now();
-      const std::int64_t got = drain(reader, 24ll << 20, 8.0, &error);
+      const std::int64_t got = drain(session, byte_at, want, 10.0, 1 << 20, &error);
       const double spent = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
       const std::string what = std::to_string(connections) + " 条连接时请求" + (piece_ms < 1000 ? "很慢" : "卡住");
       if (!error.empty()) return fail(what + "后读取出错: " + error);
-      if (got < (24ll << 20) || spent > 5.0) {
-        return fail(what + "没有及时重派：" + std::to_string(spent) + " 秒读到 " + std::to_string(got >> 20) + " MB");
+      if (got < want || spent > 7.0) {
+        return fail(what + "没有及时让出：" + std::to_string(spent) + " 秒读到 " + std::to_string(got >> 20) + " MB");
       }
     }
   }
   reset_limits();
+
+  {
+    DownloadMemory memory;
+    load_download_memory("{\"lanes\":4,\"lane_mbps\":7.5}", &memory);
+    if (memory.lanes != 4 || std::abs(memory.lane_rate - 7.5 * 1024 * 1024) > 1) return fail("读 download.json 不对");
+    DownloadMemory again;
+    load_download_memory(download_memory_json(memory), &again);
+    if (again.lanes != 4 || std::abs(again.lane_rate - memory.lane_rate) > 1024) return fail("download.json 存了再读不一样");
+    DownloadMemory junk;
+    load_download_memory("{\"lanes\":99}", &junk);
+    if (junk.lanes < 1 || junk.lanes > 8) return fail("download.json 里的条数没有限制范围");
+  }
+  return 0;
+}
+
+// 调条数、分段、让出慢连接的决策（ADR 0009），用虚拟时间跑 download_sim_scenarios 的各个场景。
+int download_sim_tests() {
+  const auto scenarios = download_sim_scenarios();
+  for (const SimScenario& scenario : scenarios) {
+    const SimResult result = run_download_sim(scenario);
+    const auto bad = [&](const std::string& what) { return fail("下载模拟「" + scenario.name + "」" + what + "\n" + describe_sim(scenario, result)); };
+    const auto is = [&](const char* prefix) { return scenario.name.rfind(prefix, 0) == 0; };
+    if (!result.error.empty()) return bad("出错: " + result.error);
+    const auto within = [&](double factor) { return result.seconds <= result.bound * factor + 0.5; };
+    if (is("单条够快")) {
+      if (result.totals.requests != 3 || result.final_lanes != 1 || !within(1.05)) return bad("应该一卷一个请求、一条到底");
+    } else if (is("每条限速")) {
+      if (result.most_lanes < 6 || !within(1.3)) return bad("应该加到 6 条以上");
+    } else if (is("共享瓶颈")) {
+      if (result.final_lanes != 1 || result.memory.lanes != 1 || !within(1.05)) return bad("多开只是分流，应该退回 1 条");
+    } else if (is("解压慢")) {
+      if (result.final_lanes > 3 || !within(1.05)) return bad("解压跟不上时应该减条数");
+    } else if (is("固定")) {
+      if (result.totals.steals != 0 || result.totals.aborts != 0 || !within(1.2)) return bad("没有故障时不该分走或断开");
+    } else if (is("慢连接")) {
+      if (result.totals.steals < 1 || !within(1.35)) return bad("应该把慢连接的后半段分走");
+    } else if (is("卡住")) {
+      if (result.totals.aborts < 1 || !within(1.3)) return bad("应该断开卡住的连接");
+    } else if (is("分卷")) {
+      if (result.totals.requests > 14 || !within(1.1)) return bad("跨卷不该多出请求或等待");
+    } else if (is("记下")) {
+      if (result.final_lanes > 3 || !within(1.1)) return bad("开头复核应该把记下的条数减下来");
+    } else if (is("总带宽")) {
+      if (!within(1.45)) return bad("带宽波动时太慢");
+    } else if (is("出错")) {
+      if (result.totals.failures < 1 || !within(1.4)) return bad("出错后应该重试并读完");
+    }
+  }
+  SimScenario broken;
+  broken.name = "一直出错";
+  broken.extents = {64ll << 20};
+  broken.error_chance = 1;
+  broken.options.retry_base = 0.1;
+  const SimResult result = run_download_sim(broken);
+  if (result.error.empty()) return fail("下载模拟：一直出错时应该报错\n" + describe_sim(broken, result));
   return 0;
 }
 
@@ -1198,7 +1153,7 @@ int game_root_test() {
              old_marker.size());
   InstallRequest request;
   request.source_dir = "/apps/panplay/Wrapped PPSA70000";
-  request.prefetch.connections = 1;
+  request.download.max_connections = 1;
   const InstallResult result = install_game(drive, sink, request);
   if (result.status != "installed") return fail("外面包了目录的游戏没装上: " + result.message);
   if (result.files_total != 4) return fail("游戏目录外的文件不该算进去");
@@ -1458,7 +1413,7 @@ int many_files_test() {
   CountingSink sink(memory);
   InstallRequest request;
   request.source_dir = "/apps/panplay/Many CUSA30000";
-  request.prefetch.connections = 1;
+  request.download.max_connections = 1;
   const InstallResult result = install_game(drive, sink, request);
   if (result.status != "installed" || result.files_total != 3000) return fail("3000 个小文件没有装完: " + result.message);
   if (drive.read_at_calls > 4) return fail("读 ZIP 目录用了 " + std::to_string(drive.read_at_calls.load()) + " 次随机读");
@@ -1751,7 +1706,7 @@ int large_file_test() {
   MemorySink sink;
   InstallRequest request;
   request.source_dir = "/apps/panplay/Huge PPSA50000";
-  request.prefetch.connections = 1;
+  request.download.max_connections = 1;
   const auto started = std::chrono::steady_clock::now();
   const InstallResult result = install_game(drive, sink, request);
   const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -2446,8 +2401,8 @@ int run_install_pipeline_self_test() {
     if (install_game(drive, *local, request).status != "already") return fail("RAR 游戏叠完补丁后没有显示已安装");
   }
 
-  if (const int code = prefetch_tests()) return code;
-  if (const int code = tuning_tests()) return code;
+  if (const int code = download_tests()) return code;
+  if (const int code = download_sim_tests()) return code;
   if (const int code = speed_test_tests()) return code;
   if (const int code = big_memory_test()) return code;
   if (const int code = install_clock_test()) return code;
@@ -2466,105 +2421,9 @@ int run_install_pipeline_self_test() {
   return 0;
 }
 
-namespace {
-
-// 模拟网盘下载：首包延迟、带宽上限、偶尔卡顿。
-class SimDrive final : public DrivePlugin {
- public:
-  SimDrive(double mb_per_second, std::int64_t size) : rate_(mb_per_second * 1024 * 1024), size_(size) {}
-  std::string id() const override { return "sim"; }
-  std::string display_name() const override { return "sim"; }
-  LoginChallenge start_login() override { return {}; }
-  LoginPoll poll_login(const LoginChallenge&) override { return {}; }
-  bool session_valid() override { return true; }
-  void logout() override {}
-  std::vector<DriveEntry> list(const std::string&, std::string*) override { return {}; }
-  ReadResult read_at(const std::string&, std::int64_t, std::size_t) override { return {}; }
-  std::unique_ptr<ByteStream> open_stream(const std::string&, std::int64_t offset, std::string*, AbortSignal*) override {
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    return std::make_unique<Stream>(rate_, size_ - offset);
-  }
-
- private:
-  class Stream final : public ByteStream {
-   public:
-    Stream(double rate, std::int64_t left) : rate_(rate), left_(left), ready_(std::chrono::steady_clock::now()) {}
-    std::size_t read(std::uint8_t*, std::size_t size, std::string*) override {
-      const std::size_t n = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), left_));
-      if (n == 0) return 0;
-      sent_ += static_cast<std::int64_t>(n);
-      left_ -= static_cast<std::int64_t>(n);
-      double cost = static_cast<double>(n) / rate_;
-      // 每 48 MB 卡 400 ms，模拟 CDN 抖动。
-      if (sent_ / (48 << 20) != (sent_ - static_cast<std::int64_t>(n)) / (48 << 20)) cost += 0.4;
-      // 两次读之间隔得久，说明是缓冲满了在等，这段带宽浪费掉，不能攒着用。
-      const auto now = std::chrono::steady_clock::now();
-      if (now - returned_ > std::chrono::milliseconds(5)) ready_ = std::max(ready_, now);
-      ready_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(cost));
-      std::this_thread::sleep_until(ready_);
-      returned_ = std::chrono::steady_clock::now();
-      return n;
-    }
-
-   private:
-    double rate_;
-    std::int64_t left_;
-    std::int64_t sent_ = 0;
-    std::chrono::steady_clock::time_point ready_;
-    std::chrono::steady_clock::time_point returned_;
-  };
-
-  double rate_;
-  std::int64_t size_;
-};
-
-}  // namespace
-
-int run_prefetch_bench() {
-  constexpr std::int64_t kSize = 256ll << 20;
-  struct Scene {
-    double download;
-    double write;
-  };
-  struct Config {
-    std::size_t block;
-    std::size_t blocks;
-  };
-  const Scene scenes[] = {{40.0, 60.0}, {60.0, 60.0}};
-  const Config configs[] = {{256u << 10, 1}, {4u << 20, 1}, {4u << 20, 2}, {4u << 20, 4}, {4u << 20, 8}, {4u << 20, 16}, {8u << 20, 8}};
-  for (const auto& scene : scenes) {
-    std::cout << "下载 " << scene.download << " MB/s（每 48 MB 卡 0.4 秒），写入 " << scene.write
-              << " MB/s（每 32 MB 换文件卡 0.3 秒），共 " << (kSize >> 20) << " MB，理想 "
-              << static_cast<double>(kSize >> 20) / scene.download + 5 * 0.4 << " 秒\n";
-    for (const auto& config : configs) {
-      SimDrive drive(scene.download, kSize);
-      PrefetchOptions options;
-      options.connections = 1;
-      options.block_size = config.block;
-      options.max_blocks = config.blocks;
-      PrefetchReader reader(drive, "x", kSize, nullptr, options);
-      std::vector<std::uint8_t> buffer(64u << 10);
-      const auto start = std::chrono::steady_clock::now();
-      auto ready = start;
-      std::int64_t consumed = 0;
-      while (true) {
-        std::string error;
-        const auto asked = std::chrono::steady_clock::now();
-        const std::size_t got = reader.read(buffer.data(), buffer.size(), &error);
-        if (got == 0) break;
-        const auto now = std::chrono::steady_clock::now();
-        if (now - asked > std::chrono::milliseconds(2)) ready = std::max(ready, now);
-        consumed += static_cast<std::int64_t>(got);
-        double cost = static_cast<double>(got) / (scene.write * 1024 * 1024);
-        if (consumed / (32 << 20) != (consumed - static_cast<std::int64_t>(got)) / (32 << 20)) cost += 0.3;
-        ready += std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(cost));
-        std::this_thread::sleep_until(ready);
-      }
-      const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-      std::cout << "  块 " << (config.block >> 10) << " KB × " << config.blocks << " = "
-                << ((config.block * config.blocks) >> 10) << " KB：" << seconds << " 秒，"
-                << static_cast<double>(kSize >> 20) / seconds << " MB/s" << std::endl;
-    }
+int run_download_bench() {
+  for (const SimScenario& scenario : download_sim_scenarios()) {
+    std::cout << describe_sim(scenario, run_download_sim(scenario)) << std::flush;
   }
   return 0;
 }

@@ -3,7 +3,7 @@
 #include "install_clock.hpp"
 #include "install_common.hpp"
 #include "panplay/library.hpp"
-#include "panplay/prefetch.hpp"
+#include "panplay/download.hpp"
 #include "panplay/trace.hpp"
 
 #if defined(_WIN32)
@@ -40,7 +40,6 @@ struct VolumeState {
   std::int64_t pos = 0;
   std::int64_t splice_at = -1;
   std::int64_t splice_to = 0;
-  std::unique_ptr<panplay::PrefetchReader> reader;
 
   std::int64_t visible_size() const { return splice_at >= 0 ? size - (splice_to - splice_at) : size; }
   std::int64_t real(std::int64_t visible) const {
@@ -48,10 +47,15 @@ struct VolumeState {
   }
 };
 
+// 整组分卷（拼过的卷算两段）一个下载会话，UnRAR 看到的各卷位置换算成会话里的逻辑位置，换卷不断流。
 struct RarSession {
   panplay::DrivePlugin* drive = nullptr;
   const panplay::CancelToken* cancel = nullptr;
-  panplay::PrefetchOptions prefetch;
+  panplay::DownloadOptions download;
+  std::unique_ptr<panplay::DownloadSession> stream;
+  // 每卷在会话里的起点。
+  std::vector<std::int64_t> logical;
+  std::uint64_t dictionary = 0;
   std::function<void(std::int64_t)> on_bytes;
   std::chrono::steady_clock::time_point bytes_reported{};
   std::vector<VolumeState> volumes;
@@ -141,10 +145,6 @@ int claim_name(const wchar_t* name) {
   const std::string wanted = lower_copy(base_name(name));
   for (std::size_t i = 0; i < session->volumes.size(); ++i) {
     if (lower_copy(session->volumes[i].name) == wanted) {
-      // 只留要换到的这卷的预读器（可能已经提前开始下了），别的卷的缓冲马上还掉。
-      for (std::size_t k = 0; k < session->volumes.size(); ++k) {
-        if (k != i) session->volumes[k].reader.reset();
-      }
       session->index = static_cast<int>(i);
       session->volumes[i].pos = 0;
       return 1;
@@ -255,10 +255,10 @@ int CALLBACK rar_callback(UINT msg, LPARAM user, LPARAM p1, LPARAM p2) {
 struct SessionGuard {
   RarSession state;
   SessionGuard(panplay::DrivePlugin& drive, const std::vector<panplay::DriveEntry>& parts, const panplay::CancelToken* cancel,
-               const panplay::PrefetchOptions& prefetch) {
+               const panplay::DownloadOptions& download) {
     state.drive = &drive;
     state.cancel = cancel;
-    state.prefetch = prefetch;
+    state.download = download;
     for (const auto& part : parts) {
       VolumeState volume;
       volume.name = part.name;
@@ -316,6 +316,27 @@ std::string process_failure(const std::string& fallback) {
   return fallback;
 }
 
+// UnRAR 第一次读数据时才开始下载：续装点要先拼好。
+void open_download() {
+  std::vector<panplay::DownloadExtent> extents;
+  session->logical.clear();
+  std::int64_t at = 0;
+  for (const VolumeState& volume : session->volumes) {
+    session->logical.push_back(at);
+    if (volume.splice_at >= 0) {
+      extents.push_back(panplay::DownloadExtent{volume.file_id, 0, volume.splice_at, volume.size});
+      extents.push_back(panplay::DownloadExtent{volume.file_id, volume.splice_to, volume.size - volume.splice_to, volume.size});
+    } else {
+      extents.push_back(panplay::DownloadExtent{volume.file_id, 0, volume.size, volume.size});
+    }
+    at += volume.visible_size();
+  }
+  session->stream = std::make_unique<panplay::DownloadSession>(*session->drive, std::move(extents), session->cancel,
+                                                               session->download);
+  if (session->dictionary > 0) session->stream->set_dictionary(session->dictionary);
+  PANPLAY_DEBUG("RAR " + std::to_string(session->volumes.size()) + " 卷用下载 #" + std::to_string(session->stream->id()));
+}
+
 }  // namespace
 
 extern "C" int panplay_unrar_claim(const wchar_t* name) { return claim_name(name); }
@@ -326,21 +347,16 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
   }
   VolumeState& volume = session->volumes[static_cast<std::size_t>(session->index)];
   if (volume.pos >= volume.visible_size() || size == 0) return 0;
-  if (!volume.reader) {
-    volume.reader = std::make_unique<panplay::PrefetchReader>(*session->drive, volume.file_id, volume.size, session->cancel,
-                                                              session->prefetch);
-    PANPLAY_DEBUG("RAR 分卷 " + volume.name + " 用预读 #" + std::to_string(volume.reader->id()));
-  }
-  if (volume.reader->position() != volume.real(volume.pos)) {
-    if (auto error = volume.reader->seek(volume.real(volume.pos)); !error.empty()) {
+  if (!session->stream) open_download();
+  const std::int64_t logical = session->logical[static_cast<std::size_t>(session->index)] + volume.pos;
+  if (session->stream->position() != logical) {
+    if (auto error = session->stream->seek(logical); !error.empty()) {
       session->read_error = error;
       return -1;
     }
   }
-  // 拼过的卷在卷头和续装点之间不连续，一次只读到卷头结尾，下一次再从续装点读。
-  const std::int64_t contiguous_end =
-      volume.splice_at >= 0 && volume.pos < volume.splice_at ? volume.splice_at : volume.visible_size();
-  const auto want = static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), contiguous_end - volume.pos));
+  const auto want =
+      static_cast<std::size_t>(std::min<std::int64_t>(static_cast<std::int64_t>(size), volume.visible_size() - volume.pos));
   auto* out = static_cast<std::uint8_t*>(data);
   std::size_t filled = 0;
   const auto started = std::chrono::steady_clock::now();
@@ -351,7 +367,7 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
   } timer{started};
   while (filled < want) {
     std::string error;
-    const std::size_t got = volume.reader->read(out + filled, want - filled, &error);
+    const std::size_t got = session->stream->read(out + filled, want - filled, &error);
     if (!error.empty()) {
       session->read_error = error;
       return -1;
@@ -361,15 +377,6 @@ extern "C" int panplay_unrar_read(void* data, size_t size) {
   }
   volume.pos += static_cast<std::int64_t>(filled);
   report_bytes(false);
-  // 这卷都派给连接了，下一卷提前开始下，UnRAR 换卷时不用等连接建立。
-  const std::size_t next = static_cast<std::size_t>(session->index) + 1;
-  if (next < session->volumes.size() && !session->volumes[next].reader && volume.reader->fully_assigned()) {
-    VolumeState& upcoming = session->volumes[next];
-    upcoming.reader = std::make_unique<panplay::PrefetchReader>(*session->drive, upcoming.file_id, upcoming.size,
-                                                                session->cancel, session->prefetch);
-    upcoming.reader->start();
-    PANPLAY_DEBUG("RAR 分卷 " + upcoming.name + " 提前开始下载，用预读 #" + std::to_string(upcoming.reader->id()));
-  }
   return static_cast<int>(filled);
 }
 
@@ -484,7 +491,7 @@ std::vector<ListedRarEntry> entries_before(const RarExtract& options, const std:
 std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vector<DriveEntry>& parts,
                          const RarExtract& options, std::vector<FinishedFile>* done,
                          std::vector<ListedRarEntry>* listed, const ResumeAt* resume, bool* start_over) {
-  SessionGuard guard(drive, parts, options.cancel, options.prefetch);
+  SessionGuard guard(drive, parts, options.cancel, options.download);
   guard.state.on_bytes = options.on_bytes;
   if (resume != nullptr) {
     VolumeState& volume = guard.state.volumes[static_cast<std::size_t>(resume->volume)];
@@ -577,6 +584,8 @@ std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vecto
       largest_dictionary = dictionary;
       InstallClock::note_dictionary(dictionary);
       PANPLAY_DEBUG("RAR 字典 " + std::to_string(dictionary >> 20) + " MB" + (solid ? "（固实）" : "") + "，解压需要这么多内存");
+      guard.state.dictionary = dictionary;
+      if (guard.state.stream) guard.state.stream->set_dictionary(dictionary);
     }
     if (options.max_dictionary > 0 && dictionary > options.max_dictionary) {
       failure = dictionary_refusal("RAR", dictionary, options.max_dictionary);

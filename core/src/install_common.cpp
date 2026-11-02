@@ -81,71 +81,36 @@ std::string read_span(DrivePlugin& drive, const std::vector<ArchiveVolume>& volu
   return out->size() == size ? "" : "压缩包意外结束";
 }
 
-VolumeStream::VolumeStream(DrivePlugin& drive, std::vector<ArchiveVolume> volumes, const CancelToken* cancel,
-                           PrefetchOptions options)
-    : drive_(drive), volumes_(std::move(volumes)), cancel_(cancel), options_(options) {}
+std::vector<DownloadExtent> volume_extents(const std::vector<ArchiveVolume>& volumes) {
+  std::vector<DownloadExtent> extents;
+  for (const auto& volume : volumes) extents.push_back(DownloadExtent{volume.file_id, 0, volume.size, volume.size});
+  return extents;
+}
+
+VolumeStream::VolumeStream(DrivePlugin& drive, const std::vector<ArchiveVolume>& volumes, const CancelToken* cancel,
+                           DownloadOptions options)
+    : session_(drive, volume_extents(volumes), cancel, std::move(options)) {}
 
 std::string VolumeStream::seek(std::int64_t position) {
-  for (std::size_t i = 0; i < volumes_.size(); ++i) {
-    const ArchiveVolume& volume = volumes_[i];
-    if (position < volume.start || position >= volume.start + volume.size) continue;
-    if (i != index_ || !reader_) open_volume(i);
-    position_ = position;
-    return reader_->seek(position - volume.start);
-  }
-  return "压缩包偏移越界";
+  if (position < 0 || position >= session_.size()) return "压缩包偏移越界";
+  return session_.seek(position);
 }
 
 std::string VolumeStream::read(std::uint8_t* dst, std::size_t size) {
   std::size_t filled = 0;
   while (filled < size) {
-    if (!reader_ || reader_->position() >= reader_->size()) {
-      const std::size_t next = reader_ ? index_ + 1 : 0;
-      if (next >= volumes_.size()) return "压缩包意外结束";
-      open_volume(next);
-      continue;
-    }
     std::string error;
-    const std::size_t got = reader_->read(dst + filled, size - filled, &error);
+    const std::size_t got = session_.read(dst + filled, size - filled, &error);
     if (!error.empty()) return error;
-    if (got == 0) {
-      if (index_ + 1 >= volumes_.size()) return "压缩包意外结束";
-      open_volume(index_ + 1);
-      continue;
-    }
+    if (got == 0) return "压缩包意外结束";
     filled += got;
-    position_ += static_cast<std::int64_t>(got);
   }
-  start_next_if_due();
   return "";
-}
-
-void VolumeStream::start_next_if_due() {
-  if (next_ || !reader_ || index_ + 1 >= volumes_.size() || !reader_->fully_assigned()) return;
-  const ArchiveVolume& volume = volumes_[index_ + 1];
-  next_ = std::make_unique<PrefetchReader>(drive_, volume.file_id, volume.size, cancel_, options_);
-  next_->start();
-  PANPLAY_DEBUG("第 " + std::to_string(index_ + 2) + "/" + std::to_string(volumes_.size()) + " 卷提前开始下载，用预读 #" +
-                std::to_string(next_->id()));
 }
 
 std::string VolumeStream::skip(std::int64_t size) {
   if (size == 0) return "";
-  return seek(position_ + size);
-}
-
-void VolumeStream::open_volume(std::size_t index) {
-  reader_.reset();
-  if (next_ && index == index_ + 1) {
-    reader_ = std::move(next_);
-  } else {
-    next_.reset();
-    reader_ = std::make_unique<PrefetchReader>(drive_, volumes_[index].file_id, volumes_[index].size, cancel_, options_);
-  }
-  index_ = index;
-  PANPLAY_DEBUG("第 " + std::to_string(index + 1) + "/" + std::to_string(volumes_.size()) + " 卷用预读 #" +
-                std::to_string(reader_->id()));
-  position_ = volumes_[index].start;
+  return seek(position() + size);
 }
 
 namespace {

@@ -1382,7 +1382,9 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
       request.cancel = cancel;
       request.skip_sets = load_skipped_sets(path);
       request.max_dictionary = settings.max_dictionary_mb << 20;
+      request.download.memory = download_memory();
       result = panplay::install_game(*drive, *sink, request);
+      save_download_memory();
     }
   } catch (const std::exception& ex) {
     result.status = "error";

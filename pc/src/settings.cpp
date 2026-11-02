@@ -1,6 +1,7 @@
 #include "settings.hpp"
 
 #include "panplay/app_paths.hpp"
+#include "panplay/download.hpp"
 #include "panplay/drive.hpp"
 #include "panplay/json.hpp"
 #include "panplay/storage_path.hpp"
@@ -277,6 +278,42 @@ void write_progress_unlocked(const std::map<std::string, InstallProgress>& recor
 }
 
 }  // namespace
+
+namespace {
+
+std::filesystem::path download_memory_path() { return app_dir() / "download.json"; }
+
+}  // namespace
+
+std::shared_ptr<panplay::DownloadMemory> download_memory() {
+  static const std::shared_ptr<panplay::DownloadMemory> memory = [] {
+    auto loaded = std::make_shared<panplay::DownloadMemory>();
+    std::ifstream in(download_memory_path(), std::ios::binary);
+    if (in) {
+      std::stringstream buffer;
+      buffer << in.rdbuf();
+      panplay::load_download_memory(buffer.str(), loaded.get());
+    }
+    return loaded;
+  }();
+  return memory;
+}
+
+void save_download_memory() {
+  static std::mutex save_mu;
+  std::lock_guard<std::mutex> lock(save_mu);
+  const std::string json = panplay::download_memory_json(*download_memory());
+  std::error_code ec;
+  std::filesystem::create_directories(app_dir(), ec);
+  std::filesystem::path tmp = download_memory_path();
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    out << json;
+    if (!out) return;
+  }
+  std::filesystem::rename(tmp, download_memory_path(), ec);
+}
 
 std::optional<InstallProgress> load_install_progress(const std::string& game_path) {
   std::lock_guard<std::mutex> lock(progress_mu);

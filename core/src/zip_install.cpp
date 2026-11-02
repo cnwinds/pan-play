@@ -4,7 +4,6 @@
 #include "install_common.hpp"
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
-#include "panplay/prefetch.hpp"
 #include "panplay/trace.hpp"
 
 #include <zlib.h>
@@ -767,9 +766,9 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
     for (const auto& part : source.set->parts) result.bytes_total += part.size;
     log_info(std::string("解压 ") + (source.rar ? "RAR" : source.sevenzip ? "7z" : "ZIP") + " " + source.set->parts.front().name +
           "，" + std::to_string(source.set->parts.size()) + " 卷共 " +
-          std::to_string((result.bytes_total - source.start) >> 20) + " MB，预读 " +
-          std::to_string(request.prefetch.connections) + " 条连接 × " + std::to_string(request.prefetch.block_size >> 20) +
-          " MB，" + memory_summary());
+          std::to_string((result.bytes_total - source.start) >> 20) + " MB，下载" +
+          (request.download.adaptive ? "最多 " : "固定 ") + std::to_string(request.download.max_connections) + " 条连接，" +
+          memory_summary());
     if (source.rar) {
       RarExtract options;
       options.staging_root = staging_root;
@@ -777,7 +776,7 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
       options.written = &written;
       options.stop_after_output_bytes = request.stop_after_output_bytes;
       options.cancel = request.cancel;
-      options.prefetch = request.prefetch;
+      options.download = request.download;
       options.staging_prefix = source.prefix;
       options.max_dictionary = request.max_dictionary;
       options.finished_dirs = &done_dirs;
@@ -814,7 +813,7 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
       options.written = &written;
       options.stop_after_output_bytes = request.stop_after_output_bytes;
       options.cancel = request.cancel;
-      options.prefetch = request.prefetch;
+      options.download = request.download;
       options.targets.resize(source.seven.files.size());
       for (const auto& member : source.members) {
         if (member.directory || member.name.compare(0, source.root.size(), source.root) != 0) continue;
@@ -840,7 +839,9 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
     }
     std::sort(ordered.begin(), ordered.end(),
               [](const Member* left, const Member* right) { return left->local_offset < right->local_offset; });
-    VolumeStream stream(drive, source.volumes, request.cancel, request.prefetch);
+    VolumeStream stream(drive, source.volumes, request.cancel, request.download);
+    // Deflate 的窗口只有 32 KB。
+    stream.set_dictionary(32u << 10);
     for (const Member* member : ordered) {
       if (!member->directory) enter_entry(already_done(context, *member));
       const std::string zip_error = extract_member(stream, context, *member, &done);
@@ -1084,12 +1085,12 @@ int run_scan_cli(DrivePlugin& drive, const std::string& dir) {
 int run_install_cli(DrivePlugin& drive, int argc, char** argv) {
   if (argc < 3) {
     std::cerr << "用法: panplay install <网盘游戏目录> --to <本机目录或 ftp://主机:端口> [--prefix /data/homebrew]"
-                 " [--connections N] [--block-mb M] [--blocks K]\n";
+                 " [--connections 最多几条] [--fixed 固定几条] [--buffer-mb 缓冲上限]\n";
     return 1;
   }
   std::string to;
   std::string prefix = "/data/homebrew";
-  PrefetchOptions prefetch;
+  DownloadOptions download;
   for (int i = 3; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--to" && i + 1 < argc) {
@@ -1097,11 +1098,12 @@ int run_install_cli(DrivePlugin& drive, int argc, char** argv) {
     } else if (arg == "--prefix" && i + 1 < argc) {
       prefix = argv[++i];
     } else if (arg == "--connections" && i + 1 < argc) {
-      prefetch.connections = std::max(1, std::atoi(argv[++i]));
-    } else if (arg == "--block-mb" && i + 1 < argc) {
-      prefetch.block_size = static_cast<std::size_t>(std::max(1, std::atoi(argv[++i]))) << 20;
-    } else if (arg == "--blocks" && i + 1 < argc) {
-      prefetch.max_blocks = static_cast<std::size_t>(std::max(1, std::atoi(argv[++i])));
+      download.max_connections = std::max(1, std::atoi(argv[++i]));
+    } else if (arg == "--fixed" && i + 1 < argc) {
+      download.max_connections = std::max(1, std::atoi(argv[++i]));
+      download.adaptive = false;
+    } else if (arg == "--buffer-mb" && i + 1 < argc) {
+      download.window_max = static_cast<std::int64_t>(std::max(4, std::atoi(argv[++i]))) << 20;
     } else {
       std::cerr << "无法识别的参数\n";
       return 1;
@@ -1126,10 +1128,7 @@ int run_install_cli(DrivePlugin& drive, int argc, char** argv) {
   InstallRequest request;
   request.source_dir = argv[2];
   request.dest_prefix = prefix;
-  if (prefetch.max_blocks < static_cast<std::size_t>(prefetch.connections) * 2) {
-    prefetch.max_blocks = static_cast<std::size_t>(prefetch.connections) * 2;
-  }
-  request.prefetch = prefetch;
+  request.download = download;
   const InstallResult result = install_game(drive, *sink, request);
   if (result.status == "error") {
     std::cerr << result.message << "\n";

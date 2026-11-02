@@ -1,8 +1,8 @@
 #pragma once
 
+#include "panplay/download.hpp"
 #include "panplay/drive.hpp"
 #include "panplay/install.hpp"
-#include "panplay/prefetch.hpp"
 #include "panplay/sink.hpp"
 
 #include <chrono>
@@ -34,31 +34,25 @@ std::vector<ArchiveVolume> archive_volumes(const std::vector<DriveEntry>& parts)
 std::string read_span(DrivePlugin& drive, const std::vector<ArchiveVolume>& volumes, std::int64_t position, std::size_t size,
                       std::vector<std::uint8_t>* out);
 
-// 在整组分卷上顺序读，每卷一个预读器。
+// 在整组分卷上顺序读：整组一个下载会话，换卷不断流（ADR 0009）。
 class VolumeStream {
  public:
-  VolumeStream(DrivePlugin& drive, std::vector<ArchiveVolume> volumes, const CancelToken* cancel, PrefetchOptions options);
+  VolumeStream(DrivePlugin& drive, const std::vector<ArchiveVolume>& volumes, const CancelToken* cancel,
+               DownloadOptions options);
 
-  std::int64_t position() const { return position_; }
+  std::int64_t position() const { return session_.position(); }
   std::string seek(std::int64_t position);
   // 读满 size 字节，读不满算出错。
   std::string read(std::uint8_t* dst, std::size_t size);
   std::string skip(std::int64_t size);
+  void set_dictionary(std::uint64_t bytes) { session_.set_dictionary(bytes); }
 
  private:
-  void open_volume(std::size_t index);
-  void start_next_if_due();
-
-  DrivePlugin& drive_;
-  std::vector<ArchiveVolume> volumes_;
-  const CancelToken* cancel_;
-  PrefetchOptions options_;
-  std::size_t index_ = 0;
-  std::unique_ptr<PrefetchReader> reader_;
-  // 当前卷都派给连接以后提前开始下的下一卷。
-  std::unique_ptr<PrefetchReader> next_;
-  std::int64_t position_ = 0;
+  DownloadSession session_;
 };
+
+// 整组分卷对应的下载段，每卷一段。
+std::vector<DownloadExtent> volume_extents(const std::vector<ArchiveVolume>& volumes);
 
 // 索尼的 .pkg 安装包要在主机上用安装工具安装，解压到 homebrew 里主机和 ShadowMountPlus 都不认。
 // 压缩包里没有 sce_sys、却有这么大的 .pkg，就当作安装包拒绝；小的 .pkg 可能是游戏自己的数据文件。

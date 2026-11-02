@@ -681,7 +681,8 @@ std::string extract_7z_entries(DrivePlugin& drive, InstallSink& sink, const std:
     return archive.folders[a].pack_offset < archive.folders[b].pack_offset;
   });
 
-  VolumeStream stream(drive, archive_volumes(parts), options.cancel, options.prefetch);
+  VolumeStream stream(drive, archive_volumes(parts), options.cancel, options.download);
+  stream.set_dictionary(largest);
   constexpr std::size_t kChunk = 256u << 10;
   std::vector<std::uint8_t> buffer;
   double wait_seconds = 0;

@@ -2,7 +2,7 @@
 
 #include "panplay/drive.hpp"
 #include "panplay/library.hpp"
-#include "panplay/prefetch.hpp"
+#include "panplay/download.hpp"
 #include "panplay/sink.hpp"
 
 #include <cstdint>
@@ -48,7 +48,7 @@ struct InstallRequest {
   // 扫描和逐个文件完成时回调。安装结束前就会调用，方便界面不必等到整包结束。
   std::function<void(const InstallResult&)> on_progress;
   const CancelToken* cancel = nullptr;
-  PrefetchOptions prefetch;
+  DownloadOptions download;
   // 用户选了不装的压缩包组（按 archive_set_id）。是否已安装、有没有更新也只看没跳过的。
   std::set<std::string> skip_sets;
   // RAR / 7z 的字典超过这么多字节就拒绝安装，0 是不限制。
@@ -89,7 +89,7 @@ struct RarExtract {
   std::int64_t* written = nullptr;
   std::int64_t stop_after_output_bytes = -1;
   const CancelToken* cancel = nullptr;
-  PrefetchOptions prefetch;
+  DownloadOptions download;
   // 解压到暂存区时加在压缩包内路径前面（带结尾斜杠）；进度日志里记的也是加了前缀的名字。
   std::string staging_prefix;
   std::function<void(const std::vector<FinishedFile>& done)> on_file_done;
@@ -155,7 +155,7 @@ struct SevenZipExtract {
   std::int64_t* written = nullptr;
   std::int64_t stop_after_output_bytes = -1;
   const CancelToken* cancel = nullptr;
-  PrefetchOptions prefetch;
+  DownloadOptions download;
   // 按 SevenZipArchive::files 的下标给出暂存区里的路径；空的不装。
   std::vector<std::string> targets;
   // 上次已装好的文件（暂存区路径 -> 大小和 CRC），这次只核对后跳过。
@@ -192,6 +192,7 @@ std::unique_ptr<InstallSink> open_destination(const Destination& destination, st
 int run_scan_cli(DrivePlugin& drive, const std::string& dir);
 int run_install_cli(DrivePlugin& drive, int argc, char** argv);
 int run_install_pipeline_self_test();
-int run_prefetch_bench();
+// 用模拟的网络和解压器跑一遍下载调度的各个场景，打印用时和请求数（ADR 0009）。
+int run_download_bench();
 
 }  // namespace panplay

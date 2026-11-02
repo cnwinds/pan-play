@@ -3,10 +3,15 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <vector>
+
+namespace panplay {
+struct DownloadMemory;
+}
 
 // 每个网盘插件各存一份，切换插件不会丢。
 struct DriveSettings {
@@ -67,6 +72,10 @@ struct InstallProgress {
   std::int64_t bytes_total = 0;
   int files_done = 0;
 };
+
+// 下载用几条连接的结论（ADR 0009），本进程各次安装共用一份，第一次用时从 download.json 读。
+std::shared_ptr<panplay::DownloadMemory> download_memory();
+void save_download_memory();
 
 std::optional<InstallProgress> load_install_progress(const std::string& game_path);
 // 和已记下的取较大值：续装开头核对已装文件时进度会从头走一遍，不能把记录往回改。
