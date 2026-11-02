@@ -1500,6 +1500,32 @@ int variant_test() {
   if (with_loose.size() != 4 || !with_loose.back().format.empty() || with_loose.back().path != "/apps/panplay/Var PPSA41000") {
     return fail("游戏目录里直接放的压缩包没有算成一个变体");
   }
+  {
+    const auto bytes_in = [&](const std::string& dir) {
+      std::int64_t total = 0;
+      for (const auto& file : collect_archives(drive, dir, &error)) total += file.size;
+      return total;
+    };
+    const auto sizes = measure_game(drive, "/apps/panplay/Var PPSA41000", &error);
+    if (!error.empty() || sizes.size() != with_loose.size()) return fail("分了格式的游戏量出的变体数不对: " + error);
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+      if (sizes[i].format != with_loose[i].format || sizes[i].path != with_loose[i].path ||
+          sizes[i].bytes <= 0 || sizes[i].bytes != bytes_in(sizes[i].path)) {
+        return fail("分了格式的游戏量出的容量不对: " + sizes[i].path);
+      }
+    }
+    const auto game_zip = make_zip({{"eboot.bin", folder, true}}, {}).front();
+    const auto patch_zip = make_zip({{"patch.bin", image, false}}, {}).front();
+    FakeDrive plain;
+    plain.add("/apps/panplay/Plain PPSA41001/game.zip", game_zip);
+    plain.add("/apps/panplay/Plain PPSA41001/补丁/patch.zip", patch_zip);
+    plain.add("/apps/panplay/Plain PPSA41001/readme.txt", {1, 2, 3});
+    const auto one = measure_game(plain, "/apps/panplay/Plain PPSA41001", &error);
+    if (!error.empty() || one.size() != 1 || !one[0].format.empty() || one[0].path != "/apps/panplay/Plain PPSA41001" ||
+        one[0].bytes != static_cast<std::int64_t>(game_zip.size() + patch_zip.size())) {
+      return fail("没分格式的游戏量出的容量不对（要算上补丁子目录、不算别的文件）: " + error);
+    }
+  }
 
   MemorySink sink;
   InstallRequest request;

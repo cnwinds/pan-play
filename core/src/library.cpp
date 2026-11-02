@@ -237,10 +237,12 @@ std::vector<ArchiveSet> group_archives(const std::vector<DriveEntry>& files) {
   return sets;
 }
 
-std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& dir, std::string* error) {
+namespace {
+
+// entries 是已经列出的 dir 下的子项，只再列各个子目录。
+std::vector<DriveEntry> archives_in(DrivePlugin& drive, const std::string& dir, const std::vector<DriveEntry>& entries,
+                                    std::string* error) {
   std::vector<DriveEntry> files;
-  const auto entries = drive.list(dir, error);
-  if (error && !error->empty()) return {};
   for (const auto& entry : entries) {
     const std::string path = entry.path.empty() ? join_storage_path(dir, entry.name) : entry.path;
     if (entry.is_dir) {
@@ -261,10 +263,8 @@ std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& 
   return files;
 }
 
-std::vector<GameVariant> list_variants(DrivePlugin& drive, const std::string& game_dir, std::string* error) {
+std::vector<GameVariant> variants_in(const std::string& game_dir, const std::vector<DriveEntry>& entries) {
   std::vector<GameVariant> variants;
-  const auto entries = drive.list(game_dir, error);
-  if (error && !error->empty()) return {};
   bool loose = false;
   for (const auto& entry : entries) {
     if (!entry.is_dir) {
@@ -281,6 +281,37 @@ std::vector<GameVariant> list_variants(DrivePlugin& drive, const std::string& ga
   });
   if (!variants.empty() && loose) variants.push_back({"", game_dir});
   return variants;
+}
+
+}  // namespace
+
+std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& dir, std::string* error) {
+  const auto entries = drive.list(dir, error);
+  if (error && !error->empty()) return {};
+  return archives_in(drive, dir, entries, error);
+}
+
+std::vector<GameVariant> list_variants(DrivePlugin& drive, const std::string& game_dir, std::string* error) {
+  const auto entries = drive.list(game_dir, error);
+  if (error && !error->empty()) return {};
+  return variants_in(game_dir, entries);
+}
+
+std::vector<VariantSize> measure_game(DrivePlugin& drive, const std::string& game_dir, std::string* error) {
+  const auto entries = drive.list(game_dir, error);
+  if (error && !error->empty()) return {};
+  auto variants = variants_in(game_dir, entries);
+  if (variants.empty()) variants.push_back({"", game_dir});
+  std::vector<VariantSize> sizes;
+  for (const auto& variant : variants) {
+    const auto files = variant.path == game_dir ? archives_in(drive, game_dir, entries, error)
+                                                : collect_archives(drive, variant.path, error);
+    if (error && !error->empty()) return {};
+    VariantSize size{variant.format, variant.path};
+    for (const auto& file : files) size.bytes += file.size;
+    sizes.push_back(std::move(size));
+  }
+  return sizes;
 }
 
 std::string archive_sets_signature(const std::vector<ArchiveSet>& sets) {

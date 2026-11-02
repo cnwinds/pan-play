@@ -41,6 +41,15 @@ std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& 
 // 游戏目录下的各个变体，按 exfat、folder、其他的顺序。没分格式时为空；分了格式、游戏目录里又直接放着压缩包时，
 // 游戏目录本身也算一个（format 为空），排在最后。
 std::vector<GameVariant> list_variants(DrivePlugin& drive, const std::string& game_dir, std::string* error);
+
+struct VariantSize {
+  std::string format;
+  std::string path;
+  std::int64_t bytes = 0;
+};
+// 游戏目录里压缩包一共多大，只列目录、不读文件。没分格式时只有游戏目录本身一项；分了格式时按 list_variants 的
+// 顺序每个变体一项。
+std::vector<VariantSize> measure_game(DrivePlugin& drive, const std::string& game_dir, std::string* error);
 std::vector<GameFolder> scan_library(DrivePlugin& drive, const std::string& root, std::string* error);
 
 // 一组压缩包的身份：各分卷的文件名和大小。安装记录、补丁选择都按它认。
