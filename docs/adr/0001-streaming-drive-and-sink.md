@@ -45,6 +45,8 @@ virtual std::unique_ptr<ByteStream> open_stream(const std::string& file_id, std:
 
 ### 2. 预读：下载和解压、写入并行
 
+> 已由 [ADR 0009](0009-download-session.md) 取代：预读层换成一组分卷一个下载会话（`DownloadSession`），缓冲和跳转规则见那里。下面是当时的方案。
+
 在网盘流和解压器之间加一层 `PrefetchReader`：
 
 - 后台线程从 `ByteStream` 读，每块 4 MB，最多攒 8 块（PC 默认 32 MB）。PS5 版可以把块数调小。
@@ -167,6 +169,8 @@ virtual std::unique_ptr<FileWriter> open_writer(const std::string& path, std::st
 
 ## 诊断日志
 
+> 预读层那几条（分卷和预读编号、预读配置、提前开始下载、`预读 #N` 的近况和结束行、逐条请求、跳转重来）已由 [ADR 0009](0009-download-session.md) 的下载会话日志取代，字段含义基本沿用；「提前开始下载」已去掉。HTTP 层和安装耗时那几条不变。
+
 为了按实测决定连接数和请求长度，打开「详细日志」后预读层和 PS5 的 HTTP 层会记下面这些。界面上的速度是解压器读到的位置，等于"下载"和"解压加写入"里较慢的那个，单看它分不出瓶颈在哪，要看这里。
 
 - `第 2/5 卷用预读 #7`、`RAR 分卷 xxx.part2.rar 用预读 #7`：分卷和预读编号的对应。
@@ -226,9 +230,10 @@ virtual std::unique_ptr<FileWriter> open_writer(const std::string& path, std::st
    | 4 MB × 16 | 8.9 秒 | 7.0 秒 |
 
    32 MB 已经能盖住两边的卡顿，再大没有收益。PS5 版内存紧时可以降到 4 MB × 4。
+   → 已由 [ADR 0009](0009-download-session.md) 取代：缓冲按总速度 × 6 秒定，最小 32 MB，PS5 上限 128 MB（字典小时 256 MB）。`bench-prefetch` 换成按虚拟时间跑的 `bench-sim`。
 3. ~~一个分卷只用一条连接~~ → 改为多连接，默认 8 条，每块 8 MB，最多 16 块（约 128 MB）。单连接实测只有 30～39 MB/s，补上上面几项修复后，下载成了唯一瓶颈。多连接时每条连接领一块，用有界 Range 请求下完；下完的块按偏移顺序交给读取方，解压看到的仍是顺序流，续传仍按文件。
 
    纯下载 20 秒（`panplay bench-download`）：1 条 30～39 MB/s，4 条 36～53，8 条 52～58，16 条 46。
    真实安装 PPSA05106 到本机目录：1 条 55 秒，4 条 32 秒，8 条 26 秒；经 FTP 走服务端 36 秒（改造前 163 秒）。
    多开没有收益，还容易被百度限速，所以不超过 8 条。命令行可用 `--connections`、`--block-mb`、`--blocks` 调整。
-   → 已由 [ADR 0005](0005-adaptive-connections.md) 取代：PS5 上 8 条只是在分主机那边的带宽，现在先用一条连接读到底，一条吃不满、多开确实更快才往上加。
+   → 已由 [ADR 0005](0005-adaptive-connections.md) 取代：PS5 上 8 条只是在分主机那边的带宽，现在先用一条连接读到底，一条吃不满、多开确实更快才往上加。之后又由 [ADR 0009](0009-download-session.md) 取代：一组分卷一个下载会话，命令行改为 `--connections`（上限）、`--fixed`、`--buffer-mb`。
