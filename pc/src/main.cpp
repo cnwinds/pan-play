@@ -161,6 +161,7 @@ void print_usage() {
             << "  panplay self-test\n"
             << "  panplay bench-sim\n"
             << "  panplay bench-download <网盘目录> [秒] [连接数|auto] [缓冲MB]\n"
+            << "  panplay bench-unpack <本机压缩包目录> <装到的目录> [轮数]\n"
             << "  panplay dummy-ftp <端口> <根目录> [--zftpd]\n"
             << "  panplay login\n"
             << "  panplay ls [目录]\n"
@@ -458,6 +459,9 @@ int main(int argc, char** argv) {
     return serve(argc, argv);
   }
   if (command == "bench-sim") return panplay::run_download_bench();
+  if (command == "bench-unpack" && argc >= 4) {
+    return panplay::run_unpack_bench(argv[2], argv[3], argc >= 5 ? std::stoi(argv[4]) : 1);
+  }
   if (command == "bench-download" && argc >= 3) {
     const int connections = argc < 5 ? 0 : std::string(argv[4]) == "auto" ? -1 : std::stoi(argv[4]);
     return bench_download(argv[2], argc >= 4 ? std::stoi(argv[3]) : 20, connections, argc >= 6 ? std::stoi(argv[5]) : 0);

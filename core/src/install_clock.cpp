@@ -185,8 +185,10 @@ void InstallClock::charge(Clock::time_point now) {
 namespace {
 
 // 各项的占比，durations 时再带上各项用了多久。写入带上写了多少、写入时多快，开关文件带上新建了几个文件。
+// disk_ms 不小于 0 表示写盘在另一个线程：写入只是排队，不算写入速度、每个文件多久，有 disk_ms 时改说写盘线程忙了多久。
 template <class Tally>
-std::string describe(const Tally& tally, double all_ms, bool durations) {
+std::string describe(const Tally& tally, double all_ms, bool durations, double disk_ms) {
+  const bool behind = disk_ms >= 0;
   std::string text;
   for (const InstallPhase phase : kReportOrder) {
     const int index = static_cast<int>(phase);
@@ -200,11 +202,12 @@ std::string describe(const Tally& tally, double all_ms, bool durations) {
     }
     if (phase == InstallPhase::write && tally.written > 0) {
       add("写了 " + bytes_text(tally.written));
-      if (ms >= 50) add("写入时 " + rate_text(tally.written, ms));
+      if (!behind && ms >= 50) add("写入时 " + rate_text(tally.written, ms));
+      if (behind && disk_ms >= 50) add("写盘线程忙了 " + seconds_text(disk_ms) + "，平均 " + rate_text(tally.written, disk_ms));
     }
     if (phase == InstallPhase::files && tally.opened > 0) {
       add("新建 " + std::to_string(tally.opened) + " 个文件");
-      if (durations) add("平均每个 " + std::to_string(std::lround(ms / tally.opened)) + " ms");
+      if (durations && !behind) add("平均每个 " + std::to_string(std::lround(ms / tally.opened)) + " ms");
     }
     text += (text.empty() ? "" : "，") + std::string(kPhaseNames[index]) + " " + std::to_string(percent) + "%" +
             (extra.empty() ? "" : "（" + extra + "）");
@@ -233,7 +236,7 @@ InstallPhase InstallClock::switch_to(InstallPhase phase) {
     if (extracted_ && log_enabled(LogLevel::debug)) {
       const double all = sum_ms(window_);
       log_line(LogLevel::debug,
-               "安装耗时（最近 " + seconds_text(all) + "）：" + describe(window_, all, false) + window_details(now));
+               "安装耗时（最近 " + seconds_text(all) + "）：" + describe(window_, all, false, write_behind_ ? 0 : -1) + window_details(now));
     }
     window_ = {};
     window_at_ = now;
@@ -350,7 +353,7 @@ std::string InstallClock::summary(const std::string& name, const std::string& ou
       }
     }
   }
-  return "安装耗时 " + name + "（" + outcome + "）：共 " + seconds_text(all) + "，" + describe(total_, all, true) +
+  return "安装耗时 " + name + "（" + outcome + "）：共 " + seconds_text(all) + "，" + describe(total_, all, true, write_behind_ ? write_behind_() : -1) +
          "；时间大多花在" + (paging ? std::string("等内存换页") : kPhaseNames[static_cast<int>(most)]) + context + cpu;
 }
 

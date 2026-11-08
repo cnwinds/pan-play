@@ -2,6 +2,7 @@
 
 #include "install_clock.hpp"
 #include "install_common.hpp"
+#include "write_behind.hpp"
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
 #include "panplay/trace.hpp"
@@ -1001,7 +1002,12 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
 // 三种格式、本机和 FTP 都在这里统一记安装时间花在哪，结束时写一行总账。
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request) {
   InstallClock clock;
-  const auto timed = timed_sink(sink);
+  std::unique_ptr<WriteBehindSink> behind;
+  if (request.write_behind_bytes > 0) {
+    behind = std::make_unique<WriteBehindSink>(sink, request.write_behind_bytes);
+    clock.watch_write_behind([&behind] { return behind->busy_ms(); });
+  }
+  const auto timed = timed_sink(behind ? static_cast<InstallSink&>(*behind) : sink);
   InstallRequest paced = request;
   if (request.on_progress) {
     paced.on_progress = [&](const InstallResult& snapshot) {
@@ -1011,7 +1017,17 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
       request.on_progress(with_pace);
     };
   }
-  const InstallResult result = install_layers(drive, *timed, paced);
+  InstallResult result = install_layers(drive, *timed, paced);
+  // 收尾的完成标记还排在写盘队列里：写完才算装好。
+  if (behind) {
+    PhaseScope waiting(InstallPhase::write);
+    if (const std::string error = behind->drain(); !error.empty() && result.status == "installed") {
+      result = InstallResult{};
+      result.status = "error";
+      result.message = error;
+      result.auto_resume = !is_disk_full_error(error);
+    }
+  }
   const std::string summary = clock.summary(base_name(request.source_dir), result.status == "installed"     ? "已装好"
                                                                          : result.status == "interrupted" ? "中断"
                                                                                                           : "出错");

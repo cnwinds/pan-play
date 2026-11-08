@@ -53,6 +53,8 @@ struct InstallRequest {
   std::set<std::string> skip_sets;
   // RAR / 7z 的字典超过这么多字节就拒绝安装，0 是不限制。
   std::uint64_t max_dictionary = 0;
+  // 写盘交给另一个线程，解压不用等写完；排队的数据最多这么多字节。0 是解压线程自己同步写。
+  std::size_t write_behind_bytes = 32u << 20;
 };
 
 struct Destination {
@@ -197,5 +199,7 @@ int run_install_cli(DrivePlugin& drive, int argc, char** argv);
 int run_install_pipeline_self_test();
 // 用模拟的网络和解压器跑一遍下载调度的各个场景，打印用时和请求数（ADR 0009）。
 int run_download_bench();
+// 把本地目录里的压缩包当网盘里的一个游戏，轮流用同步写盘和后台写盘装到 out_dir，打印用时。
+int run_unpack_bench(const std::string& archive_dir, const std::string& out_dir, int rounds);
 
 }  // namespace panplay

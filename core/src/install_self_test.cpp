@@ -9,6 +9,7 @@
 #include "download_sim.hpp"
 #include "install_clock.hpp"
 #include "install_common.hpp"
+#include "write_behind.hpp"
 
 #include <zlib.h>
 
@@ -28,6 +29,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1466,6 +1468,81 @@ int zip64_split_test() {
   return 0;
 }
 
+// store 时抛异常的存放位置，其余交给 MemorySink。
+class ThrowingSink final : public InstallSink {
+ public:
+  MemorySink inner;
+  std::unique_ptr<FileWriter> open_writer(const std::string& path, std::int64_t size, std::string* error) override {
+    return inner.open_writer(path, size, error);
+  }
+  std::string ensure_dir(const std::string& path) override { return inner.ensure_dir(path); }
+  std::int64_t file_size(const std::string& path, std::string* error) override { return inner.file_size(path, error); }
+  std::string store(const std::string&, const std::uint8_t*, std::size_t) override { throw std::runtime_error("坏扇区"); }
+  std::string append(const std::string& path, const std::uint8_t* data, std::size_t size) override {
+    return inner.append(path, data, size);
+  }
+  std::string rename_path(const std::string& from, const std::string& to) override { return inner.rename_path(from, to); }
+  std::string read_file(const std::string& path, std::vector<std::uint8_t>* out, std::size_t max_bytes) override {
+    return inner.read_file(path, out, max_bytes);
+  }
+  std::vector<std::string> list_children(const std::string& path, std::string* error) override {
+    return inner.list_children(path, error);
+  }
+  std::string remove_file(const std::string& path) override { return inner.remove_file(path); }
+  std::string remove_dir(const std::string& path) override { return inner.remove_dir(path); }
+  std::string remove_tree(const std::string& path) override { return inner.remove_tree(path); }
+};
+
+int write_behind_test() {
+  const auto data = pattern(300000, 3);
+  const std::uint8_t record[] = {'o', 'k', '\n'};
+  {
+    MemorySink memory;
+    WriteBehindSink behind(memory, 64 * 1024);
+    std::string error;
+    auto writer = behind.open_writer("/g/a.bin", static_cast<std::int64_t>(data.size()), &error);
+    if (!writer || !error.empty()) return fail("后台写盘开不了文件: " + error);
+    for (std::size_t at = 0; at < data.size(); at += 10000) {
+      if (!(error = writer->write(data.data() + at, std::min<std::size_t>(10000, data.size() - at))).empty()) {
+        return fail("后台写盘写入出错: " + error);
+      }
+    }
+    if (!(error = writer->finish()).empty()) return fail("后台写盘关文件出错: " + error);
+    writer.reset();
+    if (!(error = behind.append("/g/journal", record, sizeof(record))).empty()) return fail("后台写盘记进度出错: " + error);
+    if (behind.file_size("/g/a.bin", &error) != static_cast<std::int64_t>(data.size())) return fail("后台写盘查大小前没有等写完");
+    if (!(error = behind.drain()).empty()) return fail("后台写盘收尾出错: " + error);
+    if (memory.files["/g/a.bin"].bytes != data) return fail("后台写盘写出的内容不对");
+    if (memory.files["/g/journal"].size != 3) return fail("后台写盘的进度没有记上");
+  }
+  {
+    MemorySink memory;
+    memory.room = 50000;
+    WriteBehindSink behind(memory, 64 * 1024);
+    std::string error;
+    auto writer = behind.open_writer("/g/a.bin", static_cast<std::int64_t>(data.size()), &error);
+    std::string first;
+    for (std::size_t at = 0; at < data.size() && first.empty(); at += 10000) {
+      first = writer->write(data.data() + at, 10000);
+    }
+    writer.reset();
+    const std::string drained = behind.drain();
+    if (!is_disk_full_error(drained)) return fail("后台写盘写满时没有报空间不够: " + drained);
+    if (behind.append("/g/journal", record, sizeof(record)) != drained) return fail("后台写盘出错后还在接着做");
+    if (memory.files.count("/g/journal") != 0) return fail("后台写盘出错后还记了进度");
+  }
+  {
+    ThrowingSink throwing;
+    WriteBehindSink behind(throwing, 64 * 1024);
+    behind.store("/g/done", record, sizeof(record));
+    const std::string drained = behind.drain();
+    if (drained.find("坏扇区") == std::string::npos) return fail("后台写盘抛异常时没有变成出错: " + drained);
+    std::string error;
+    if (behind.open_writer("/g/b.bin", 10, &error) && error.empty()) return fail("后台写盘抛异常后还能开文件");
+  }
+  return 0;
+}
+
 int disk_full_test() {
   FakeDrive drive;
   const auto small = pattern(5000, 5);
@@ -2455,6 +2532,7 @@ int run_install_pipeline_self_test() {
   if (const int code = package_and_duplicate_test()) return code;
   if (const int code = many_files_test()) return code;
   if (const int code = zip64_split_test()) return code;
+  if (const int code = write_behind_test()) return code;
   if (const int code = disk_full_test()) return code;
   if (const int code = variant_test()) return code;
   if (const int code = sparse_write_test()) return code;
@@ -2470,6 +2548,46 @@ int run_download_bench() {
   for (const SimScenario& scenario : download_sim_scenarios()) {
     std::cout << describe_sim(scenario, run_download_sim(scenario)) << std::flush;
   }
+  return 0;
+}
+
+int run_unpack_bench(const std::string& archive_dir, const std::string& out_dir, int rounds) {
+  const std::filesystem::path source = std::filesystem::u8path(archive_dir);
+  const std::string game_dir = "/apps/panplay/" + source.filename().u8string();
+  FakeDrive drive;
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(source, ec)) {
+    if (!entry.is_regular_file()) continue;
+    const std::filesystem::path path = entry.path();
+    drive.add_generated(game_dir + "/" + path.filename().u8string(), static_cast<std::int64_t>(entry.file_size()),
+                        [path](std::int64_t offset, std::uint8_t* dst, std::size_t size) {
+                          std::ifstream in(path, std::ios::binary);
+                          in.seekg(offset);
+                          in.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(size));
+                        });
+  }
+  if (ec) {
+    std::cerr << "读不了 " << archive_dir << ": " << ec.message() << "\n";
+    return 1;
+  }
+  const std::filesystem::path out = std::filesystem::u8path(out_dir);
+  for (int round = 0; round < rounds; ++round) {
+    for (const std::size_t queue : {std::size_t{0}, std::size_t{32u << 20}}) {
+      std::filesystem::remove_all(out, ec);
+      auto local = make_local_sink(out.u8string());
+      InstallRequest request;
+      request.source_dir = game_dir;
+      request.write_behind_bytes = queue;
+      const auto started = std::chrono::steady_clock::now();
+      const InstallResult result = install_game(drive, *local, request);
+      const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+      std::cout << (queue == 0 ? "同步写盘" : "后台写盘") << " 第 " << round + 1 << " 轮: " << result.status << "，"
+                << seconds << " 秒，" << result.message << "\n"
+                << std::flush;
+      if (result.status != "installed") return 1;
+    }
+  }
+  std::filesystem::remove_all(out, ec);
   return 0;
 }
 

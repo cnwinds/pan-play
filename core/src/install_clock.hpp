@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +28,9 @@ class InstallClock {
 
   // 安装结束时的一行总账。一直没开始解压（比如已经装好、读目录就失败）时为空。
   std::string summary(const std::string& name, const std::string& outcome);
+  // 写盘交给另一个线程时调用：安装线程上的「写入」「开关文件」只剩排队和等队列腾地方的时间，
+  // 总账改用 busy_ms（写盘线程实际忙了多少毫秒）说写盘多快，不再按排队时间算写入速度、每个文件多久。
+  void watch_write_behind(std::function<double()> busy_ms) { write_behind_ = std::move(busy_ms); }
 
   // 当前线程正在计时的安装写出了多少字节、新建了一个文件。没有在计时时什么也不做。
   static void note_written(std::size_t bytes);
@@ -86,6 +90,7 @@ class InstallClock {
   double game_ms_ = 0;
   std::vector<std::string> games_;
   std::uint64_t largest_dictionary_ = 0;
+  std::function<double()> write_behind_;
   std::atomic<std::uint64_t> dictionary_{0};
   std::atomic<int> slow_{0};
 };
