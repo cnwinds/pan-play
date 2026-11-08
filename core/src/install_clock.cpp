@@ -1,11 +1,14 @@
 #include "install_clock.hpp"
 
+#include "panplay/install.hpp"
 #include "panplay/trace.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <functional>
+#include <mutex>
 #include <thread>
 
 #if defined(_WIN32)
@@ -83,15 +86,16 @@ double thread_cpu_seconds() {
 #endif
 }
 
-// 整个进程到现在的缺页次数（要从系统要新内存页的次数）。大字典的解压窗口第一次碰到每一页都要缺一次。
-long long page_faults() {
-#if defined(_WIN32)
-  return -1;
-#else
-  rusage usage{};
-  if (getrusage(RUSAGE_SELF, &usage) != 0) return -1;
-  return static_cast<long long>(usage.ru_minflt) + usage.ru_majflt;
-#endif
+std::mutex game_probe_mu;
+std::function<std::string()> game_probe;
+
+std::string running_game() {
+  std::function<std::string()> probe;
+  {
+    std::lock_guard<std::mutex> lock(game_probe_mu);
+    probe = game_probe;
+  }
+  return probe ? probe() : std::string();
 }
 
 int online_cpus() {
@@ -108,14 +112,13 @@ std::string rate_text(std::int64_t bytes, double ms) {
 
 }  // namespace
 
-InstallClock::InstallClock()
-    : outer_(bound),
-      since_(Clock::now()),
-      window_at_(since_),
-      cpu_at_start_(process_cpu_seconds()),
-      thread_cpu_at_start_(thread_cpu_seconds()),
-      faults_at_start_(page_faults()) {
-  window_usage_ = usage_now();
+void set_running_game_probe(std::function<std::string()> probe) {
+  std::lock_guard<std::mutex> lock(game_probe_mu);
+  game_probe = std::move(probe);
+}
+
+InstallClock::InstallClock() : outer_(bound), since_(Clock::now()), window_at_(since_) {
+  start_usage_ = window_usage_ = usage_now();
   bound = this;
 }
 
@@ -169,6 +172,7 @@ void InstallClock::note_write_time(double ms) {
 void InstallClock::note_dictionary(std::uint64_t bytes) {
   if (bound == nullptr) return;
   bound->dictionary_.store(bytes, std::memory_order_relaxed);
+  bound->largest_dictionary_ = std::max(bound->largest_dictionary_, bytes);
 }
 
 void InstallClock::charge(Clock::time_point now) {
@@ -191,6 +195,9 @@ std::string describe(const Tally& tally, double all_ms, bool durations) {
     if (phase == InstallPhase::other && percent < 1) continue;
     std::string extra = durations ? seconds_text(ms) : "";
     const auto add = [&](const std::string& part) { extra += (extra.empty() ? "" : "，") + part; };
+    if (phase == InstallPhase::decode && durations && tally.paging_ms >= 1000) {
+      add("其中等内存换页 " + seconds_text(tally.paging_ms));
+    }
     if (phase == InstallPhase::write && tally.written > 0) {
       add("写了 " + bytes_text(tally.written));
       if (ms >= 50) add("写入时 " + rate_text(tally.written, ms));
@@ -221,7 +228,8 @@ InstallPhase InstallClock::switch_to(InstallPhase phase) {
   current_ = phase;
   if (phase == InstallPhase::decode) extracted_ = true;
   if (now - window_at_ >= std::chrono::seconds(10)) {
-    if (extracted_) slow_.store(window_slow(now), std::memory_order_relaxed);
+    const bool paging = close_window(now);
+    if (extracted_) slow_.store(window_slow(paging), std::memory_order_relaxed);
     if (extracted_ && log_enabled(LogLevel::debug)) {
       const double all = sum_ms(window_);
       log_line(LogLevel::debug,
@@ -272,50 +280,78 @@ constexpr double kSwappingFaultsPerSecond = 100;
 }  // namespace
 
 // 哪一项占了这段时间一半以上就算卡在哪。解压时缺页要读盘的次数多，是在等内存换页而不是算不过来。
-int InstallClock::window_slow(Clock::time_point now) const {
+int InstallClock::window_slow(bool paging) const {
   const double all = sum_ms(window_);
   if (all <= 0) return 0;
   const auto share = [&](InstallPhase phase) { return window_.ms[static_cast<int>(phase)] / all; };
   if (share(InstallPhase::download) >= 0.5) return 1;
-  if (share(InstallPhase::decode) >= 0.5) {
-    const double seconds = std::chrono::duration<double>(now - window_at_).count();
-    const long long hard = usage_now().hard_faults;
-    const bool swapping = window_usage_.hard_faults >= 0 && hard >= 0 && seconds > 0 &&
-                          static_cast<double>(hard - window_usage_.hard_faults) / seconds >= kSwappingFaultsPerSecond;
-    return swapping ? 3 : 2;
-  }
+  if (share(InstallPhase::decode) >= 0.5) return paging ? 3 : 2;
   if (share(InstallPhase::write) + share(InstallPhase::files) >= 0.5) return 4;
   return 0;
+}
+
+// 一段（约 10 秒）结束：这段每秒要读盘的缺页过百时，解压的时间记作等内存换页；主机上在运行游戏时记下整段时间。
+// 返回这段是不是在换页。
+bool InstallClock::close_window(Clock::time_point now) {
+  const double seconds = std::chrono::duration<double>(now - window_at_).count();
+  if (seconds <= 0) return false;
+  const long long hard = usage_now().hard_faults;
+  const bool paging = window_usage_.hard_faults >= 0 && hard >= 0 &&
+                      static_cast<double>(hard - window_usage_.hard_faults) / seconds >= kSwappingFaultsPerSecond;
+  if (paging) total_.paging_ms += window_.ms[static_cast<int>(InstallPhase::decode)];
+  if (const std::string game = running_game(); !game.empty()) {
+    game_ms_ += seconds * 1000;
+    if (std::find(games_.begin(), games_.end(), game) == games_.end()) games_.push_back(game);
+  }
+  return paging;
 }
 
 std::string InstallClock::slow() const { return kSlowNames[slow_.load(std::memory_order_relaxed)]; }
 
 std::string InstallClock::summary(const std::string& name, const std::string& outcome) {
-  charge(Clock::now());
+  const auto now = Clock::now();
+  charge(now);
   if (!extracted_) return "";
+  close_window(now);
   const double all = sum_ms(total_);
   InstallPhase most = InstallPhase::download;
   for (const InstallPhase phase : kReportOrder) {
     if (total_.ms[static_cast<int>(phase)] > total_.ms[static_cast<int>(most)]) most = phase;
   }
-  // 安装线程的 CPU 时间远少于解压加写入的时间，说明线程在等（等 UnRAR 的解码线程、等主机分 CPU），不是算不过来。
+  // 解压的时间大半在等换页时，慢的不是 CPU，是字典放不下、被系统换到了硬盘（主机上在玩游戏时常见）。
+  const bool paging = most == InstallPhase::decode && total_.paging_ms * 2 > total_.ms[static_cast<int>(InstallPhase::decode)];
+  std::string context;
+  if (largest_dictionary_ > 0) context += "；字典 " + bytes_text(static_cast<std::int64_t>(largest_dictionary_));
+  if (game_ms_ > 0 && all > 0) {
+    std::string titles;
+    for (const std::string& game : games_) titles += (titles.empty() ? "" : "、") + game;
+    context += "；装的时候主机上在运行 " + titles + "，占 " + std::to_string(std::lround(std::min(100.0, game_ms_ * 100 / all))) +
+               "% 的时间";
+  }
+  // 安装线程的 CPU 时间远少于解压加写入的时间，说明线程在等（等 UnRAR 的解码线程、等主机分 CPU、等换页），不是算不过来。
   std::string cpu;
-  if (const double used = process_cpu_seconds() - cpu_at_start_; cpu_at_start_ >= 0 && all > 0 && used >= 0) {
+  const Usage usage = usage_now();
+  if (const double used = usage.process_cpu - start_usage_.process_cpu;
+      start_usage_.process_cpu >= 0 && usage.process_cpu >= 0 && all > 0 && used >= 0) {
     char text[160];
     std::snprintf(text, sizeof(text), "；整个盘游平均占 %.2f 个 CPU 核（共 %d 核）", used * 1000 / all, online_cpus());
     cpu = text;
-    if (const double mine = thread_cpu_seconds() - thread_cpu_at_start_; thread_cpu_at_start_ >= 0 && mine >= 0) {
+    if (const double mine = usage.thread_cpu - start_usage_.thread_cpu;
+        start_usage_.thread_cpu >= 0 && usage.thread_cpu >= 0 && mine >= 0) {
       const double busy_ms = total_.ms[static_cast<int>(InstallPhase::decode)] + total_.ms[static_cast<int>(InstallPhase::write)];
       std::snprintf(text, sizeof(text), "，安装线程用了 CPU %s（解压加写入共 %s）", seconds_text(mine * 1000).c_str(),
                     seconds_text(busy_ms).c_str());
       cpu += text;
     }
-    if (const long long faults = page_faults() - faults_at_start_; faults_at_start_ >= 0 && faults >= 0) {
-      cpu += "，缺页 " + std::to_string(faults) + " 次";
+    if (start_usage_.faults >= 0 && usage.faults >= 0) {
+      cpu += "，缺页 " + std::to_string(usage.faults - start_usage_.faults) + " 次";
+      if (start_usage_.hard_faults >= 0 && usage.hard_faults >= 0) {
+        cpu += "（要读盘 " + std::to_string(usage.hard_faults - start_usage_.hard_faults) + " 次）";
+      }
     }
   }
   return "安装耗时 " + name + "（" + outcome + "）：共 " + seconds_text(all) + "，" + describe(total_, all, true) +
-         "；时间大多花在" + kPhaseNames[static_cast<int>(most)] + cpu;
+         "；时间大多花在" + (paging ? std::string("等内存换页") : kPhaseNames[static_cast<int>(most)]) + context + cpu;
 }
 
 PhaseScope::PhaseScope(InstallPhase phase) : clock_(bound) {

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace panplay {
 
@@ -48,6 +49,8 @@ class InstallClock {
   static constexpr int kPhases = 5;
   struct Tally {
     double ms[kPhases] = {};
+    // 解压里有多少是在等内存换页（那 10 秒每秒要读盘的缺页过百），只记在总账上。
+    double paging_ms = 0;
     std::int64_t written = 0;
     int opened = 0;
     std::int64_t read = 0;
@@ -67,19 +70,22 @@ class InstallClock {
   InstallPhase switch_to(InstallPhase phase);
   void charge(Clock::time_point now);
   std::string window_details(Clock::time_point now) const;
-  int window_slow(Clock::time_point now) const;
+  int window_slow(bool paging) const;
+  bool close_window(Clock::time_point now);
 
   InstallClock* outer_;
   InstallPhase current_ = InstallPhase::other;
   Clock::time_point since_;
   Clock::time_point window_at_;
+  Usage start_usage_;
   Usage window_usage_;
   Tally total_;
   Tally window_;
   bool extracted_ = false;
-  double cpu_at_start_;
-  double thread_cpu_at_start_;
-  long long faults_at_start_;
+  // 装的时候主机上在运行游戏的时间（按 10 秒一段取样）和是哪几个游戏。
+  double game_ms_ = 0;
+  std::vector<std::string> games_;
+  std::uint64_t largest_dictionary_ = 0;
   std::atomic<std::uint64_t> dictionary_{0};
   std::atomic<int> slow_{0};
 };

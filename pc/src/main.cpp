@@ -32,6 +32,7 @@
 #endif
 
 #if defined(PANPLAY_PS5)
+#include "ps5_appinst.hpp"
 #include "ps5_dashboard.hpp"
 #include "ps5_game_watch.hpp"
 #include "ps5_notify.hpp"
@@ -402,6 +403,11 @@ int main(int argc, char** argv) {
     // 注册过的游戏靠 nullfs 挂载才能启动，挂载重启就没了，开机后要先挂回去。
     restore_console_mounts();
     start_game_watch();
+    // 游戏占着内存时大字典会被换到硬盘，装得慢几倍，安装耗时总账里要写明。NPXS 开头的是系统应用，不算游戏。
+    panplay::set_running_game_probe([] {
+      std::string id = running_app_title_id();
+      return id.rfind("NPXS", 0) == 0 ? std::string() : id;
+    });
     options.on_ready = [](const std::string&, const std::string& url, const std::string& code) {
       notify(std::string("盘游 ") + panplay::app_version() + " 已启动 " + url + (code.empty() ? "" : " 口令 " + code));
     };

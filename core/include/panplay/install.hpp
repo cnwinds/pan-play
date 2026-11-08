@@ -171,6 +171,9 @@ std::string extract_7z_entries(DrivePlugin& drive, InstallSink& sink, const std:
                                std::vector<FinishedFile>* done);
 
 InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallRequest& request);
+// 安装耗时总账写明装的时候主机上在运行哪个游戏：probe 返回正在运行的游戏的 Title ID，没有时为空。
+// 安装线程大约每 10 秒调一次。不设时不记。
+void set_running_game_probe(std::function<std::string()> probe);
 // 游戏已经装好，但网盘目录里（除去 skip_sets）的压缩包和装的时候不一样了（比如多了补丁）。
 // 没装好、装的是这款游戏的另一种格式时返回 false。
 bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,

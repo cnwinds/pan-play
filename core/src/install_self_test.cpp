@@ -1125,9 +1125,28 @@ int install_clock_test() {
     return fail("安装耗时总账不对: " + line);
   }
   if (percent("等下载") < 60 || percent("等下载") > 90 || percent("解压") < 12) return fail("安装耗时占比不对: " + line);
+  if (line.find("等内存换页") != std::string::npos || line.find("主机上在运行") != std::string::npos ||
+      line.find("字典") != std::string::npos) {
+    return fail("没换页、没在玩游戏、不用字典时总账不该提这些: " + line);
+  }
   InstallClock::note_dictionary(64u << 20);
   if (clock.dictionary() != (64u << 20)) return fail("安装计时没记下字典大小");
   if (!clock.slow().empty()) return fail("不到 10 秒就判断了慢在哪: " + clock.slow());
+  set_running_game_probe([] { return std::string("PPSA00001"); });
+  std::string playing_line;
+  {
+    InstallClock playing;
+    {
+      PhaseScope decoding(InstallPhase::decode);
+      InstallClock::note_dictionary(64u << 20);
+      nap(50);
+    }
+    playing_line = playing.summary("测试", "已装好");
+  }
+  set_running_game_probe(nullptr);
+  if (playing_line.find("；字典 64 MB；装的时候主机上在运行 PPSA00001，占 ") == std::string::npos) {
+    return fail("总账没写字典大小、装的时候在运行的游戏: " + playing_line);
+  }
   return 0;
 }
 
