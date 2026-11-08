@@ -318,7 +318,7 @@ std::string InstallClock::summary(const std::string& name, const std::string& ou
   for (const InstallPhase phase : kReportOrder) {
     if (total_.ms[static_cast<int>(phase)] > total_.ms[static_cast<int>(most)]) most = phase;
   }
-  // 解压的时间大半在等换页时，慢的不是 CPU，是字典放不下、被系统换到了硬盘（主机上在玩游戏时常见）。
+  // 解压的时间大半在等换页时，慢的不是 CPU，是字典放不下、被系统换到了硬盘。
   const bool paging = most == InstallPhase::decode && total_.paging_ms * 2 > total_.ms[static_cast<int>(InstallPhase::decode)];
   std::string context;
   if (largest_dictionary_ > 0) context += "；字典 " + bytes_text(static_cast<std::int64_t>(largest_dictionary_));

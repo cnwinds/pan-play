@@ -403,7 +403,7 @@ int main(int argc, char** argv) {
     // 注册过的游戏靠 nullfs 挂载才能启动，挂载重启就没了，开机后要先挂回去。
     restore_console_mounts();
     start_game_watch();
-    // 游戏占着内存时大字典会被换到硬盘，装得慢几倍，安装耗时总账里要写明。NPXS 开头的是系统应用，不算游戏。
+    // 安装耗时总账里记下装的时候主机上在运行哪个游戏，和不开游戏时对比。NPXS 开头的是系统应用，不算游戏。
     panplay::set_running_game_probe([] {
       std::string id = running_app_title_id();
       return id.rfind("NPXS", 0) == 0 ? std::string() : id;
