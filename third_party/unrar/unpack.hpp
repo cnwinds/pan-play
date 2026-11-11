@@ -438,4 +438,7 @@ class Unpack:PackDef
     }
 };
 
+// panplay: window the file really needs, see unpack.cpp.
+uint64 PanplayWinSize(const FileHeader &hd,bool ArcSolid);
+
 #endif

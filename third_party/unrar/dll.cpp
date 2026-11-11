@@ -303,7 +303,7 @@ int PASCAL RARReadHeaderEx(HANDLE hArcData,struct RARHeaderDataEx *D)
     D->CmtSize=0;
     D->CmtState=0;
 
-    D->DictSize=uint(hd->WinSize/1024);
+    D->DictSize=uint(PanplayWinSize(*hd,Data->Arc.Solid)/1024); // panplay
 
     switch (hd->FileHash.Type)
     {

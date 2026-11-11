@@ -903,7 +903,7 @@ bool CmdExtract::ExtractCurrentFile(Archive &Arc,size_t HeaderSize,bool &Repeat)
           {
             try
             {
-              Unp->Init(Arc.FileHead.WinSize,Arc.FileHead.Solid);
+              Unp->Init(PanplayWinSize(Arc.FileHead,Arc.Solid),Arc.FileHead.Solid); // panplay
             }
             catch (std::bad_alloc)
             {

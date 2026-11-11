@@ -81,6 +81,26 @@ void Unpack::SetThreads(uint Threads)
 // We get 64-bit WinSize, so we still can check and quit for dictionaries
 // exceeding a threshold in 32-bit builds. Then we convert WinSize to size_t
 // MaxWinSize.
+// panplay: a file in a non-solid archive never refers back past its own start,
+// so a window as large as the file is enough. Archivers often keep the configured
+// dictionary in every header (4 GB even for a 200-byte file), which would make
+// the console allocate gigabytes it never touches. Solid archives keep the full
+// window: later files reuse the window of the first one. Stored files need none.
+uint64 PanplayWinSize(const FileHeader &hd,bool ArcSolid)
+{
+  if (ArcSolid || hd.Solid)
+    return hd.WinSize;
+  if (hd.Method==0)
+    return 0;
+  if (hd.UnknownUnpSize || hd.UnpSize<=0 || (uint64)hd.UnpSize>=hd.WinSize)
+    return hd.WinSize;
+  // Power of two, as older RAR formats wrap the window with a mask.
+  uint64 Size=0x40000;
+  while (Size<(uint64)hd.UnpSize)
+    Size<<=1;
+  return Min(Size,hd.WinSize);
+}
+
 void Unpack::Init(uint64 WinSize,bool Solid)
 {
   // Minimum window size must be at least twice more than maximum possible

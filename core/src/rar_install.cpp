@@ -578,7 +578,9 @@ std::string extract_pass(DrivePlugin& drive, InstallSink& sink, const std::vecto
       break;
     }
     const bool solid = (header.Flags & RHDF_SOLID) != 0;
-    // 解压要把整个字典放在内存里，这是装 RAR 时最大的一块内存。
+    // 解压要把整个字典放在内存里，这是装 RAR 时最大的一块内存。DictSize 是这个文件真要用的：非固实的压缩包里不超过
+    // 文件本身大小、只存不压的为 0（third_party/unrar/unpack.cpp 的 PanplayWinSize）。所以小文件不会因为文件头写着大字典
+    // 被拒，超过上限的大文件到它才拒，调高上限后从它接着装。
     const std::uint64_t dictionary = static_cast<std::uint64_t>(header.DictSize) << 10;
     if (dictionary > largest_dictionary) {
       largest_dictionary = dictionary;

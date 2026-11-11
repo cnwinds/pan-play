@@ -2111,7 +2111,8 @@ int run_install_pipeline_self_test() {
   for (int i = 0; i < 4096; ++i) packed_text += "panplay packed line " + std::to_string(i % 7) + "\n";
   std::ofstream(rar_dir / "packed.txt", std::ios::binary) << packed_text;
   const auto packed_rar = rar_dir / "packed.rar";
-  if (!run_rar("a -ep -idq -y -ma5 -m3 " + shell_quoted(packed_rar) + " " + shell_quoted(rar_dir / "packed.txt"))) {
+  // 文件头写 64 MB 字典，文件本身只有一百多 KB：解压按文件大小要窗口，不按文件头。
+  if (!run_rar("a -ep -idq -y -ma5 -m3 -md64m " + shell_quoted(packed_rar) + " " + shell_quoted(rar_dir / "packed.txt"))) {
     return fail("RAR 没能生成压缩过的测试 RAR");
   }
   std::vector<std::uint8_t> packed_bytes;
@@ -2312,10 +2313,28 @@ int run_install_pipeline_self_test() {
   }
 
   {
-    auto local = make_local_sink((root / "rar-dict").u8string());
+    // 只存不压的文件解压时不用字典，上限再小也照装。
+    auto local = make_local_sink((root / "rar-dict-stored").u8string());
     InstallRequest request;
     request.source_dir = "/apps/panplay/Rar CUSA77777";
     request.dest_prefix = "/data/homebrew";
+    request.max_dictionary = 1;
+    const InstallResult stored = install_game(drive, *local, request);
+    if (stored.status != "installed") return fail("只存不压的 RAR 不该因为字典上限被拒: " + stored.status + " " + stored.message);
+  }
+
+  {
+    // 文件头写着 64 MB 字典，按文件大小只要 256 KB 的窗口：上限 1 MB 能装，上限 1 字节要拒。
+    auto local = make_local_sink((root / "rar-dict").u8string());
+    InstallRequest request;
+    request.source_dir = "/apps/panplay/Packed CUSA75555";
+    request.dest_prefix = "/data/homebrew";
+    request.max_dictionary = 1 << 20;
+    const InstallResult small = install_game(drive, *local, request);
+    if (small.status != "installed") return fail("小文件不该按文件头里的大字典被拒: " + small.status + " " + small.message);
+    if (auto remove_error = uninstall_game(*local, request.dest_prefix, request.source_dir); !remove_error.empty()) {
+      return fail("删除装好的游戏失败: " + remove_error);
+    }
     request.max_dictionary = 1;
     const InstallResult refused = install_game(drive, *local, request);
     if (refused.status != "error" || refused.message.find("超过上限") == std::string::npos) {
@@ -2323,7 +2342,7 @@ int run_install_pipeline_self_test() {
     }
     if (!refused.retryable) return fail("字典超过上限调高后可以重试，不该标成不能重试");
     error.clear();
-    if (local->file_size("/data/homebrew/CUSA77777/note.txt", &error) >= 0) return fail("字典超过上限还是装了文件");
+    if (local->file_size("/data/homebrew/CUSA75555/packed.txt", &error) >= 0) return fail("字典超过上限还是装了文件");
   }
 
   {
