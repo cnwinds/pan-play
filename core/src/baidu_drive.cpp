@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -20,6 +21,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace panplay {
 namespace {
@@ -494,7 +496,337 @@ class BaiduDrive final : public DrivePlugin {
     return "百度要求安全验证、不能直接删除，移到 " + kTrashDir + " 也失败了 errno=" + std::to_string(code);
   }
 
+  ShareListing list_share(const std::string& surl, const std::string& pwd) override {
+    ShareListing listing;
+    std::string randsk;
+    if (auto error = verify_share(surl, pwd, false, &randsk, &listing.invalid); !error.empty()) {
+      listing.error = error;
+      return listing;
+    }
+    const std::string short_url = share_short(surl);
+    std::deque<std::string> dirs{""};
+    while (!dirs.empty()) {
+      const std::string dir = dirs.front();
+      dirs.pop_front();
+      for (int page = 1;; ++page) {
+        const std::string url = "https://pan.baidu.com/share/list?web=1&app_id=250528&shorturl=" + short_url +
+                                (dir.empty() ? "&root=1" : "&root=0&dir=" + url_encode(dir)) + "&page=" +
+                                std::to_string(page) + "&num=100&order=name&desc=0&showempty=0";
+        Json json;
+        if (auto error = share_get(url, "https://pan.baidu.com/s/" + surl, "BDCLND=" + randsk, kBrowserUa, &json);
+            !error.empty()) {
+          listing.error = error;
+          return listing;
+        }
+        if (const int code = static_cast<int>(json.num("errno")); code != 0) {
+          listing.error = share_error(code, "列分享失败");
+          listing.invalid = share_gone(code);
+          return listing;
+        }
+        const Json* list = json.get("list");
+        const std::size_t count = list && list->type == Json::Type::array ? list->array.size() : 0;
+        for (std::size_t i = 0; i < count; ++i) {
+          const Json& item = list->array[i];
+          if (item.num("isdir") != 0) {
+            dirs.push_back(item.str("path"));
+          } else {
+            listing.files.push_back({item.str("path"), parse_size(item.str("size")), item.str("md5")});
+          }
+        }
+        // 列分享接口限流比列自己的网盘严，翻页之间歇一下。
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        if (count < 100) break;
+      }
+    }
+    return listing;
+  }
+
+  ShareTransfer transfer_share(const std::string& surl, const std::string& pwd, const std::string& dest_dir) override {
+    ShareTransfer out;
+    std::string token;
+    if (auto error = bdstoken(&token); !error.empty()) {
+      out.error = error;
+      return out;
+    }
+    const auto slash = dest_dir.find_last_of('/');
+    for (const std::string& dir : {slash == 0 ? std::string() : dest_dir.substr(0, slash), dest_dir}) {
+      if (dir.empty()) continue;
+      if (auto error = make_dir(token, dir); !error.empty()) {
+        out.error = error;
+        return out;
+      }
+    }
+    std::string randsk;
+    if (!pwd.empty()) {
+      if (auto error = verify_share(surl, pwd, true, &randsk, &out.invalid); !error.empty()) {
+        out.error = error;
+        return out;
+      }
+    }
+    const std::string short_url = share_short(surl);
+    const std::string feature = "1" + short_url;
+    const std::string cookie = pan_cookie() + (randsk.empty() ? "" : "; BDCLND=" + randsk);
+    // 分享页对浏览器 UA 会跳登录页、藏起 bdstoken 这些字段，要用网盘客户端的 UA。
+    const HttpResponse page =
+        client_.send({"https://pan.baidu.com/s/" + feature, "GET", "",
+                      {{"User-Agent", kNetdiskUa},
+                       {"Referer", pwd.empty() ? kPanHome : "https://pan.baidu.com/share/init?surl=" + short_url},
+                       {"Cookie", cookie}}});
+    if (!page.error.empty()) {
+      out.error = page.error;
+      return out;
+    }
+    if (page.final_url.find("/error") != std::string::npos || page.body.find("error-404") != std::string::npos ||
+        page.body.find("platform-non-found") != std::string::npos ||
+        page.body.find("share-error-left") != std::string::npos) {
+      out.error = "分享链接已失效或不存在";
+      out.invalid = true;
+      return out;
+    }
+    if (page.final_url.find("/share/init") != std::string::npos) {
+      out.error = "需要提取码或提取码错误";
+      out.invalid = true;
+      return out;
+    }
+    const std::string page_token = page_field(page.body, "bdstoken");
+    const std::string share_id = page_field(page.body, "shareid");
+    const std::string share_uk = page_field(page.body, "share_uk");
+    if (page_token.empty() || page_field(page.body, "loginstate").empty()) {
+      out.error = "分享页里没有登录态，请重新扫码登录";
+      return out;
+    }
+    if (share_id.empty() || share_uk.empty()) {
+      out.error = "分享页缺少 shareid / share_uk";
+      out.invalid = true;
+      return out;
+    }
+
+    Json listed;
+    if (auto error = share_get("https://pan.baidu.com/share/list?app_id=250528&bdstoken=" + page_token +
+                                   "&channel=chunlei&root=1&shorturl=" + short_url + "&web=5",
+                               "https://pan.baidu.com/s/" + feature, cookie, kBrowserUa, &listed);
+        !error.empty()) {
+      out.error = error;
+      return out;
+    }
+    if (const int code = static_cast<int>(listed.num("errno")); code != 0) {
+      out.error = share_error(code, "列分享失败");
+      out.invalid = share_gone(code);
+      return out;
+    }
+    std::string fsids;
+    if (const Json* list = listed.get("list"); list && list->type == Json::Type::array) {
+      for (const Json& item : list->array) {
+        if (item.str("fs_id").empty()) continue;
+        fsids += (fsids.empty() ? "" : ",") + item.str("fs_id");
+        out.names.push_back(item.str("server_filename"));
+      }
+    }
+    if (fsids.empty()) {
+      out.error = "分享内容为空";
+      out.invalid = true;
+      return out;
+    }
+
+    HttpRequest request{"https://pan.baidu.com/share/transfer?app_id=250528&bdstoken=" + page_token +
+                            "&channel=chunlei&clienttype=0&from=" + share_uk + "&shareid=" + share_id + "&web=1",
+                        "POST",
+                        "fsidlist=" + url_encode("[" + fsids + "]") + "&path=" + url_encode(dest_dir),
+                        {{"User-Agent", kBrowserUa},
+                         {"Referer", "https://pan.baidu.com/s/" + feature},
+                         {"Content-Type", "application/x-www-form-urlencoded"},
+                         {"Cookie", cookie}}};
+    // 大分享转存要百度那边拷一会儿。
+    request.timeout_ms = 180000;
+    const HttpResponse response = client_.send(request);
+    if (!response.error.empty()) {
+      out.error = response.error;
+      return out;
+    }
+    const Json json = Json::parse(response.body, nullptr);
+    const int code = static_cast<int>(json.num("errno"));
+    if (code == 0) return out;
+    const std::string message = json.str("show_msg").empty() ? json.str("err_msg") : json.str("show_msg");
+    std::vector<int> item_codes;
+    if (const Json* info = json.get("info"); info && info->type == Json::Type::array) {
+      for (const Json& item : info->array) {
+        if (const int item_code = static_cast<int>(item.num("errno")); item_code != 0) item_codes.push_back(item_code);
+      }
+    }
+    const auto all_exist = !item_codes.empty() && std::all_of(item_codes.begin(), item_codes.end(),
+                                                             [](int c) { return c == -30 || c == -8; });
+    // 百度偶尔回「已存在」但目标目录里并没有，要列一下核实，不然这款游戏会被当成已经在网盘里。
+    if (code == 4 || code == -8 || code == -30 || (code == 12 && all_exist)) {
+      std::string list_error;
+      const auto entries = list(dest_dir, &list_error);
+      const bool present = list_error.empty() && std::any_of(entries.begin(), entries.end(), [&](const DriveEntry& entry) {
+        return std::find(out.names.begin(), out.names.end(), entry.name) != out.names.end();
+      });
+      if (!present) out.error = "百度说已经存过，但 " + dest_dir + " 里没有，请重试 errno=" + std::to_string(code);
+      return out;
+    }
+    const bool full = code == -10 || code == -32 ||
+                      std::any_of(item_codes.begin(), item_codes.end(), [](int c) { return c == -10 || c == -32; }) ||
+                      message.find("空间不足") != std::string::npos || message.find("容量不足") != std::string::npos;
+    if (full) {
+      out.quota = true;
+      out.error = message.empty() ? "网盘空间不足" : message;
+      return out;
+    }
+    if (share_gone(code)) {
+      out.invalid = true;
+      out.error = message.empty() ? share_error(code, "链接已失效") : message;
+      return out;
+    }
+    if (code == 12 && json.num("target_file_nums") > json.num("target_file_nums_limit") &&
+        json.num("target_file_nums_limit") > 0) {
+      out.error = "分享里的文件数（" + json.str("target_file_nums") + "）超过一次能转存的上限（" +
+                  json.str("target_file_nums_limit") + "）";
+      return out;
+    }
+    out.error = (message.empty() ? "转存失败" : message) + " errno=" + std::to_string(code) +
+                (item_codes.empty() ? "" : "（" + std::to_string(item_codes.front()) + "）");
+    return out;
+  }
+
+  std::string move_path(const std::string& from, const std::string& to) override {
+    std::string token;
+    if (auto error = bdstoken(&token); !error.empty()) return error;
+    const auto slash = to.find_last_of('/');
+    const std::string dir = slash == 0 ? "/" : to.substr(0, slash);
+    const std::string item = "[{\"path\":\"" + json_escape(from) + "\",\"dest\":\"" + json_escape(dir) +
+                             "\",\"newname\":\"" + json_escape(to.substr(slash + 1)) + "\"}]";
+    int code = 0;
+    if (auto error = file_manager(token, "move", item, &code); !error.empty()) return error;
+    return code == 0 ? "" : "百度移动失败 errno=" + std::to_string(code);
+  }
+
+  DriveQuota quota() override {
+    DriveQuota quota;
+    std::string token;
+    if (auto error = bdstoken(&token); !error.empty()) {
+      quota.error = error;
+      return quota;
+    }
+    const HttpResponse response = client_.send(
+        {"https://pan.baidu.com/api/quota?clienttype=0&app_id=250528&web=1&checkfree=1&checkexpire=1&bdstoken=" +
+             url_encode(token),
+         "GET", "", {{"User-Agent", kNetdiskUa}, {"Referer", kPanHome}, {"Cookie", pan_cookie()}}});
+    if (!response.error.empty()) {
+      quota.error = response.error;
+      return quota;
+    }
+    const Json json = Json::parse(response.body, nullptr);
+    const int code = static_cast<int>(json.num("errno"));
+    if (code == kErrnoNotLoggedIn) {
+      quota.error = signed_out();
+      return quota;
+    }
+    if (code != 0) {
+      quota.error = "查网盘空间失败 errno=" + std::to_string(code);
+      return quota;
+    }
+    quota.total = parse_size(json.str("total"));
+    quota.used = parse_size(json.str("used"));
+    return quota;
+  }
+
  private:
+  static std::int64_t parse_size(const std::string& text) {
+    try {
+      return text.empty() ? 0 : std::stoll(text);
+    } catch (const std::exception&) {
+      return 0;
+    }
+  }
+
+  // 分享链接 /s/1AbCd 里的 1 是路径的一部分，verify、list 要去掉它。
+  static std::string share_short(const std::string& surl) { return !surl.empty() && surl[0] == '1' ? surl.substr(1) : surl; }
+
+  static bool share_gone(int code) { return code == 105 || code == -7 || code == 117 || code == -21 || code == 115; }
+
+  static std::string share_error(int code, const std::string& fallback) {
+    switch (code) {
+      case -9:
+      case -12: return "提取码错误";
+      case -62: return "需要验证码（请求太频繁）";
+      case 105:
+      case -7: return "链接已失效";
+      case 117: return "链接已过期";
+      case -21: return "分享已取消或不存在";
+      case 115: return "该文件禁止分享";
+      default: return fallback + " errno=" + std::to_string(code);
+    }
+  }
+
+  // 分享页里 locals 的一个字段（"bdstoken":"…" 或 "shareid":123），没有时为空。
+  static std::string page_field(const std::string& html, const std::string& key) {
+    const std::string needle = "\"" + key + "\":";
+    const auto at = html.find(needle);
+    if (at == std::string::npos) return "";
+    std::size_t pos = at + needle.size();
+    while (pos < html.size() && html[pos] == ' ') ++pos;
+    if (pos < html.size() && html[pos] == '"') {
+      const auto end = html.find('"', pos + 1);
+      return end == std::string::npos ? "" : html.substr(pos + 1, end - pos - 1);
+    }
+    const auto end = html.find_first_of(",}\r\n", pos);
+    std::string value = html.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    return value == "null" || value == "0" || value == "false" ? "" : value;
+  }
+
+  // 凭提取码换 randsk（拼进 cookie 的 BDCLND，本身已经是编码过的，不要再编码）。转存时要带上登录 cookie。
+  std::string verify_share(const std::string& surl, const std::string& pwd, bool with_login, std::string* randsk,
+                           bool* invalid) {
+    const std::string short_url = share_short(surl);
+    std::vector<std::pair<std::string, std::string>> headers{
+        {"User-Agent", kBrowserUa},
+        {"Referer", "https://pan.baidu.com/share/init?surl=" + short_url},
+        {"Content-Type", "application/x-www-form-urlencoded"}};
+    if (with_login) headers.emplace_back("Cookie", pan_cookie());
+    const HttpResponse response =
+        client_.send({"https://pan.baidu.com/share/verify?surl=" + short_url + "&t=" + now_ms_text() +
+                          "&channel=chunlei&web=1&clienttype=0",
+                      "POST", "pwd=" + url_encode(pwd) + "&vcode=&vcode_str=", headers});
+    if (!response.error.empty()) return response.error;
+    std::string parse_error;
+    const Json json = Json::parse(response.body, &parse_error);
+    if (!parse_error.empty() || json.get("errno") == nullptr) return "验证提取码时百度返回的内容看不懂";
+    const int code = static_cast<int>(json.num("errno"));
+    if (code != 0) {
+      // 没带提取码时百度也可能回「提取码错误」，那说明不了链接失效。
+      *invalid = share_gone(code) || (!pwd.empty() && (code == -9 || code == -12));
+      return share_error(code, "验证提取码失败");
+    }
+    *randsk = json.str("randsk");
+    return "";
+  }
+
+  std::string share_get(const std::string& url, const std::string& referer, const std::string& cookie,
+                        const std::string& agent, Json* out) {
+    const HttpResponse response =
+        client_.send({url, "GET", "", {{"User-Agent", agent}, {"Referer", referer}, {"Cookie", cookie}}});
+    if (!response.error.empty()) return response.error;
+    std::string parse_error;
+    *out = Json::parse(response.body, &parse_error);
+    if (!parse_error.empty() || out->get("errno") == nullptr) {
+      return "列分享时百度返回的内容看不懂，状态 " + std::to_string(response.status);
+    }
+    return "";
+  }
+
+  std::string make_dir(const std::string& token, const std::string& path) {
+    Json created;
+    if (auto error = web_api("/api/create", {{"a", "commit"}},
+                             "path=" + url_encode(path) + "&isdir=1&block_list=%5B%5D&rtype=0", token, &created);
+        !error.empty()) {
+      return error;
+    }
+    // -8：目录已经有了
+    const int code = static_cast<int>(created.num("errno"));
+    return code == 0 || code == -8 ? "" : "建网盘目录 " + path + " 失败 errno=" + std::to_string(code);
+  }
+
   std::string bdstoken(std::string* token) {
     const std::string cookie = pan_cookie();
     if (cookie.empty()) return "百度未登录";

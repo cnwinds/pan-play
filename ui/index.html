@@ -155,6 +155,17 @@
             <input name="library_path" placeholder="/游戏资源/PS5" spellcheck="false">
             <span class="hint">网盘里放游戏文件夹的目录，每个子文件夹算一个游戏。</span>
           </label>
+          <p class="hint shelf-library" id="shelf-library-status" role="status"></p>
+          <div class="field-pair">
+            <label class="field">游戏最多占用网盘（GB）
+              <input name="drive_cap_gb" type="number" min="1" step="1" inputmode="numeric" placeholder="2048">
+              <span class="hint">装盘架资源库里的游戏时自动转存；游戏库目录超过这么大，先把能再转回来的游戏移出网盘。</span>
+            </label>
+            <label class="field">网盘至少留出（GB）
+              <input name="drive_reserve_gb" type="number" min="0" step="1" inputmode="numeric" placeholder="200">
+              <span class="hint">网盘总剩余低于这么多时，也先腾空间再转存。</span>
+            </label>
+          </div>
           <section class="speedtest" aria-labelledby="speedtest-title">
             <div class="speedtest-head">
               <div>

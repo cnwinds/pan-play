@@ -14,6 +14,7 @@
 
 #include "server.hpp"
 #include "settings.hpp"
+#include "shelf_transfer.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -468,6 +469,7 @@ int main(int argc, char** argv) {
   }
   if (command == "self-test") {
     if (const int json = self_test()) return json;
+    if (const int shelf = run_shelf_self_test()) return shelf;
     if (const int store = panplay::run_store_meta_self_test()) return store;
     if (const int launch = panplay::run_game_launch_self_test()) return launch;
     if (const int sink = panplay::run_install_sink_self_test()) return sink;

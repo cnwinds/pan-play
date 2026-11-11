@@ -65,6 +65,35 @@ struct ReadResult {
   std::string error;
 };
 
+// 分享里的一个文件。path 是相对分享根目录的路径。
+struct ShareFile {
+  std::string path;
+  std::int64_t size = 0;
+  std::string content_hash;
+};
+
+struct ShareListing {
+  std::vector<ShareFile> files;
+  std::string error;
+  // 链接确定不能用了（失效、取消、提取码错）；否则 error 是限流、网络这类过一会儿再试的错。
+  bool invalid = false;
+};
+
+struct ShareTransfer {
+  // 分享第一层的文件和目录名，转存后就在 dest_dir 下面。
+  std::vector<std::string> names;
+  std::string error;
+  bool invalid = false;
+  // 网盘空间不够。
+  bool quota = false;
+};
+
+struct DriveQuota {
+  std::int64_t total = 0;
+  std::int64_t used = 0;
+  std::string error;
+};
+
 class DrivePlugin {
  public:
   virtual ~DrivePlugin() = default;
@@ -89,6 +118,14 @@ class DrivePlugin {
   // 从网盘删掉一个文件或整个文件夹，删掉的进网盘回收站。网盘不让直接删时可以改为移进一个待删除目录，
   // 这时 moved_to 写这个目录，要用户自己去网盘里清空才释放空间。返回出错原因。
   virtual std::string remove_path(const std::string& path, std::string* moved_to);
+  // 以下几个给盘游自己转存资源库里的游戏用（ADR 0011），网盘不支持时返回出错原因。
+  // 凭提取码列出分享里的全部文件。
+  virtual ShareListing list_share(const std::string& surl, const std::string& pwd);
+  // 把分享整份转存到 dest_dir，目录没有时先建好（连同上级目录）。
+  virtual ShareTransfer transfer_share(const std::string& surl, const std::string& pwd, const std::string& dest_dir);
+  // 把 from 挪到 to（完整路径，可以同时改名）。to 已经存在时失败。返回出错原因。
+  virtual std::string move_path(const std::string& from, const std::string& to);
+  virtual DriveQuota quota();
 };
 
 struct BaiduConfig {

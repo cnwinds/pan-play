@@ -39,6 +39,10 @@ struct AppSettings {
   bool lan_access = true;
   bool require_code = false;
   std::uint64_t max_dictionary_mb = kDefaultMaxDictionaryMb;
+  // 装资源库里的游戏时自己转存（ADR 0011）：游戏库目录里的游戏加起来不超过 drive_cap_gb，网盘总剩余不低于
+  // drive_reserve_gb，不够时把能转回来的游戏移出网盘。
+  std::uint64_t drive_cap_gb = 2048;
+  std::uint64_t drive_reserve_gb = 200;
   // 详细日志：连逐个请求、网络连接、心跳这类排查用的细节也记。平时关着，只记启动、安装和出错。
   bool verbose_log = false;
 

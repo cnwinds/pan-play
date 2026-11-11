@@ -267,7 +267,12 @@ function paintArt(art, game) {
   else if (game.state === "continue") art.append(el("span", "badge continue", "未装完"));
   else if (game.state === "update") art.append(el("span", "badge continue", "有更新"));
   else if (game.state === "queued") art.append(el("span", "badge queued num", "排队 " + (queuePosition(game.path) || "")));
-  else if (game.state !== "installing" && size) art.append(el("span", "badge size num", size));
+  else if (game.state !== "installing" && size) {
+    // 虚线框：网盘里还没有，装的时候先转存。
+    const badge = el("span", "badge size num" + (game.remote ? " remote" : ""), size);
+    if (game.remote) badge.title = "网盘里还没有，安装时先转存到网盘";
+    art.append(badge);
+  }
   // 自己评价过这个版本有问题：封面画红色描边。
   if (game.review_state === "bad") art.dataset.review = "bad";
   else delete art.dataset.review;
@@ -1028,6 +1033,7 @@ function detailFacts(game) {
   if (game.formats) facts.push(game.formats.toUpperCase());
   if (game.archive_bytes) facts.push(formatBytes(game.archive_bytes));
   if (game.on_drive === false) facts.push("网盘已删除");
+  else if (game.remote) facts.push("装时先转存到网盘");
   return facts;
 }
 
@@ -1084,6 +1090,7 @@ function nameSourceText(game) {
   if (game.name_source === "user") return "手动修改";
   if (game.name_source === "store") return storeLocaleText[game.store_locale] || "商店";
   if (game.name_source === "catalog") return "PlayStation-Titles 英文名";
+  if (game.name_source === "shelf") return "盘架资源库";
   return "网盘目录名";
 }
 
@@ -1334,6 +1341,8 @@ function openDetail(game, opener) {
   queueRow.append(queueText, queueLinks);
   const status = el("p", "status-text");
   status.setAttribute("role", "status");
+  // 网盘里还没有的格式：说一句装的时候会先转存，链接失效、评过有问题的也在这里说。
+  const remoteNote = el("p", "remote-note");
   // 不常用的操作（调整补丁、注册到主机、删除）收在主按钮旁的「⋯」菜单里，主按钮只管安装和显示状态。
   const menuItem = (text, className = "") => {
     const item = el("button", "more-item " + className, text);
@@ -1592,13 +1601,14 @@ function openDetail(game, opener) {
       button.setAttribute("role", "radio");
       button.setAttribute("aria-checked", String(item.path === game.path));
       if (item.format === game.installed_variant && game.installed_variant) button.append(el("span", "variant-installed", "已装"));
+      else if (item.remote) button.append(el("span", "variant-installed", item.alive === false ? "链接失效" : "需转存"));
       button.disabled = busy && item.path !== game.path;
       button.addEventListener("click", () => switchVariant(item.path));
       return button;
     }));
   };
 
-  install.append(variantRow, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
+  install.append(variantRow, remoteNote, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1687,10 +1697,29 @@ function openDetail(game, opener) {
     if (unshelved) label = game.on_drive === false ? "已删除" : "已从网盘删除";
     const onConsole = game.console && ["installed", "update"].includes(game.state) ? consoleSummary(game.console) : null;
     if (game.state === "installed" && onConsole && onConsole.healthy) label = "已安装 · 已在主机桌面";
+    const remoteVariant = game.remote ? (game.variants || []).find((item) => item.path === game.path) : null;
+    const toInstall = ["install", "continue"].includes(game.state) && !running && !queued;
+    const linkDead = toInstall && Boolean(remoteVariant && remoteVariant.alive === false);
+    if (linkDead) label = "链接已失效";
     action.textContent = label;
     action.classList.toggle("done", game.state === "installed");
-    action.disabled = unshelved || waitingLayers || running || queued || refused || ["installed", "unsupported", "empty", "other"].includes(game.state) ||
+    action.disabled = unshelved || waitingLayers || running || queued || refused || linkDead || ["installed", "unsupported", "empty", "other"].includes(game.state) ||
       (game.state !== "need-settings" && archivesRead && !game.formats);
+    let remoteText = "";
+    if (remoteVariant && toInstall) {
+      if (remoteVariant.alive === false) {
+        remoteText = "盘架检查时这个分享链接已经失效，装不了，换别的格式试试。";
+      } else {
+        const size = remoteVariant.size ? `（约 ${formatBytes(remoteVariant.size)}）` : "";
+        remoteText = `网盘里还没有${variantLabel(remoteVariant.format)}版，安装时先从分享转存到网盘${size}，再开始下载。`;
+        if (remoteVariant.review_state === "bad") {
+          remoteText += `盘游评过这份资源有问题${remoteVariant.review_note ? `：${remoteVariant.review_note}` : ""}。`;
+        }
+      }
+    }
+    remoteNote.textContent = remoteText;
+    remoteNote.hidden = !remoteText || picking || confirm.open;
+    remoteNote.classList.toggle("warn", linkDead || remoteVariant?.review_state === "bad");
     if (picking && (running || queued)) {
       picking = false;
       picker.close();
@@ -1707,7 +1736,7 @@ function openDetail(game, opener) {
     const installedNow = ["installed", "update"].includes(game.state);
     reviewItem.hidden = !game.fingerprint || busy || (!game.review && !installedNow);
     reviewItem.textContent = game.review ? "修改评价" : "评价这个版本";
-    unshelve.hidden = !game.path || busy || game.state === "continue" || game.on_drive === false;
+    unshelve.hidden = !game.path || busy || game.state === "continue" || game.on_drive === false || game.remote;
     paintReview(installedNow, busy || unshelved);
     moreWrap.hidden = unshelved || [adjust, registerItem, reviewItem, discard, remove, unshelve].every((item) => item.hidden);
     if (moreWrap.hidden && menuOpen) setMenu(false);
@@ -2264,6 +2293,23 @@ function summarizeSettings() {
   setTabStatus("log", verbose ? "详细日志开着" : "只记要紧的", verbose ? "warn" : "ok");
 }
 
+// 盘架发布的资源库：读到了几款游戏，盘架转存到的目录和这里的游戏库目录对不对得上。
+async function loadShelfLibraryStatus() {
+  const info = await api("/api/shelf-library");
+  const box = $("#shelf-library-status");
+  const parts = [];
+  if (!info.loaded) {
+    parts.push("还没读到盘架的资源库。盘架发布到网盘 /盘游/资源库.json 后，网盘里还没有的游戏也会列在游戏库里，点安装时自动转存。");
+  } else {
+    const at = info.generated_at ? serverClockDate(info.generated_at * 1000) : null;
+    parts.push(`盘架资源库：${info.count} 款游戏${at ? `，${at.getUTCMonth() + 1}/${at.getUTCDate()} 发布` : ""}。网盘里还没有的点安装时自动转存。`);
+    if (info.mismatch) parts.push(`盘架把游戏转存到 ${info.library_dir}，和这里填的游戏库目录不一样，两边要填同一个目录。`);
+  }
+  if (info.error) parts.push(`上次读取失败：${info.error}`);
+  box.textContent = parts.join("");
+  box.classList.toggle("warn", Boolean(info.mismatch || info.error));
+}
+
 let catalogTimer = 0;
 
 async function loadCatalogStatus() {
@@ -2407,9 +2453,11 @@ async function loadSettings() {
   renderTarget(settings.target);
   renderDictionary(settings.max_dictionary_mb ?? settings.default_dictionary_mb, settings.default_dictionary_mb);
   form.elements.verbose_log.checked = Boolean(settings.verbose_log);
+  form.elements.drive_cap_gb.value = settings.drive_cap_gb ?? "";
+  form.elements.drive_reserve_gb.value = settings.drive_reserve_gb ?? "";
   $("#log-path").textContent = settings.log_path || "";
   summarizeSettings();
-  await Promise.all([loadAccess(), loadCatalogStatus(), pollSpeedtest(), pollDisktest()]);
+  await Promise.all([loadAccess(), loadCatalogStatus(), loadShelfLibraryStatus().catch(() => {}), pollSpeedtest(), pollDisktest()]);
 }
 
 /* 局域网访问 */
@@ -2491,6 +2539,10 @@ form.addEventListener("submit", async (event) => {
   for (const name of ["local_dir", "ftp_host", "ftp_port", "ftp_dir"]) body[name] = form.elements[name].value;
   body.max_dictionary_mb = chosenDictionary();
   body.verbose_log = form.elements.verbose_log.checked;
+  for (const name of ["drive_cap_gb", "drive_reserve_gb"]) {
+    const value = form.elements[name].value.trim();
+    if (value) body[name] = Number(value);
+  }
   settingsNote.classList.remove("error");
   try {
     await api("/api/settings", body);

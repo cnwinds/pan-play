@@ -138,6 +138,26 @@ std::string DrivePlugin::remove_path(const std::string&, std::string* moved_to) 
   return "这个网盘不支持删除文件";
 }
 
+ShareListing DrivePlugin::list_share(const std::string&, const std::string&) {
+  ShareListing listing;
+  listing.error = "这个网盘不支持分享链接";
+  return listing;
+}
+
+ShareTransfer DrivePlugin::transfer_share(const std::string&, const std::string&, const std::string&) {
+  ShareTransfer transfer;
+  transfer.error = "这个网盘不支持转存分享";
+  return transfer;
+}
+
+std::string DrivePlugin::move_path(const std::string&, const std::string&) { return "这个网盘不支持移动文件"; }
+
+DriveQuota DrivePlugin::quota() {
+  DriveQuota quota;
+  quota.error = "这个网盘不支持查空间";
+  return quota;
+}
+
 struct DownloadSession::Impl {
   struct Lane {
     std::thread thread;

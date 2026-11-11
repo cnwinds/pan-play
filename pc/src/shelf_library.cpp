@@ -1,0 +1,226 @@
+#include "shelf_library.hpp"
+
+#include "panplay/app_paths.hpp"
+#include "panplay/json.hpp"
+#include "panplay/trace.hpp"
+
+#include <chrono>
+#include <condition_variable>
+#include <ctime>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <thread>
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+// 盘架按这个位置写，改了要两边一起改。
+const std::string kLibraryDir = "/盘游";
+const std::string kLibraryName = "资源库.json";
+constexpr auto kRefreshEvery = std::chrono::minutes(30);
+constexpr auto kStaleAfter = std::chrono::minutes(5);
+constexpr std::int64_t kMaxFileBytes = 32 << 20;
+
+std::mutex mu;
+std::condition_variable wake;
+bool started = false;
+bool refresh_wanted = true;
+Clock::time_point refreshed_at;
+std::shared_ptr<const ShelfLibrary> current;
+// 网盘上的文件上次读到的 fs_id；盘架覆盖写一次 fs_id 就变，没变的不重读。
+std::string seen_file_id;
+std::int64_t fetched_at = 0;
+std::string last_error;
+
+std::filesystem::path cache_file() { return panplay::app_data_dir() / "shelf-library.json"; }
+
+std::string read_cache() {
+  std::ifstream in(cache_file(), std::ios::binary);
+  std::stringstream buffer;
+  buffer << in.rdbuf();
+  return buffer.str();
+}
+
+void write_cache(const std::string& text) {
+  const auto path = cache_file();
+  auto temp = path;
+  temp += ".tmp";
+  {
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    out << text;
+    if (!out) return;
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp, path, ec);
+}
+
+// 返回出错原因；网盘上还没有这个文件（盘架没开或还没发布过）不算错。
+std::string pull(panplay::DrivePlugin& drive, const std::function<void()>& on_change) {
+  std::string error;
+  const auto entries = drive.list(kLibraryDir, &error);
+  if (!error.empty()) return error.find("errno=-9") == std::string::npos ? error : "";
+  for (const auto& entry : entries) {
+    if (entry.is_dir || entry.name != kLibraryName) continue;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      if (entry.file_id == seen_file_id) return "";
+    }
+    if (entry.size <= 0 || entry.size > kMaxFileBytes) return "资源库文件大小不对：" + std::to_string(entry.size);
+    const panplay::ReadResult read = drive.read_at(entry.file_id, 0, static_cast<std::size_t>(entry.size));
+    if (!read.error.empty()) return "读资源库失败：" + read.error;
+    const std::string text(read.bytes.begin(), read.bytes.end());
+    std::string parse_error;
+    auto library = parse_shelf_library(text, &parse_error);
+    if (!library) return "资源库读不懂：" + parse_error;
+    write_cache(text);
+    const std::size_t count = library->games.size();
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      current = std::move(library);
+      seen_file_id = entry.file_id;
+      fetched_at = static_cast<std::int64_t>(std::time(nullptr));
+    }
+    panplay::log_info("读到盘架的资源库：" + std::to_string(count) + " 款游戏");
+    on_change();
+    return "";
+  }
+  return "";
+}
+
+void sync_loop(const std::function<std::shared_ptr<panplay::DrivePlugin>()>& open_drive,
+               const std::function<void()>& on_change) {
+  bool failing = false;
+  std::this_thread::sleep_for(std::chrono::seconds(3));
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      while (!refresh_wanted && Clock::now() < refreshed_at + kRefreshEvery) {
+        wake.wait_until(lock, refreshed_at + kRefreshEvery);
+      }
+      refresh_wanted = false;
+      refreshed_at = Clock::now();
+    }
+    const auto drive = open_drive();
+    if (!drive || !drive->session_valid()) continue;
+    const std::string error = pull(*drive, on_change);
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      last_error = error;
+    }
+    // 断网时每 30 分钟都会失败，只在第一次记警告，恢复时再记一行。
+    if (!error.empty() && !failing) panplay::log_warn("没能读到盘架的资源库：" + error + "（恢复之前不再重复记）");
+    else if (error.empty() && failing) panplay::log_info("又能读到盘架的资源库了");
+    failing = !error.empty();
+  }
+}
+
+}  // namespace
+
+const ShelfGame* ShelfLibrary::find(const std::string& title_id) const {
+  if (title_id.empty()) return nullptr;
+  for (const auto& game : games) {
+    if (game.title_id == title_id) return &game;
+  }
+  return nullptr;
+}
+
+std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::string* error) {
+  std::string parse_error;
+  const panplay::Json json = panplay::Json::parse(text, &parse_error);
+  const panplay::Json* games = json.get("games");
+  if (!parse_error.empty() || games == nullptr || games->type != panplay::Json::Type::array) {
+    if (error) *error = parse_error.empty() ? "没有 games" : parse_error;
+    return nullptr;
+  }
+  auto library = std::make_shared<ShelfLibrary>();
+  library->generated_at = static_cast<std::int64_t>(json.num("generated_at"));
+  library->library_dir = json.str("library_dir");
+  for (const auto& item : games->array) {
+    ShelfGame game;
+    game.title_id = item.str("title_id");
+    game.concept_id = static_cast<std::int64_t>(item.num("concept_id"));
+    game.name = item.str("name");
+    game.added_at = static_cast<std::int64_t>(item.num("added_at"));
+    if (const panplay::Json* variants = item.get("variants")) {
+      for (const auto& entry : variants->array) {
+        ShelfVariant variant;
+        variant.format = entry.str("format");
+        variant.surl = entry.str("surl");
+        variant.pwd = entry.str("pwd");
+        variant.version = entry.str("version");
+        variant.firmware = entry.str("firmware");
+        variant.size = static_cast<std::int64_t>(entry.num("size"));
+        if (const panplay::Json* alive = entry.get("alive"); alive && alive->type == panplay::Json::Type::boolean) {
+          variant.alive = alive->boolean ? 1 : 0;
+        }
+        variant.checked_at = static_cast<std::int64_t>(entry.num("checked_at"));
+        if (const panplay::Json* review = entry.get("review"); review && review->type == panplay::Json::Type::object) {
+          variant.reviewed = true;
+          variant.playable = review->boolean_or("playable", true);
+          variant.review_note = review->str("note");
+        }
+        if (variant.format.empty() || variant.surl.empty()) continue;
+        game.variants.push_back(std::move(variant));
+      }
+    }
+    if (game.title_id.empty() || game.variants.empty()) continue;
+    library->games.push_back(std::move(game));
+  }
+  return library;
+}
+
+std::string shelf_variant_dir(const std::string& format) { return format == "unknown" ? "@other" : "@" + format; }
+
+std::string shelf_format_of(const std::string& variant_format) {
+  return variant_format == "other" ? "unknown" : variant_format;
+}
+
+void start_shelf_library_sync(std::function<std::shared_ptr<panplay::DrivePlugin>()> open_drive,
+                              std::function<void()> on_change) {
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (started) return;
+    started = true;
+    refreshed_at = Clock::now();
+    if (auto cached = parse_shelf_library(read_cache(), nullptr)) current = std::move(cached);
+  }
+  std::thread([open_drive = std::move(open_drive), on_change = std::move(on_change)] {
+    sync_loop(open_drive, on_change);
+  }).detach();
+}
+
+void refresh_shelf_library_if_stale() {
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (refresh_wanted || Clock::now() - refreshed_at < kStaleAfter) return;
+    refresh_wanted = true;
+  }
+  wake.notify_all();
+}
+
+std::shared_ptr<const ShelfLibrary> shelf_library() {
+  std::lock_guard<std::mutex> lock(mu);
+  return current;
+}
+
+void use_shelf_library(std::shared_ptr<const ShelfLibrary> library) {
+  std::lock_guard<std::mutex> lock(mu);
+  current = std::move(library);
+}
+
+std::string shelf_library_status_json(const std::string& library_path) {
+  std::lock_guard<std::mutex> lock(mu);
+  const auto trimmed = [](std::string path) {
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
+    return path;
+  };
+  const bool mismatch = current && !current->library_dir.empty() && trimmed(current->library_dir) != trimmed(library_path);
+  return "{\"loaded\":" + std::string(current ? "true" : "false") +
+         ",\"count\":" + std::to_string(current ? current->games.size() : 0) +
+         ",\"generated_at\":" + std::to_string(current ? current->generated_at : 0) +
+         ",\"fetched_at\":" + std::to_string(fetched_at) + ",\"library_dir\":\"" +
+         panplay::json_escape(current ? current->library_dir : "") + "\",\"mismatch\":" + (mismatch ? "true" : "false") +
+         ",\"error\":\"" + panplay::json_escape(last_error) + "\"}";
+}

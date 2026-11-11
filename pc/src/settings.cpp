@@ -58,6 +58,12 @@ void read_current(const panplay::Json& json, AppSettings* settings) {
     settings->max_dictionary_mb = static_cast<std::uint64_t>(json.num("max_dictionary_mb"));
   }
   settings->verbose_log = json.boolean_or("verbose_log", false);
+  if (json.get("drive_cap_gb") != nullptr && json.num("drive_cap_gb") > 0) {
+    settings->drive_cap_gb = static_cast<std::uint64_t>(json.num("drive_cap_gb"));
+  }
+  if (json.get("drive_reserve_gb") != nullptr && json.num("drive_reserve_gb") >= 0) {
+    settings->drive_reserve_gb = static_cast<std::uint64_t>(json.num("drive_reserve_gb"));
+  }
 }
 
 // 版本 1 只有百度一个插件；存放位置是一个地址加主机目录，本机目录也会再套一层主机目录。
@@ -382,7 +388,9 @@ std::string save_settings(const AppSettings& settings) {
           "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) + "\",\"lan_access\":" +
           (settings.lan_access ? "true" : "false") + ",\"require_code\":" + (settings.require_code ? "true" : "false") +
           ",\"max_dictionary_mb\":" + std::to_string(settings.max_dictionary_mb) +
-          ",\"verbose_log\":" + (settings.verbose_log ? "true" : "false") + "}";
+          ",\"verbose_log\":" + (settings.verbose_log ? "true" : "false") +
+          ",\"drive_cap_gb\":" + std::to_string(settings.drive_cap_gb) +
+          ",\"drive_reserve_gb\":" + std::to_string(settings.drive_reserve_gb) + "}";
   const std::filesystem::path path = settings_file_path();
   std::filesystem::path tmp = path;
   tmp += ".tmp";

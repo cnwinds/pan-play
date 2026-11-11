@@ -1,0 +1,274 @@
+#include "shelf_library.hpp"
+#include "shelf_transfer.hpp"
+
+#include <algorithm>
+#include <ctime>
+#include <iostream>
+#include <map>
+
+namespace {
+
+int fail(const std::string& message) {
+  std::cerr << "资源库自检失败: " << message << "\n";
+  return 1;
+}
+
+constexpr std::int64_t kGb = 1ll << 30;
+
+// 内存里的网盘：路径到文件（目录 size 为 -1）。分享按 surl 存一组相对路径和大小。
+class FakeDrive : public panplay::DrivePlugin {
+ public:
+  struct Node {
+    std::int64_t size = -1;
+    std::string text;
+  };
+  struct Share {
+    std::vector<std::pair<std::string, std::int64_t>> files;
+    bool dead = false;
+  };
+
+  std::map<std::string, Node> nodes;
+  std::map<std::string, Share> shares;
+  std::set<std::string> need_verify;
+  int transfers = 0;
+
+  void add_file(const std::string& path, std::int64_t size, const std::string& text = "") {
+    add_dirs(parent(path));
+    nodes[path] = {size, text};
+  }
+  bool has(const std::string& path) const { return nodes.count(path) != 0; }
+
+  std::string id() const override { return "fake"; }
+  std::string display_name() const override { return "fake"; }
+  panplay::LoginChallenge start_login() override { return {}; }
+  panplay::LoginPoll poll_login(const panplay::LoginChallenge&) override { return {}; }
+  bool session_valid() override { return true; }
+  void logout() override {}
+
+  std::vector<panplay::DriveEntry> list(const std::string& path, std::string* error) override {
+    const auto dir = nodes.find(path);
+    if (path != "/" && (dir == nodes.end() || dir->second.size >= 0)) {
+      if (error) *error = "百度列目录失败 errno=-9";
+      return {};
+    }
+    std::vector<panplay::DriveEntry> out;
+    for (const auto& [child, node] : nodes) {
+      if (child == path || parent(child) != path) continue;
+      panplay::DriveEntry entry;
+      entry.file_id = child;
+      entry.name = child.substr(child.find_last_of('/') + 1);
+      entry.path = child;
+      entry.is_dir = node.size < 0;
+      entry.size = node.size < 0 ? 0 : (node.text.empty() ? node.size : static_cast<std::int64_t>(node.text.size()));
+      out.push_back(entry);
+    }
+    return out;
+  }
+
+  panplay::ReadResult read_at(const std::string& file_id, std::int64_t, std::size_t) override {
+    panplay::ReadResult result;
+    const auto node = nodes.find(file_id);
+    if (node == nodes.end()) result.error = "没有这个文件";
+    else result.bytes.assign(node->second.text.begin(), node->second.text.end());
+    return result;
+  }
+
+  std::string remove_path(const std::string& path, std::string* moved_to) override {
+    if (moved_to) moved_to->clear();
+    if (!has(path)) return "没有 " + path;
+    if (need_verify.count(path) != 0) {
+      if (moved_to) *moved_to = "/盘游待删除";
+      return move_path(path, "/盘游待删除/" + path.substr(path.find_last_of('/') + 1));
+    }
+    for (auto it = nodes.begin(); it != nodes.end();) {
+      it = it->first == path || it->first.rfind(path + "/", 0) == 0 ? nodes.erase(it) : std::next(it);
+    }
+    return "";
+  }
+
+  std::string move_path(const std::string& from, const std::string& to) override {
+    if (!has(from) || has(to)) return "移动失败";
+    add_dirs(parent(to));
+    std::map<std::string, Node> moved;
+    for (auto it = nodes.begin(); it != nodes.end();) {
+      if (it->first == from || it->first.rfind(from + "/", 0) == 0) {
+        moved[to + it->first.substr(from.size())] = it->second;
+        it = nodes.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    nodes.insert(moved.begin(), moved.end());
+    return "";
+  }
+
+  panplay::ShareListing list_share(const std::string& surl, const std::string&) override {
+    panplay::ShareListing listing;
+    const auto share = shares.find(surl);
+    if (share == shares.end() || share->second.dead) {
+      listing.error = "链接已失效";
+      listing.invalid = true;
+      return listing;
+    }
+    for (const auto& [rel, size] : share->second.files) listing.files.push_back({rel, size, ""});
+    return listing;
+  }
+
+  panplay::ShareTransfer transfer_share(const std::string& surl, const std::string& pwd, const std::string& dest) override {
+    panplay::ShareTransfer transfer;
+    const panplay::ShareListing listing = list_share(surl, pwd);
+    if (!listing.error.empty()) {
+      transfer.error = listing.error;
+      transfer.invalid = true;
+      return transfer;
+    }
+    ++transfers;
+    add_dirs(dest);
+    for (const auto& file : listing.files) {
+      add_file(dest + file.path, file.size);
+      const std::string top = file.path.substr(1, file.path.find('/', 1) - 1);
+      if (std::find(transfer.names.begin(), transfer.names.end(), top) == transfer.names.end()) transfer.names.push_back(top);
+    }
+    return transfer;
+  }
+
+  panplay::DriveQuota quota() override {
+    panplay::DriveQuota quota;
+    quota.total = 100000 * kGb;
+    for (const auto& [path, node] : nodes) quota.used += std::max<std::int64_t>(0, node.size);
+    return quota;
+  }
+
+ private:
+  static std::string parent(const std::string& path) {
+    const auto slash = path.find_last_of('/');
+    return slash == 0 ? "/" : path.substr(0, slash);
+  }
+  void add_dirs(const std::string& path) {
+    for (std::string dir = path; dir != "/" && !dir.empty(); dir = parent(dir)) {
+      if (!has(dir)) nodes[dir] = {};
+    }
+  }
+};
+
+const char* kLibrary = R"({"version":1,"generated_at":1794393246,"library_dir":"/lib","games":[
+ {"title_id":"PPSA00001","concept_id":11,"name":"目标","added_at":5,"variants":[
+   {"format":"exfat","surl":"1s1","pwd":"abcd","version":"1.05","size":0,"checked_at":0},
+   {"format":"unknown","surl":"1s1b","pwd":"","size":5,"alive":false,"checked_at":9,"review":{"playable":false,"note":"黑屏"}}]},
+ {"title_id":"PPSA00002","name":"装在主机上","variants":[{"format":"folder","surl":"1s2","pwd":"x","alive":true}]},
+ {"title_id":"PPSA00003","name":"很久没用","variants":[{"format":"exfat","surl":"1s3","pwd":"x"}]},
+ {"title_id":"PPSA00004","name":"刚用过","variants":[{"format":"exfat","surl":"1s4","pwd":"x"}]},
+ {"title_id":"PPSA00005","name":"别的设备在装","variants":[{"format":"exfat","surl":"1s5","pwd":"x"}]},
+ {"title_id":"PPSA00006","name":"链接失效","variants":[{"format":"exfat","surl":"1s6","pwd":"x","alive":false}]},
+ {"title_id":"PPSA00007","name":"分享打不开","variants":[{"format":"exfat","surl":"1s7","pwd":"x"}]},
+ {"title_id":"","name":"没编号","variants":[{"format":"exfat","surl":"1s8"}]},
+ {"title_id":"PPSA00009","name":"没有格式","variants":[]}]})";
+
+int check_parse() {
+  std::string error;
+  const auto library = parse_shelf_library(kLibrary, &error);
+  if (!library) return fail("解析失败：" + error);
+  if (library->games.size() != 7) return fail("没编号、没格式的游戏应该跳过，实际 " + std::to_string(library->games.size()));
+  const ShelfGame* target = library->find("PPSA00001");
+  if (!target || target->name != "目标" || target->concept_id != 11 || target->variants.size() != 2) return fail("目标游戏读错了");
+  const ShelfVariant& dead = target->variants[1];
+  if (dead.alive != 0 || !dead.reviewed || dead.playable || dead.review_note != "黑屏") return fail("失效、评价读错了");
+  if (target->variants[0].alive != -1 || library->find("PPSA00002")->variants[0].alive != 1) return fail("alive 读错了");
+  if (shelf_variant_dir("unknown") != "@other" || shelf_variant_dir("exfat") != "@exfat" || shelf_format_of("other") != "unknown") {
+    return fail("格式和目录名对不上");
+  }
+  if (parse_shelf_library("{}", &error) || error.empty()) return fail("没有 games 应该报错");
+  return 0;
+}
+
+AppSettings test_settings(std::uint64_t cap_gb) {
+  AppSettings settings;
+  settings.drive = "fake";
+  settings.drives["fake"].library_path = "/lib";
+  settings.drive_cap_gb = cap_gb;
+  settings.drive_reserve_gb = 0;
+  return settings;
+}
+
+void fill(FakeDrive& drive) {
+  const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+  drive.add_file("/lib/PPSA00002/@folder/a.rar", 20 * kGb);
+  drive.add_file("/lib/PPSA00003/@exfat/a.rar", 25 * kGb);
+  drive.add_file("/lib/PPSA00004/@exfat/a.rar", 25 * kGb);
+  drive.add_file("/lib/PPSA00005/@exfat/a.rar", 25 * kGb);
+  drive.add_file("/lib/PPSA00006/@exfat/a.rar", 25 * kGb);
+  drive.add_file("/lib/PPSA00007/@exfat/a.rar", 25 * kGb);
+  drive.add_file("/lib/MyGame/a.rar", 10 * kGb);
+  drive.add_file("/盘游/在用/other.json", 0,
+                 "{\"installing\":[{\"path\":\"/lib/PPSA00005/@exfat\",\"heartbeat\":" + std::to_string(now) +
+                     "}],\"installed\":[\"/lib/PPSA00002\"],\"used\":{\"/lib/PPSA00003/@exfat\":100,"
+                     "\"/lib/PPSA00004/@exfat\":" + std::to_string(now) + ",\"/lib/PPSA00007/@exfat\":50}}");
+  for (const char* surl : {"1s2", "1s3", "1s4", "1s5"}) drive.shares[surl].files = {{"/a.rar", 1}};
+  drive.shares["1s7"].dead = true;
+  drive.shares["1s1"].files = {{"/对马岛/game.part1.rar", 20 * kGb}, {"/对马岛/game.part2.rar", 10 * kGb},
+                               {"/对马岛/补丁01/patch.rar", 1}};
+}
+
+int check_transfer_and_room() {
+  FakeDrive drive;
+  fill(drive);
+  panplay::CancelToken cancel;
+  std::vector<std::string> said;
+  const auto say = [&](const std::string& message) { said.push_back(message); };
+  // 游戏区 155 GB，要装 30 GB，上限 150 GB：要腾出 35 GB。
+  PrepareResult result = prepare_on_drive(drive, test_settings(150), "shelf-self-test", "/lib/PPSA00001/@exfat", {}, cancel, say);
+  if (!result.error.empty() || !result.transferred) return fail("转存应该成功：" + result.error);
+  // 先退装在主机上的（20 GB），再退最久没用的：分享打不开的跳过，接着是很久没用的（25 GB），够了就停。
+  if (drive.has("/lib/PPSA00002")) return fail("装在主机上的应该先退");
+  if (drive.has("/lib/PPSA00003")) return fail("很久没用的应该退掉，游戏目录一起删");
+  if (!drive.has("/lib/PPSA00007/@exfat")) return fail("分享打不开的不能退");
+  if (!drive.has("/lib/PPSA00004/@exfat")) return fail("腾够了就不该再退");
+  if (!drive.has("/lib/PPSA00005/@exfat")) return fail("别的设备正在装的不能退");
+  if (!drive.has("/lib/PPSA00006/@exfat")) return fail("链接失效的不能退");
+  if (!drive.has("/lib/MyGame")) return fail("资源库里没有的不能退");
+  if (!drive.has("/lib/PPSA00001/@exfat/game.part1.rar") || !drive.has("/lib/PPSA00001/@exfat/补丁01/patch.rar") ||
+      drive.has("/lib/PPSA00001/@exfat/对马岛")) {
+    return fail("外包目录应该去掉");
+  }
+  if (said.empty()) return fail("应该报告进度");
+
+  // 已经在网盘里的不再转存。
+  const int before = drive.transfers;
+  result = prepare_on_drive(drive, test_settings(150), "shelf-self-test", "/lib/PPSA00001/@exfat", {}, cancel, say);
+  if (!result.error.empty() || result.transferred || drive.transfers != before) return fail("网盘里有了不该再转存");
+
+  // 链接失效的格式：不重试。
+  result = prepare_on_drive(drive, test_settings(150), "shelf-self-test", "/lib/PPSA00001/@other", {}, cancel, say);
+  if (result.error.empty() || result.retryable) return fail("链接失效应该报错且不重试");
+  return 0;
+}
+
+int check_not_enough() {
+  FakeDrive drive;
+  fill(drive);
+  drive.need_verify.insert("/lib/PPSA00002/@folder");
+  panplay::CancelToken cancel;
+  // 上限 50 GB：能退的全退了也不够；要安全验证的移进待删除，不算腾出空间。
+  const PrepareResult result =
+      prepare_on_drive(drive, test_settings(50), "shelf-self-test", "/lib/PPSA00001/@exfat", {"/lib/PPSA00004/@exfat"}, cancel,
+                       [](const std::string&) {});
+  if (result.error.find("网盘空间不够") == std::string::npos || result.error.find("待删除") == std::string::npos) {
+    return fail("空间不够时应该说明原因：" + result.error);
+  }
+  if (drive.transfers != 0) return fail("空间不够不该转存");
+  if (!drive.has("/盘游待删除/@folder")) return fail("要安全验证的应该移进待删除");
+  if (!drive.has("/lib/PPSA00004/@exfat")) return fail("本机队列里的不能退");
+  return 0;
+}
+
+}  // namespace
+
+int run_shelf_self_test() {
+  const auto saved = shelf_library();
+  if (const int parse = check_parse()) return parse;
+  use_shelf_library(parse_shelf_library(kLibrary, nullptr));
+  int result = check_transfer_and_room();
+  if (result == 0) result = check_not_enough();
+  use_shelf_library(saved);
+  return result;
+}

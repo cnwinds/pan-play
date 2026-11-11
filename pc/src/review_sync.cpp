@@ -198,6 +198,13 @@ void review_changed() {
   wake.notify_all();
 }
 
+std::string sync_device_id() {
+  static const std::string id = device_id();
+  return id;
+}
+
+std::string sync_device_name() { return device_name(); }
+
 void refresh_reviews_if_stale() {
   {
     std::lock_guard<std::mutex> lock(mu);

@@ -543,6 +543,10 @@ button:disabled { cursor: default; }
   background: var(--mint);
   color: #10151f;
 }
+.badge.size.remote {
+  border-style: dashed;
+  border-color: rgba(255, 255, 255, 0.35);
+}
 .badge.continue { color: var(--amber); }
 .badge.queued { color: var(--signal-hi); }
 
@@ -895,6 +899,10 @@ body.drawer-open { overflow: hidden; }
 
 .variant-row .chip-toggle:disabled { opacity: 0.5; }
 .variant-installed { font-size: 0.75rem; color: var(--faint); }
+.remote-note { margin: 0 0 0.75rem; color: var(--muted, var(--faint)); font-size: 0.86rem; }
+.remote-note[hidden] { display: none; }
+.remote-note.warn,
+.shelf-library.warn { color: var(--amber); }
 .action-row[hidden],
 .action-row .btn[hidden] { display: none; }
 
@@ -1989,6 +1997,12 @@ body.drawer-open { overflow: hidden; }
   gap: 0.4rem;
   font-size: 0.9rem;
   font-weight: 500;
+}
+
+.field-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 1.15rem;
 }
 
 .field input {

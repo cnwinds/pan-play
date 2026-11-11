@@ -4,7 +4,10 @@
 #include "game_sizes.hpp"
 #include "review_sync.hpp"
 #include "reviews.hpp"
+#include "drive_usage.hpp"
 #include "settings.hpp"
+#include "shelf_library.hpp"
+#include "shelf_transfer.hpp"
 
 #include "panplay/app_paths.hpp"
 #include "panplay/catalog.hpp"
@@ -103,7 +106,9 @@ std::string settings_json(const AppSettings& settings) {
           "\",\"ftp_port\":\"" + json_escape(settings.ftp_port) + "\",\"ftp_dir\":\"" + json_escape(settings.ftp_dir) +
           "\",\"max_dictionary_mb\":" + std::to_string(settings.max_dictionary_mb) +
           ",\"default_dictionary_mb\":" + std::to_string(kDefaultMaxDictionaryMb) +
-          ",\"verbose_log\":" + (settings.verbose_log ? "true" : "false") + ",\"log_path\":\"" +
+          ",\"verbose_log\":" + (settings.verbose_log ? "true" : "false") +
+          ",\"drive_cap_gb\":" + std::to_string(settings.drive_cap_gb) +
+          ",\"drive_reserve_gb\":" + std::to_string(settings.drive_reserve_gb) + ",\"log_path\":\"" +
           json_escape((panplay::app_data_dir() / "panplay.log").u8string()) + "\",\"version\":\"" +
           json_escape(panplay::app_version()) + "\"}";
   return json;
@@ -150,6 +155,17 @@ std::string apply_settings(const panplay::Json& json, AppSettings* settings) {
   if (has_dictionary && (dictionary < 0 || dictionary > 65536 || dictionary != static_cast<double>(static_cast<std::uint64_t>(dictionary)))) {
     return "字典上限要是 0 到 65536 之间的整数（MB）";
   }
+  const auto whole_gb = [&](const char* key, double low, std::uint64_t* out) -> bool {
+    if (json.get(key) == nullptr) return true;
+    const double value = json.num(key);
+    if (value < low || value > 1048576 || value != static_cast<double>(static_cast<std::uint64_t>(value))) return false;
+    *out = static_cast<std::uint64_t>(value);
+    return true;
+  };
+  std::uint64_t cap = settings->drive_cap_gb;
+  std::uint64_t reserve = settings->drive_reserve_gb;
+  if (!whole_gb("drive_cap_gb", 1, &cap)) return "游戏区上限要是大于 0 的整数（GB）";
+  if (!whole_gb("drive_reserve_gb", 0, &reserve)) return "网盘保底要是 0 或以上的整数（GB）";
 
   settings->drive = kind->id;
   settings->target = mode;
@@ -158,6 +174,8 @@ std::string apply_settings(const panplay::Json& json, AppSettings* settings) {
   if (!port.empty()) settings->ftp_port = port;
   if (!ftp_dir.empty()) settings->ftp_dir = ftp_dir;
   if (has_dictionary) settings->max_dictionary_mb = static_cast<std::uint64_t>(dictionary);
+  settings->drive_cap_gb = cap;
+  settings->drive_reserve_gb = reserve;
   if (json.get("verbose_log") != nullptr) settings->verbose_log = json.boolean_or("verbose_log", false);
   return "";
 }
@@ -312,6 +330,15 @@ std::map<std::string, std::string> queue_states() {
     states[installs.current->path] = "installing";
   }
   return states;
+}
+
+// 本机安装队列里的（正在装的和排队的），腾网盘空间时不动它们。
+std::set<std::string> queued_paths() {
+  std::lock_guard<std::mutex> lock(installs.mu);
+  std::set<std::string> paths;
+  if (installs.current) paths.insert(installs.current->path);
+  for (const auto& task : installs.waiting) paths.insert(task.path);
+  return paths;
 }
 
 void send_all(SOCKET socket, const std::string& data) { panplay::send_all(socket, data.data(), data.size()); }
@@ -512,8 +539,10 @@ std::string store_meta_fields(const panplay::StoreMeta& meta, bool detail) {
   return json;
 }
 
+// shelf_name 是盘架资源库里的名字，商店和资料库都没有这款游戏时用它。
 std::string game_meta_fields(const std::string& name, const std::string& title_id, const NameOverrides& overrides,
-                             bool detail, std::string* search_text = nullptr, panplay::StoreMeta* meta_out = nullptr) {
+                             bool detail, std::string* search_text = nullptr, panplay::StoreMeta* meta_out = nullptr,
+                             const std::string& shelf_name = "") {
   panplay::CatalogMatch match;
   if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
   const std::int64_t concept_id = match.found ? match.entry.concept_id : 0;
@@ -535,9 +564,14 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
   } else if (match.found) {
     display_name = match.entry.name;
     name_source = "catalog";
+  } else if (!shelf_name.empty()) {
+    display_name = shelf_name;
+    name_source = "shelf";
   }
 
-  if (search_text != nullptr) *search_text = display_name + "\n" + (match.found ? match.entry.name : "");
+  if (search_text != nullptr) {
+    *search_text = display_name + "\n" + (match.found ? match.entry.name : "") + "\n" + shelf_name;
+  }
 
   std::string cover_url;
   // 封面从 AVIF、WebP 换成 JPEG 时抓取时间不变，加上 jpg 让浏览器别用缓存的旧图。
@@ -556,10 +590,17 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
   return json + store_meta_fields(meta, detail);
 }
 
+// 盘架资源库里这款游戏的名字，没有时为空。
+std::string shelf_name_of(const std::string& title_id) {
+  const auto library = shelf_library();
+  const ShelfGame* game = library ? library->find(title_id) : nullptr;
+  return game ? game->name : "";
+}
+
 std::string meta_json(const std::string& name, const NameOverrides& overrides, bool detail) {
   const std::string title_id = panplay::find_title_id(name);
   return "{\"name\":\"" + panplay::json_escape(name) + "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\"" +
-         game_meta_fields(name, title_id, overrides, detail) + "}";
+         game_meta_fields(name, title_id, overrides, detail, nullptr, nullptr, shelf_name_of(title_id)) + "}";
 }
 
 std::string folder_json(const std::string& name, const std::string& path, const std::string& title_id,
@@ -620,6 +661,19 @@ std::string sizes_key(const AppSettings& settings) { return settings.drive + "\n
 std::shared_ptr<const ShelfListing> cached_shelf(const AppSettings& settings) {
   std::lock_guard<std::mutex> lock(shelf_mu);
   return shelf_cache && shelf_cache->key == shelf_key(settings) ? shelf_cache : nullptr;
+}
+
+// 主机上装着的、网盘游戏库目录里也有的游戏目录，按列表上次读到的安装情况。写进在用记录，腾网盘空间时先退它们。
+std::set<std::string> installed_game_dirs() {
+  std::set<std::string> dirs;
+  const auto listing = cached_shelf(load_settings());
+  if (!listing || !listing->sink_ready) return dirs;
+  for (const auto& folder : listing->folders) {
+    if (listing->placement.installed_dirs.count(folder.title_id.empty() ? folder.name : folder.title_id) != 0) {
+      dirs.insert(folder.path);
+    }
+  }
+  return dirs;
 }
 
 bool same_listing(const ShelfListing& left, const ShelfListing& right) {
@@ -824,13 +878,39 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
   std::vector<Row> rows;
   std::size_t installed = 0;
   std::size_t continuing = 0;
-  std::vector<std::pair<const ShelfListing::Folder*, bool>> entries;
-  for (const auto& folder : listing->folders) entries.emplace_back(&folder, true);
-  for (const auto& folder : listing->orphans) entries.emplace_back(&folder, false);
-  for (const auto& [entry, on_drive] : entries) {
+  // drive：网盘游戏库目录里的；console：装在主机上、网盘里已经没有的；shelf：盘架资源库里有、网盘里还没有的，
+  // 路径按转存后会放的位置拼，装的时候先转存（ADR 0011）。
+  enum class Where { drive, console, shelf };
+  const auto library = shelf_library();
+  std::vector<ShelfListing::Folder> remote_folders;
+  std::map<std::string, const ShelfGame*> shelf_games;
+  if (library) {
+    std::unordered_set<std::string> on_drive;
+    for (const auto& folder : listing->folders) on_drive.insert(folder.title_id);
+    const std::string library_path = load_settings().library_path();
+    for (const auto& game : library->games) {
+      if (on_drive.count(game.title_id) != 0) continue;
+      const auto orphan = std::find_if(listing->orphans.begin(), listing->orphans.end(),
+                                       [&](const ShelfListing::Folder& folder) { return folder.title_id == game.title_id; });
+      if (orphan != listing->orphans.end()) {
+        shelf_games[orphan->path] = &game;
+        continue;
+      }
+      remote_folders.push_back({game.title_id, panplay::join_storage_path(library_path, game.title_id), game.title_id});
+      shelf_games[remote_folders.back().path] = &game;
+    }
+  }
+  std::vector<std::pair<const ShelfListing::Folder*, Where>> entries;
+  for (const auto& folder : listing->folders) entries.emplace_back(&folder, Where::drive);
+  for (const auto& folder : listing->orphans) entries.emplace_back(&folder, Where::console);
+  for (const auto& folder : remote_folders) entries.emplace_back(&folder, Where::shelf);
+  for (const auto& [entry, where] : entries) {
     const ShelfListing::Folder& folder = *entry;
+    const bool on_drive = where == Where::drive;
+    const auto found = shelf_games.find(folder.path);
+    const ShelfGame* shelf = found == shelf_games.end() ? nullptr : found->second;
     std::string state = "need-settings";
-    if (!on_drive) state = "installed";
+    if (where == Where::console) state = "installed";
     else if (listing->sink_ready) state = shelf_state(placement, folder.name, folder.title_id, folder.path);
     else if (listing->dest_ready) state = "install";
     // 有没有新补丁要读网盘目录和完成标记，列表不读，用详情页上次读到的。
@@ -846,7 +926,8 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     if (filter == "continue" && state != "continue") continue;
     std::string search_text;
     panplay::StoreMeta store;
-    const std::string meta = game_meta_fields(folder.name, folder.title_id, overrides, false, &search_text, &store);
+    const std::string meta = game_meta_fields(folder.name, folder.title_id, overrides, false, &search_text, &store,
+                                              shelf ? shelf->name : "");
     if (!needle.empty() &&
         ascii_lower(folder.name + "\n" + folder.title_id + "\n" + search_text).find(needle) == std::string::npos) {
       continue;
@@ -855,11 +936,20 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     if (multi_only && !(store.found && store.players >= 2)) continue;
     const std::string shown = search_text.substr(0, search_text.find('\n'));
     // 打开过详情、读过压缩包的才知道指纹；没读过的不查，列表不为这个多发请求。
-    std::string review_field = on_drive ? "" : ",\"on_drive\":false";
+    std::string review_field = where == Where::console ? ",\"on_drive\":false" : "";
+    if (shelf) review_field += ",\"remote\":true";
     if (const auto review = find_review(listed_fingerprint(listing->key, folder.path))) {
       review_field += std::string(",\"review_state\":\"") + (review->playable ? "good" : "bad") + "\"";
+    } else if (shelf) {
+      // 盘架把分享和评价对上了的，网盘里还没有也能标出来。
+      for (const auto& variant : shelf->variants) {
+        if (!variant.reviewed) continue;
+        review_field += std::string(",\"review_state\":\"") + (variant.playable ? "good" : "bad") + "\"";
+        break;
+      }
     }
-    const std::int64_t bytes = on_drive ? listed_bytes(sizes, listing->key, folder.path) : 0;
+    std::int64_t bytes = on_drive ? listed_bytes(sizes, listing->key, folder.path) : 0;
+    if (!on_drive && shelf) bytes = shelf->variants.front().size;
     rows.push_back({folder_json(folder.name, folder.path, folder.title_id, bytes, state, meta + review_field),
                     shown.empty() ? folder.name : shown, std::move(store)});
   }
@@ -957,19 +1047,95 @@ std::string layers_json(const panplay::GameFolder& game, const std::set<std::str
 }
 
 // 实时读网盘上的压缩包和主机上的安装情况。主机连不上时安装情况用 fallback（上次读到的）。
+std::string shelf_variant_json(const ShelfVariant& variant) {
+  return ",\"remote\":true,\"size\":" + std::to_string(variant.size) + ",\"alive\":" +
+         (variant.alive < 0 ? "null" : variant.alive ? "true" : "false") + ",\"version\":\"" +
+         panplay::json_escape(variant.version) + "\",\"firmware\":\"" + panplay::json_escape(variant.firmware) +
+         "\",\"review_state\":\"" + (variant.reviewed ? (variant.playable ? "good" : "bad") : "") +
+         "\",\"review_note\":\"" + panplay::json_escape(variant.review_note) + "\"";
+}
+
+// 资源库里有、网盘里还没有的那种格式：主机上的情况照常读，压缩包要等转存之后才知道。
+void read_remote_detail(const AppSettings& settings, const std::string& path, const ShelfVariant* variant,
+                        const std::optional<GameDetail>& fallback, GameDetail& detail) {
+  detail.archive_bytes = variant ? variant->size : 0;
+  detail.formats = "-";
+  detail.layers = "[]";
+  detail.state = "need-settings";
+  panplay::Destination destination;
+  std::string dest_error;
+  if (settings.dest().empty() || !panplay::parse_destination(settings.dest(), &destination, &dest_error)) return;
+  panplay::GameFolder game;
+  game.name = folder_name_of(path);
+  game.path = path;
+  game.title_id = panplay::find_title_id(game.name);
+  if (auto sink = panplay::open_destination(destination, &dest_error)) {
+    detail.state = game_state(*sink, settings.prefix(), game);
+    if (detail.state == "installed") {
+      const auto installed_variant = panplay::installed_variant(*sink, settings.prefix(), path);
+      detail.installed_variant = installed_variant.value_or("");
+      if (installed_variant && *installed_variant != panplay::variant_format(path) && path != panplay::game_dir_of(path)) {
+        detail.state = "other";
+      }
+    }
+  } else if (fallback && fallback->state != "need-settings") {
+    detail.state = fallback->state;
+    detail.installed_variant = fallback->installed_variant;
+  } else if (const auto listing = cached_shelf(settings); listing && listing->sink_ready) {
+    detail.state = shelf_state(listing->placement, game.name, game.title_id, path);
+  } else {
+    detail.state = "install";
+  }
+}
+
 GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& path,
                             const std::optional<GameDetail>& fallback, std::string* error) {
   GameDetail detail;
-  const auto variants = panplay::list_variants(drive, panplay::game_dir_of(path), error);
+  const std::string game_dir = panplay::game_dir_of(path);
+  const auto library = shelf_library();
+  const ShelfGame* shelf = library ? library->find(panplay::find_title_id(folder_name_of(path))) : nullptr;
+  const auto variants = panplay::list_variants(drive, game_dir, error);
+  // 网盘里还没有这款游戏，资源库里有：照样列出它的各种格式，装的时候先转存。
+  const bool missing = shelf && error->find("errno=-9") != std::string::npos;
+  if (missing) error->clear();
   if (!error->empty()) return detail;
-  if (!variants.empty()) {
+  // 网盘里是没分格式的旧目录时不加资源库的格式，照旧装网盘里那份。
+  struct Listed {
+    std::string format;
+    std::string path;
+    const ShelfVariant* shelf = nullptr;
+  };
+  std::vector<Listed> listed;
+  for (const auto& variant : variants) listed.push_back({variant.format, variant.path, nullptr});
+  if (shelf && (missing || !variants.empty())) {
+    for (const auto& item : shelf->variants) {
+      const std::string dir = shelf_variant_dir(item.format);
+      const std::string variant_path = panplay::join_storage_path(game_dir, dir);
+      const bool present = std::any_of(variants.begin(), variants.end(),
+                                       [&](const panplay::GameVariant& variant) { return variant.path == variant_path; });
+      if (!present) listed.push_back({dir.substr(1), variant_path, &item});
+    }
+  }
+  const auto rank = [](const std::string& format) {
+    return format == "exfat" ? 0 : format == "folder" ? 1 : format.empty() ? 3 : 2;
+  };
+  std::stable_sort(listed.begin(), listed.end(),
+                   [&](const Listed& left, const Listed& right) { return rank(left.format) < rank(right.format); });
+  const ShelfVariant* remote_here = nullptr;
+  if (!listed.empty()) {
     detail.variants = "[";
-    for (const auto& variant : variants) {
+    for (const auto& variant : listed) {
       if (detail.variants.size() > 1) detail.variants += ",";
       detail.variants += "{\"format\":\"" + panplay::json_escape(variant.format) + "\",\"path\":\"" +
-                         panplay::json_escape(variant.path) + "\"}";
+                         panplay::json_escape(variant.path) + "\"" +
+                         (variant.shelf ? shelf_variant_json(*variant.shelf) : "") + "}";
+      if (variant.shelf && variant.path == path) remote_here = variant.shelf;
     }
     detail.variants += "]";
+  }
+  if (remote_here || missing) {
+    read_remote_detail(settings, path, remote_here, fallback, detail);
+    return detail;
   }
   const auto files = panplay::collect_archives(drive, path, error);
   if (!error->empty()) return detail;
@@ -1049,6 +1215,7 @@ std::string game_display_name(const std::string& path) {
   if (match.found && match.entry.concept_id > 0 && store_meta != nullptr) store_meta->lookup(match.entry.concept_id, &meta);
   if (meta.found && !meta.name.empty()) return meta.name;
   if (match.found && !match.entry.name.empty()) return match.entry.name;
+  if (const std::string shelf = shelf_name_of(title_id); !shelf.empty()) return shelf;
   return name;
 }
 
@@ -1206,6 +1373,19 @@ void announce_installed(const std::string& path, bool registered) {
 }
 #endif
 
+// 这个变体（或整款游戏）网盘里还没有，只在资源库里：装的时候先转存。
+bool not_on_drive(const GameDetail& detail, const std::string& path) {
+  const auto variants = panplay::Json::parse(detail.variants, nullptr).array;
+  if (variants.empty()) return false;
+  if (path == panplay::game_dir_of(path)) {
+    return std::all_of(variants.begin(), variants.end(),
+                       [](const panplay::Json& variant) { return variant.boolean_or("remote", false); });
+  }
+  return std::any_of(variants.begin(), variants.end(), [&](const panplay::Json& variant) {
+    return variant.str("path") == path && variant.boolean_or("remote", false);
+  });
+}
+
 // 详情页要的游戏信息。cached 时只给上次读到的（source 为 cache，没有时为 none），立刻返回；
 // 否则实时读网盘和主机（source 为 live），读到的存起来，游戏库列表缓存里这款游戏的状态也跟着改。
 std::string one_game_json(const std::string& path, bool cached) {
@@ -1241,13 +1421,16 @@ std::string one_game_json(const std::string& path, bool cached) {
     if (!error.empty()) return json_error(error);
     store_game_detail(key, path, live);
     if (fill_review_parts(live.fingerprint, review_parts(live))) review_changed();
-    GameSize size{live.archive_bytes, {}};
-    if (panplay::game_dir_of(path) == path) {
-      for (const auto& variant : panplay::Json::parse(live.variants, nullptr).array) {
-        size.variants.push_back({variant.str("format"), variant.str("path")});
+    // 网盘里还没有的不记容量，后台量容量时它不在网盘上，会被当成删掉的记录清掉。
+    if (!not_on_drive(live, path)) {
+      GameSize size{live.archive_bytes, {}};
+      if (panplay::game_dir_of(path) == path) {
+        for (const auto& variant : panplay::Json::parse(live.variants, nullptr).array) {
+          if (!variant.boolean_or("remote", false)) size.variants.push_back({variant.str("format"), variant.str("path")});
+        }
       }
+      if (store_game_size(sizes_key(settings), path, size)) library_changed();
     }
-    if (store_game_size(sizes_key(settings), path, size)) library_changed();
     sync_shelf_state(key, name, title_id, live.state);
     // 暂存区已经没了（在别处删掉或装完），下次就是从头装，旧记录取较大值会把进度显示高。
     if (live.state == "install" || live.state == "installed" || live.state == "update") forget_install_progress(path);
@@ -1260,6 +1443,9 @@ std::string one_game_json(const std::string& path, bool cached) {
                      panplay::json_escape(panplay::variant_format(path)) + "\",\"title_id\":\"" +
                      panplay::json_escape(title_id) + "\",\"source\":\"" + source + "\"";
   if (orphan) json += ",\"on_drive\":false";
+  // 读到详情就带上：详情页切换格式时用 Object.assign 合并，不带的话上一种格式的 true 会留下来。
+  // 还没读到时不带，免得把游戏库格子上的标记冲掉。
+  if (detail) json += std::string(",\"remote\":") + (not_on_drive(*detail, path) ? "true" : "false");
   if (detail) {
     json += ",\"variants\":" + (detail->variants.empty() ? std::string("[]") : detail->variants) +
             ",\"installed_variant\":\"" + panplay::json_escape(detail->installed_variant) + "\"";
@@ -1290,7 +1476,7 @@ std::string one_game_json(const std::string& path, bool cached) {
     const auto others = reviews_of_title(title_id, detail->fingerprint);
     json += ",\"other_review\":" + (others.empty() ? std::string("null") : review_json(others.front()));
   }
-  return json + game_meta_fields(name, title_id, load_name_overrides(), true) + "}";
+  return json + game_meta_fields(name, title_id, load_name_overrides(), true, nullptr, nullptr, shelf_name_of(title_id)) + "}";
 }
 
 constexpr double kRecentRateSeconds = 60;
@@ -1406,7 +1592,32 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
       result.message = error;
       // 填好了却连不上（FTP 那头的主机在休眠、网络还没恢复），等一会儿再连；没填好的等也没用。
       result.auto_resume = !settings.dest().empty();
-    } else {
+      return result;
+    }
+    // 网盘里还没有、盘架资源库里有的：先腾空间、转存进来（ADR 0011）。
+    const PrepareResult prepared =
+        prepare_on_drive(*drive, settings, sizes_key(settings), path, queued_paths(), *cancel, [](const std::string& message) {
+          panplay::InstallResult step;
+          step.message = message;
+          publish_progress(step);
+        });
+    if (prepared.transferred) {
+      std::string listing_error;
+      shelf_listing(*drive, true, &listing_error);
+    }
+    if (cancel->cancelled()) {
+      result.status = "interrupted";
+      result.message = "已中断，再次执行安装会继续";
+      return result;
+    }
+    if (!prepared.error.empty()) {
+      result.status = "error";
+      result.message = prepared.error;
+      result.retryable = prepared.retryable;
+      result.auto_resume = prepared.auto_resume;
+      return result;
+    }
+    {
       panplay::InstallRequest request;
       request.source_dir = path;
       request.dest_prefix = settings.prefix();
@@ -1499,7 +1710,10 @@ void queue_worker() {
       panplay::log_info("开始安装，停掉正在进行的测速");
     }
     panplay::log_info("开始安装 " + path);
+    usage_install_started(path);
+    usage_used(path);
     panplay::InstallResult result = install_with_auto_resume(path, *cancel);
+    usage_install_stopped(path);
     if (result.status == "interrupted" && cancel->cancelled()) {
       result.message = "已暂停，已装好 " + std::to_string(result.files_done) + " 个文件，点继续接着装";
     }
@@ -1651,7 +1865,7 @@ std::string task_json(const InstallTask& task, const char* state, const NameOver
          ",\"files_checked\":" + std::to_string(r.files_checked) + ",\"files_to_check\":" + std::to_string(r.files_to_check) +
          ",\"dictionary\":" + std::to_string(r.dictionary) + ",\"slow\":\"" + panplay::json_escape(r.slow) + "\"" +
          ",\"retryable\":" + (r.retryable ? "true" : "false") + rate_fields(task, std::strcmp(state, "running") == 0) +
-         game_meta_fields(name, title_id, overrides, false) + "}";
+         game_meta_fields(name, title_id, overrides, false, nullptr, nullptr, shelf_name_of(title_id)) + "}";
 }
 
 // 队列顺序：正在装的，排队的，最近完成的。
@@ -2050,6 +2264,10 @@ void handle_client(SOCKET client, bool local_peer) {
     reply_json(client, 200, catalog_status_json());
     return;
   }
+  if (method == "GET" && target == "/api/shelf-library") {
+    reply_json(client, 200, shelf_library_status_json(load_settings().library_path()));
+    return;
+  }
   if (method == "POST" && target == "/api/catalog/reload") {
     std::string catalog_error;
     const bool ok = panplay::GameCatalog::instance().reload(&catalog_error);
@@ -2276,6 +2494,7 @@ void handle_client(SOCKET client, bool local_peer) {
   }
   if (method == "GET" && (target == "/api/games" || target.rfind("/api/games?", 0) == 0)) {
     refresh_reviews_if_stale();
+    refresh_shelf_library_if_stale();
     auto drive = open_drive();
     const auto mark = target.find('?');
     const std::string json = games_json(*drive, mark == std::string::npos ? "" : target.substr(mark + 1));
@@ -2710,6 +2929,8 @@ int run_server(const ServerOptions& options) {
   load_queue();
   start_review_sync(open_drive);
   start_size_scan(open_drive, library_changed);
+  start_shelf_library_sync(open_drive, library_changed);
+  start_drive_usage_sync(open_drive, installed_game_dirs);
   PANPLAY_DEBUG("安装队列恢复完，开始接受连接");
   while (true) {
     sockaddr_in peer{};

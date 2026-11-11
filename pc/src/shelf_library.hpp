@@ -1,0 +1,65 @@
+#pragma once
+
+#include "panplay/drive.hpp"
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+// 盘架发布的资源库（网盘 /盘游/资源库.json）：盘架采集到的全部游戏和它们的分享链接。游戏库按它把网盘里还没有的
+// 游戏也列出来，装的时候盘游自己转存。见 ADR 0011。
+
+struct ShelfVariant {
+  // exfat、folder、unknown，网盘里分别放在 @exfat、@folder、@other。
+  std::string format;
+  std::string surl;
+  std::string pwd;
+  std::string version;
+  std::string firmware;
+  // 分享里文件的总大小，盘架还没列过分享时为 0。
+  std::int64_t size = 0;
+  // 链接还能不能用：1 能用，0 失效，-1 盘架还没查过。
+  int alive = -1;
+  std::int64_t checked_at = 0;
+  // 盘架把分享里的文件和盘游的评价对上了：就是评过的那份。
+  bool reviewed = false;
+  bool playable = true;
+  std::string review_note;
+};
+
+struct ShelfGame {
+  std::string title_id;
+  std::int64_t concept_id = 0;
+  std::string name;
+  std::int64_t added_at = 0;
+  std::vector<ShelfVariant> variants;
+};
+
+struct ShelfLibrary {
+  std::int64_t generated_at = 0;
+  // 盘架的转存目录；和盘游的游戏库目录不一样时设置页提示。
+  std::string library_dir;
+  std::vector<ShelfGame> games;
+
+  const ShelfGame* find(const std::string& title_id) const;
+};
+
+std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::string* error);
+
+// 资源库格式（unknown）和网盘里变体目录名（@other）互换。
+std::string shelf_variant_dir(const std::string& format);
+std::string shelf_format_of(const std::string& variant_format);
+
+// 启动时先用上次存在本机的那份，之后在后台每 30 分钟看一次网盘上的文件有没有变。on_change 在读到新内容时调用。
+void start_shelf_library_sync(std::function<std::shared_ptr<panplay::DrivePlugin>()> open_drive,
+                              std::function<void()> on_change);
+// 打开游戏库时调用：几分钟没看过就在后台看一次。
+void refresh_shelf_library_if_stale();
+// 当前的资源库，从没读到过时为空指针。
+std::shared_ptr<const ShelfLibrary> shelf_library();
+// 自测用：直接换上一份资源库。
+void use_shelf_library(std::shared_ptr<const ShelfLibrary> library);
+// 设置页显示的状态：读到了几款游戏、什么时候发布的、上次出了什么错。
+std::string shelf_library_status_json(const std::string& library_path);
