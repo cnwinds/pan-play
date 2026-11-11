@@ -2293,7 +2293,7 @@ function summarizeSettings() {
   setTabStatus("log", verbose ? "详细日志开着" : "只记要紧的", verbose ? "warn" : "ok");
 }
 
-// 盘架发布的资源库：读到了几款游戏，盘架转存到的目录和这里的游戏库目录对不对得上。
+// 盘架发布的资源库：读到了几款游戏；盘架转存到的目录和这里的游戏库目录对不上时，直接填成盘架的。
 async function loadShelfLibraryStatus() {
   const info = await api("/api/shelf-library");
   const box = $("#shelf-library-status");
@@ -2303,7 +2303,11 @@ async function loadShelfLibraryStatus() {
   } else {
     const at = info.generated_at ? serverClockDate(info.generated_at * 1000) : null;
     parts.push(`盘架资源库：${info.count} 款游戏${at ? `，${at.getUTCMonth() + 1}/${at.getUTCDate()} 发布` : ""}。网盘里还没有的点安装时自动转存。`);
-    if (info.mismatch) parts.push(`盘架把游戏转存到 ${info.library_dir}，和这里填的游戏库目录不一样，两边要填同一个目录。`);
+    if (info.mismatch) {
+      form.elements.library_path.value = info.library_dir;
+      rememberDrive();
+      parts.push(`盘架把游戏转存到 ${info.library_dir}，游戏库目录已填成同一个，点保存生效。`);
+    }
   }
   if (info.error) parts.push(`上次读取失败：${info.error}`);
   box.textContent = parts.join("");
@@ -2549,6 +2553,7 @@ form.addEventListener("submit", async (event) => {
     savedTarget = body.target;
     settingsNote.textContent = "已保存。";
     summarizeSettings();
+    loadShelfLibraryStatus().catch(() => {});
     if (loggedIn) loadGames();
   } catch (error) {
     settingsNote.classList.add("error");
