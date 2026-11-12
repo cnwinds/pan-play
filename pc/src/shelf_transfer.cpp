@@ -187,7 +187,7 @@ std::string make_room(panplay::DrivePlugin& drive, const AppSettings& settings, 
   if (freed >= to_free) return "";
   std::string message = "网盘空间不够：还差约 " + gb_text(to_free - freed) +
                         "。能再转回来的游戏都退出网盘了，自己放的、链接失效的、正在装的不会动。";
-  if (trashed) message += "有的游戏百度要求安全验证、只移到了 /盘游待删除，在百度网盘 App 里删掉这个文件夹才会腾出空间。";
+  if (trashed) message += "有的游戏百度要求安全验证、只移到了 /盘游/待删除，在百度网盘 App 里清空这个文件夹才会腾出空间。";
   message += "可以在设置里调高游戏占用上限，或者自己清理网盘。";
   return message;
 }

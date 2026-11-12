@@ -83,8 +83,8 @@ class FakeDrive : public panplay::DrivePlugin {
     if (moved_to) moved_to->clear();
     if (!has(path)) return "没有 " + path;
     if (need_verify.count(path) != 0) {
-      if (moved_to) *moved_to = "/盘游待删除";
-      return move_path(path, "/盘游待删除/" + path.substr(path.find_last_of('/') + 1));
+      if (moved_to) *moved_to = "/盘游/待删除";
+      return move_path(path, "/盘游/待删除/" + path.substr(path.find_last_of('/') + 1));
     }
     for (auto it = nodes.begin(); it != nodes.end();) {
       it = it->first == path || it->first.rfind(path + "/", 0) == 0 ? nodes.erase(it) : std::next(it);
@@ -273,7 +273,7 @@ int check_not_enough() {
     return fail("空间不够时应该说明原因：" + result.error);
   }
   if (drive.transfers != 0) return fail("空间不够不该转存");
-  if (!drive.has("/盘游待删除/@folder")) return fail("要安全验证的应该移进待删除");
+  if (!drive.has("/盘游/待删除/@folder")) return fail("要安全验证的应该移进待删除");
   if (!drive.has("/lib/PPSA00004/@exfat")) return fail("本机队列里的不能退");
   return 0;
 }

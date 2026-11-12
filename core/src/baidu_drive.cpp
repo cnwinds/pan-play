@@ -53,8 +53,9 @@ constexpr int kErrnoNotLoggedIn = -6;
 const std::string kNetdiskUa =
     "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;";
 // 百度风控要求安全验证时（网页版会弹短信验证）删不掉文件，移动不受影响，改为移进这个目录等用户自己清空。
+// 和盘架共用；以前放在根目录的 /盘游待删除 由盘架启动时并进来。
 constexpr int kErrnoNeedVerify = 132;
-const std::string kTrashDir = "/盘游待删除";
+const std::string kTrashDir = "/盘游/待删除";
 
 bool write_file_atomic(const std::string& path, const std::string& text) {
   const std::filesystem::path target = std::filesystem::u8path(path);

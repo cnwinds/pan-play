@@ -2796,8 +2796,8 @@ void handle_client(SOCKET client, bool local_peer) {
       reply_json(client, 400, json_error("游戏库目录里没有这个文件夹，可能已经从网盘删掉了"));
       return;
     }
-    // 游戏库设成网盘根目录时，盘游自己放评价的目录和待删除目录也会列成游戏。
-    if (path == "/盘游" || path == "/盘游待删除") {
+    // 游戏库设成网盘根目录时，盘游自己用的目录（评价、待删除都在 /盘游 里）和旧版的待删除目录也会列成游戏。
+    if (path == "/盘游" || path == "/盘游待删除" || path == "/盘架待删除" || path == "/盘架临时") {
       reply_json(client, 400, json_error("这是盘游自己用的文件夹，不能当游戏删除"));
       return;
     }
