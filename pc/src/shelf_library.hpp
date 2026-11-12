@@ -5,11 +5,39 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 // 盘架发布的资源库（网盘 /盘游/资源库.json）：盘架采集到的全部游戏和它们的分享链接。游戏库按它把网盘里还没有的
 // 游戏也列出来，装的时候盘游自己转存。见 ADR 0011。
+
+// 盘架用大模型排的安装编排（ADR 0012）。路径相对去掉外包目录后的分享根。
+struct ShelfPlanFile {
+  std::string path;
+  std::int64_t size = 0;
+  std::string md5;
+};
+
+struct ShelfPlanLayer {
+  std::string role;
+  std::string name;
+  std::vector<ShelfPlanFile> files;
+};
+
+struct ShelfPlanCopy {
+  ShelfPlanFile from;
+  std::string to;
+};
+
+struct ShelfPlan {
+  int rev = 0;
+  // 按叠放顺序，第一层是主游戏。
+  std::vector<ShelfPlanLayer> layers;
+  std::vector<ShelfPlanCopy> copies;
+  // 盘游做不了、要提醒用户的步骤。
+  std::vector<std::string> notes;
+};
 
 struct ShelfVariant {
   // exfat、folder、unknown，网盘里分别放在 @exfat、@folder、@other。
@@ -27,6 +55,7 @@ struct ShelfVariant {
   bool reviewed = false;
   bool playable = true;
   std::string review_note;
+  std::optional<ShelfPlan> plan;
 };
 
 struct ShelfGame {
@@ -44,6 +73,8 @@ struct ShelfLibrary {
   std::vector<ShelfGame> games;
 
   const ShelfGame* find(const std::string& title_id) const;
+  // 网盘里变体目录对应的那种格式（variant_format 给 exfat、folder、other），没有时为空指针。
+  const ShelfVariant* variant(const std::string& title_id, const std::string& variant_format) const;
 };
 
 std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::string* error);

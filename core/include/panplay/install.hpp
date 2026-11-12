@@ -41,8 +41,23 @@ struct InstallResult {
   std::string slow;
 };
 
+// 盘架排的安装编排（ADR 0012），文件已经对到网盘里。
+struct PlanCopy {
+  DriveEntry file;
+  // 相对游戏根目录的位置，同名的覆盖压缩包里的。
+  std::string target;
+};
+
+struct InstallPlan {
+  // 按叠放顺序，第一层是主游戏。
+  std::vector<ArchiveSet> layers;
+  std::vector<PlanCopy> copies;
+};
+
 struct InstallRequest {
   std::string source_dir;
+  // 给了时只装这些压缩包组、按这个顺序叠，再把单独的文件放进游戏目录；不给时按目录里的压缩包猜。
+  std::optional<InstallPlan> plan;
   std::string dest_prefix = "/data/homebrew";
   std::int64_t stop_after_output_bytes = -1;
   // 扫描和逐个文件完成时回调。安装结束前就会调用，方便界面不必等到整包结束。
@@ -176,10 +191,11 @@ InstallResult install_game(DrivePlugin& drive, InstallSink& sink, const InstallR
 // 安装耗时总账写明装的时候主机上在运行哪个游戏：probe 返回正在运行的游戏的 Title ID，没有时为空。
 // 安装线程大约每 10 秒调一次。不设时不记。
 void set_running_game_probe(std::function<std::string()> probe);
-// 游戏已经装好，但网盘目录里（除去 skip_sets）的压缩包和装的时候不一样了（比如多了补丁）。
-// 没装好、装的是这款游戏的另一种格式时返回 false。
+// 游戏已经装好，但网盘目录里（除去 skip_sets）的压缩包和装的时候不一样了（比如多了补丁），
+// 或者编排要放的单独文件（copies）还没放进去。没装好、装的是这款游戏的另一种格式时返回 false。
 bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
-                      const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets = {});
+                      const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets = {},
+                      const std::vector<PlanCopy>& copies = {});
 // 已装好的游戏按顺序叠了哪些压缩包组（archive_set_id）。没装好或旧版本装的返回空。
 std::vector<std::string> installed_sets(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 // 这款游戏装好的是哪种格式（variant_format）。没装好时为空 optional；旧版本装的、从没分格式的游戏目录装的也为空 optional，

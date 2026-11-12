@@ -1343,6 +1343,9 @@ function openDetail(game, opener) {
   status.setAttribute("role", "status");
   // 网盘里还没有的格式：说一句装的时候会先转存，链接失效、评过有问题的也在这里说。
   const remoteNote = el("p", "remote-note");
+  // 盘架编排里盘游做不了、要用户自己做的步骤（ADR 0012）。
+  const shelfNotes = el("div", "shelf-notes");
+  let shelfNotesKey = null;
   // 不常用的操作（调整补丁、注册到主机、删除）收在主按钮旁的「⋯」菜单里，主按钮只管安装和显示状态。
   const menuItem = (text, className = "") => {
     const item = el("button", "more-item " + className, text);
@@ -1355,6 +1358,7 @@ function openDetail(game, opener) {
   const discard = menuItem("删除已装的部分", "danger");
   const remove = menuItem("删除游戏", "danger");
   const unshelve = menuItem("从网盘删除", "danger");
+  const reshelf = menuItem("让盘架重新分析");
   const more = el("button", "btn more");
   more.type = "button";
   more.setAttribute("aria-haspopup", "menu");
@@ -1362,7 +1366,7 @@ function openDetail(game, opener) {
   more.innerHTML = '<svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true" fill="currentColor"><circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13" cy="8" r="1.5"/></svg>';
   const menu = el("div", "more-menu");
   menu.setAttribute("role", "menu");
-  menu.append(adjust, registerItem, discard, remove, unshelve);
+  menu.append(adjust, registerItem, reshelf, discard, remove, unshelve);
   const moreWrap = el("div", "more-wrap");
   moreWrap.append(more, menu);
   let menuOpen = false;
@@ -1608,7 +1612,7 @@ function openDetail(game, opener) {
     }));
   };
 
-  install.append(variantRow, remoteNote, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
+  install.append(variantRow, remoteNote, shelfNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1719,6 +1723,15 @@ function openDetail(game, opener) {
     }
     remoteNote.textContent = remoteText;
     remoteNote.hidden = !remoteText || picking || confirm.open;
+    const notes = game.shelf_notes || [];
+    shelfNotes.hidden = !notes.length || picking || confirm.open;
+    const notesKey = JSON.stringify(notes);
+    if (notesKey !== shelfNotesKey) {
+      shelfNotesKey = notesKey;
+      const list = el("ul");
+      for (const note of notes) list.append(el("li", "", note));
+      shelfNotes.replaceChildren(el("strong", "", "盘架说明：这些要你自己做"), list);
+    }
     remoteNote.classList.toggle("warn", linkDead || remoteVariant?.review_state === "bad");
     if (picking && (running || queued)) {
       picking = false;
@@ -1737,8 +1750,12 @@ function openDetail(game, opener) {
     reviewItem.hidden = !game.fingerprint || busy || (!game.review && !installedNow);
     reviewItem.textContent = game.review ? "修改评价" : "评价这个版本";
     unshelve.hidden = !game.path || busy || game.state === "continue" || game.on_drive === false || game.remote;
+    // 资源库里有这种格式才通知得了盘架；已经通知过、盘架还没重新分析时不再点。
+    reshelf.hidden = game.shelf_plan === undefined || busy;
+    reshelf.disabled = Boolean(game.shelf_feedback);
+    reshelf.textContent = game.shelf_feedback ? "已通知盘架，等它重新分析" : "让盘架重新分析";
     paintReview(installedNow, busy || unshelved);
-    moreWrap.hidden = unshelved || [adjust, registerItem, reviewItem, discard, remove, unshelve].every((item) => item.hidden);
+    moreWrap.hidden = unshelved || [adjust, registerItem, reviewItem, reshelf, discard, remove, unshelve].every((item) => item.hidden);
     if (moreWrap.hidden && menuOpen) setMenu(false);
     // 注册有问题时说注册的事，没问题时说 backport 库和最近一次启动的经过。
     let consoleNote = null;
@@ -1862,6 +1879,17 @@ function openDetail(game, opener) {
   };
   consoleAction.addEventListener("click", registerConsole);
   registerItem.addEventListener("click", registerConsole);
+  reshelf.addEventListener("click", async () => {
+    clearFailure();
+    try {
+      await api("/api/shelf-feedback", { path: game.path });
+      game.shelf_feedback = true;
+      say("已通知盘架重新分析这个格式的装法，排好后资源库会更新，到时再装就按新的来。");
+    } catch (error) {
+      if (detail && detail.game === game) detail.fail(error.message);
+    }
+    if (detail && detail.game === game) paint();
+  });
 
   // 立即向商店重新取中文名、封面和简介：服务端把这款插到最前面，这里每秒问一次，取完就刷新详情和封面。
   refreshMeta.addEventListener("click", async () => {

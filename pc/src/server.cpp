@@ -6,7 +6,9 @@
 #include "reviews.hpp"
 #include "drive_usage.hpp"
 #include "settings.hpp"
+#include "shelf_feedback.hpp"
 #include "shelf_library.hpp"
+#include "shelf_plan.hpp"
 #include "shelf_transfer.hpp"
 
 #include "panplay/app_paths.hpp"
@@ -1144,6 +1146,17 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
   game.path = path;
   game.title_id = panplay::find_title_id(game.name);
   game.sets = panplay::group_archives(files);
+  // 有编排、对得上时，列出的压缩包组、有没有更新都按编排（ADR 0012）。
+  std::vector<panplay::PlanCopy> plan_copies;
+  if (const ShelfVariant* planned = library ? library->variant(game.title_id, panplay::variant_format(path)) : nullptr;
+      planned && planned->plan) {
+    std::string plan_error;
+    ResolvedPlan resolved = resolve_plan(drive, path, *planned->plan, &plan_error);
+    if (plan_error.empty() && resolved.missing.empty()) {
+      game.sets = std::move(resolved.plan.layers);
+      plan_copies = std::move(resolved.plan.copies);
+    }
+  }
   for (const auto& set : game.sets) {
     for (const auto& part : set.parts) detail.archive_bytes += part.size;
   }
@@ -1172,7 +1185,7 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
         if (!variants.empty() && installed_variant && *installed_variant != panplay::variant_format(path)) {
           detail.state = "other";
         } else {
-          if (panplay::install_outdated(*sink, settings.prefix(), path, game.sets, load_skipped_sets(path))) {
+          if (panplay::install_outdated(*sink, settings.prefix(), path, game.sets, load_skipped_sets(path), plan_copies)) {
             detail.state = "update";
           }
           detail.installed = panplay::installed_sets(*sink, settings.prefix(), path);
@@ -1446,6 +1459,14 @@ std::string one_game_json(const std::string& path, bool cached) {
   // 读到详情就带上：详情页切换格式时用 Object.assign 合并，不带的话上一种格式的 true 会留下来。
   // 还没读到时不带，免得把游戏库格子上的标记冲掉。
   if (detail) json += std::string(",\"remote\":") + (not_on_drive(*detail, path) ? "true" : "false");
+  // 盘架编排里要提醒的步骤，和这种格式有没有已经通知盘架、还没重新分析的问题（ADR 0012）。
+  if (const auto library = shelf_library()) {
+    if (const ShelfVariant* variant = library->variant(title_id, panplay::variant_format(path))) {
+      json += ",\"shelf_notes\":" + json_string_array(variant->plan ? variant->plan->notes : std::vector<std::string>{}) +
+              ",\"shelf_plan\":" + (variant->plan ? std::to_string(variant->plan->rev) : "0") +
+              ",\"shelf_feedback\":" + (shelf_feedback_pending(path) ? "true" : "false");
+    }
+  }
   if (detail) {
     json += ",\"variants\":" + (detail->variants.empty() ? std::string("[]") : detail->variants) +
             ",\"installed_variant\":\"" + panplay::json_escape(detail->installed_variant) + "\"";
@@ -1577,6 +1598,32 @@ std::unique_ptr<panplay::InstallSink> open_sink(const AppSettings& settings, std
   return sink;
 }
 
+// 盘架给这种格式排了编排、网盘里的文件都对得上时照编排装（ADR 0012）。对不上时告诉盘架重新分析，这次照旧按规则装。
+std::optional<panplay::InstallPlan> install_plan_for(panplay::DrivePlugin& drive, const std::string& path) {
+  const auto library = shelf_library();
+  const ShelfVariant* variant =
+      library ? library->variant(panplay::find_title_id(folder_name_of(path)), panplay::variant_format(path)) : nullptr;
+  if (variant == nullptr || !variant->plan) return std::nullopt;
+  std::string error;
+  ResolvedPlan resolved = resolve_plan(drive, path, *variant->plan, &error);
+  if (!error.empty()) {
+    panplay::log_warn("没能核对盘架的编排，按规则装：" + error);
+    return std::nullopt;
+  }
+  if (!resolved.missing.empty()) {
+    std::string missing;
+    for (std::size_t i = 0; i < resolved.missing.size() && i < 5; ++i) missing += (i ? "、" : "") + resolved.missing[i];
+    if (resolved.missing.size() > 5) missing += " 等 " + std::to_string(resolved.missing.size()) + " 个";
+    report_to_shelf(path, "mismatch", "网盘里找不到 " + missing);
+    panplay::log_warn("网盘里的文件和盘架的编排（第 " + std::to_string(variant->plan->rev) + " 版）对不上，按规则装：找不到 " + missing);
+    return std::nullopt;
+  }
+  panplay::log_info("照盘架的编排（第 " + std::to_string(variant->plan->rev) + " 版）装：" +
+                    std::to_string(resolved.plan.layers.size()) + " 层压缩包，放 " +
+                    std::to_string(resolved.plan.copies.size()) + " 个文件");
+  return std::move(resolved.plan);
+}
+
 panplay::InstallResult run_install(const std::string& path, panplay::CancelToken* cancel) {
   panplay::InstallResult result;
   try {
@@ -1626,8 +1673,15 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
       request.skip_sets = load_skipped_sets(path);
       request.max_dictionary = settings.max_dictionary_mb << 20;
       request.download.memory = download_memory();
+      request.plan = install_plan_for(*drive, path);
       result = panplay::install_game(*drive, *sink, request);
       save_download_memory();
+      // 照编排装，失败原因在压缩包或编排上（不是网络、内存、空间这些）时告诉盘架重新分析。
+      if (request.plan && result.status == "error" && !result.auto_resume && !panplay::is_disk_full_error(result.message) &&
+          result.message.find("字典") == std::string::npos && result.message.find("内存不够") == std::string::npos &&
+          result.message.find("已经装了") == std::string::npos) {
+        report_to_shelf(path, "install_failed", result.message);
+      }
     }
   } catch (const std::exception& ex) {
     result.status = "error";
@@ -2268,6 +2322,23 @@ void handle_client(SOCKET client, bool local_peer) {
     reply_json(client, 200, shelf_library_status_json(load_settings().library_path()));
     return;
   }
+  // 详情页「⋯ › 让盘架重新分析」。
+  if (method == "POST" && target == "/api/shelf-feedback") {
+    std::string parse_error;
+    const panplay::Json json = panplay::Json::parse(body, &parse_error);
+    const std::string path = json.str("path");
+    if (!parse_error.empty() || path.empty()) {
+      reply_json(client, 400, json_error(parse_error.empty() ? "缺少游戏目录" : parse_error));
+      return;
+    }
+    const std::string note = trimmed(json.str("note"));
+    if (!report_to_shelf(path, "manual", note.empty() ? "用户要求重新分析" : note.substr(0, 300))) {
+      reply_json(client, 400, json_error("盘架资源库里没有这种格式，通知不了盘架"));
+      return;
+    }
+    reply_json(client, 200, "{\"ok\":true}");
+    return;
+  }
   if (method == "POST" && target == "/api/catalog/reload") {
     std::string catalog_error;
     const bool ok = panplay::GameCatalog::instance().reload(&catalog_error);
@@ -2644,6 +2715,7 @@ void handle_client(SOCKET client, bool local_peer) {
     }
     review_changed();
     library_changed();
+    if (!review.playable) report_to_shelf(path, "bad_review", review.note.empty() ? "装好后标了有问题" : review.note);
     panplay::log_info(std::string("评价 ") + review.name + "：" + (review.playable ? "能玩" : "有问题 " + review.note) +
                       (review.firmware.empty() ? "" : "，固件 " + review.firmware));
     reply_json(client, 200, "{\"review\":" + review_json(find_review(review.fingerprint).value_or(review)) + "}");
@@ -2931,6 +3003,7 @@ int run_server(const ServerOptions& options) {
   start_size_scan(open_drive, library_changed);
   start_shelf_library_sync(open_drive, library_changed);
   start_drive_usage_sync(open_drive, installed_game_dirs);
+  start_shelf_feedback_sync(open_drive);
   PANPLAY_DEBUG("安装队列恢复完，开始接受连接");
   while (true) {
     sockaddr_in peer{};

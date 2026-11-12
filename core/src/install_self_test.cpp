@@ -1421,6 +1421,71 @@ int package_and_duplicate_test() {
   return 0;
 }
 
+// 照盘架的编排装（ADR 0012）：只装编排里的压缩包组、按编排的顺序叠，单独的文件放进游戏目录覆盖压缩包里的。
+int plan_install_test() {
+  FakeDrive drive;
+  const std::string dir = "/apps/panplay/Plan PPSA42000/@other";
+  const auto param = pattern(300, 21);
+  const auto old_eboot = pattern(5000, 22);
+  const auto new_eboot = pattern(5200, 23);
+  const auto old_lib = pattern(900, 24);
+  const auto new_lib = pattern(1100, 25);
+  drive.add(dir + "/main/game.zip", make_zip({{"PPSA42000-app/sce_sys/param.json", param, true},
+                                              {"PPSA42000-app/eboot.bin", old_eboot, true},
+                                              {"PPSA42000-app/fakelib/libSceAmpr.sprx", old_lib, false}}, {}).front());
+  drive.add(dir + "/huge-stray.zip", make_zip({{"junk.bin", pattern(20000, 26), false}}, {}).front());
+  drive.add(dir + "/patch/p1.zip", make_zip({{"PPSA42000-app/eboot.bin", new_eboot, true}}, {}).front());
+  drive.add(dir + "/apr/libSceAmpr.sprx", new_lib);
+  std::string error;
+  const auto entry = [&](const std::string& folder, const std::string& name) {
+    for (const auto& item : drive.list(folder, &error)) {
+      if (item.name == name) return item;
+    }
+    return DriveEntry{};
+  };
+  InstallPlan plan;
+  plan.layers.push_back(group_archives({entry(dir + "/main", "game.zip")}).front());
+  plan.layers.push_back(group_archives({entry(dir + "/patch", "p1.zip")}).front());
+  InstallPlan old_plan = plan;
+  plan.copies.push_back({entry(dir + "/apr", "libSceAmpr.sprx"), "fakelib/libSceAmpr.sprx"});
+  if (plan.copies.front().file.file_id.empty()) return fail("编排自检没找到要放的文件");
+
+  const std::string root = "/data/homebrew/PPSA42000/";
+  const auto check = [&](MemorySink& sink, const char* when) -> int {
+    if (sink.files[root + "eboot.bin"].bytes != new_eboot) return fail(std::string(when) + "：补丁没按编排盖住主游戏");
+    if (sink.files[root + "fakelib/libSceAmpr.sprx"].bytes != new_lib) return fail(std::string(when) + "：编排要放的文件没覆盖进去");
+    if (sink.files[root + "sce_sys/param.json"].bytes != param) return fail(std::string(when) + "：主游戏的文件不对");
+    for (const auto& file : sink.files) {
+      if (file.first.find("junk.bin") != std::string::npos) return fail(std::string(when) + "：编排外的压缩包也装了");
+      if (file.first.find(".panplay-staging") != std::string::npos) return fail(std::string(when) + "：暂存区有剩: " + file.first);
+    }
+    return 0;
+  };
+
+  MemorySink sink;
+  InstallRequest request;
+  request.source_dir = dir;
+  request.plan = plan;
+  const InstallResult installed = install_game(drive, sink, request);
+  if (installed.status != "installed") return fail("照编排装失败: " + installed.message);
+  if (const int code = check(sink, "照编排装")) return code;
+  if (install_game(drive, sink, request).status != "already") return fail("照编排装好后再装应该是已安装");
+  if (install_outdated(sink, request.dest_prefix, dir, plan.layers, {}, plan.copies)) return fail("编排要放的文件都在，不该算有更新");
+
+  // 编排后来才多了要放的文件：压缩包没变也算有更新，再装只补上那个文件。
+  MemorySink later;
+  request.plan = old_plan;
+  if (install_game(drive, later, request).status != "installed") return fail("没有要放的文件的编排装失败");
+  if (later.files[root + "fakelib/libSceAmpr.sprx"].bytes != old_lib) return fail("没放文件时应该是压缩包里的那份");
+  if (!install_outdated(later, request.dest_prefix, dir, plan.layers, {}, plan.copies)) return fail("缺了编排要放的文件应该算有更新");
+  request.plan = plan;
+  const InstallResult patched = install_game(drive, later, request);
+  if (patched.status != "installed") return fail("补放编排的文件失败: " + patched.message);
+  if (const int code = check(later, "补放文件")) return code;
+  if (install_game(drive, later, request).status != "already") return fail("补放之后再装应该是已安装");
+  return 0;
+}
+
 int many_files_test() {
   FakeDrive drive;
   std::vector<ZipInput> inputs;
@@ -2550,6 +2615,7 @@ int run_install_pipeline_self_test() {
   if (const int code = game_root_test()) return code;
   if (const int code = package_and_duplicate_test()) return code;
   if (const int code = many_files_test()) return code;
+  if (const int code = plan_install_test()) return code;
   if (const int code = zip64_split_test()) return code;
   if (const int code = write_behind_test()) return code;
   if (const int code = disk_full_test()) return code;

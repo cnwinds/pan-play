@@ -126,6 +126,60 @@ const ShelfGame* ShelfLibrary::find(const std::string& title_id) const {
   return nullptr;
 }
 
+const ShelfVariant* ShelfLibrary::variant(const std::string& title_id, const std::string& variant_format) const {
+  const ShelfGame* game = find(title_id);
+  if (game == nullptr || variant_format.empty()) return nullptr;
+  const std::string format = shelf_format_of(variant_format);
+  for (const auto& item : game->variants) {
+    if (item.format == format) return &item;
+  }
+  return nullptr;
+}
+
+namespace {
+
+ShelfPlanFile parse_plan_file(const panplay::Json& json) {
+  return {json.str("path"), static_cast<std::int64_t>(json.num("size")), json.str("md5")};
+}
+
+// 编排里缺东西（没有主游戏、文件没路径）时整个不用，照旧按规则装。
+std::optional<ShelfPlan> parse_plan(const panplay::Json* json) {
+  if (json == nullptr || json->type != panplay::Json::Type::object) return std::nullopt;
+  ShelfPlan plan;
+  plan.rev = static_cast<int>(json->num("rev"));
+  if (const panplay::Json* layers = json->get("layers")) {
+    for (const auto& item : layers->array) {
+      ShelfPlanLayer layer{item.str("role"), item.str("name"), {}};
+      if (const panplay::Json* files = item.get("files")) {
+        for (const auto& file : files->array) layer.files.push_back(parse_plan_file(file));
+      }
+      if (layer.files.empty()) return std::nullopt;
+      plan.layers.push_back(std::move(layer));
+    }
+  }
+  if (const panplay::Json* copies = json->get("copies")) {
+    for (const auto& item : copies->array) {
+      const panplay::Json* from = item.get("from");
+      if (from == nullptr || item.str("to").empty()) return std::nullopt;
+      plan.copies.push_back({parse_plan_file(*from), item.str("to")});
+    }
+  }
+  if (const panplay::Json* notes = json->get("notes")) {
+    for (const auto& note : notes->array) {
+      if (note.type == panplay::Json::Type::string && !note.text.empty()) plan.notes.push_back(note.text);
+    }
+  }
+  if (plan.layers.empty()) return std::nullopt;
+  for (const auto& layer : plan.layers) {
+    for (const auto& file : layer.files) {
+      if (file.path.empty()) return std::nullopt;
+    }
+  }
+  return plan;
+}
+
+}  // namespace
+
 std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::string* error) {
   std::string parse_error;
   const panplay::Json json = panplay::Json::parse(text, &parse_error);
@@ -161,6 +215,7 @@ std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::
           variant.playable = review->boolean_or("playable", true);
           variant.review_note = review->str("note");
         }
+        variant.plan = parse_plan(entry.get("plan"));
         if (variant.format.empty() || variant.surl.empty()) continue;
         game.variants.push_back(std::move(variant));
       }

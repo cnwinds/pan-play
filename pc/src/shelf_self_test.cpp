@@ -1,4 +1,5 @@
 #include "shelf_library.hpp"
+#include "shelf_plan.hpp"
 #include "shelf_transfer.hpp"
 
 #include <algorithm>
@@ -28,6 +29,7 @@ class FakeDrive : public panplay::DrivePlugin {
   };
 
   std::map<std::string, Node> nodes;
+  std::map<std::string, std::string> md5s;
   std::map<std::string, Share> shares;
   std::set<std::string> need_verify;
   int transfers = 0;
@@ -60,6 +62,7 @@ class FakeDrive : public panplay::DrivePlugin {
       entry.path = child;
       entry.is_dir = node.size < 0;
       entry.size = node.size < 0 ? 0 : (node.text.empty() ? node.size : static_cast<std::int64_t>(node.text.size()));
+      if (const auto md5 = md5s.find(child); md5 != md5s.end()) entry.content_hash = md5->second;
       out.push_back(entry);
     }
     return out;
@@ -261,11 +264,70 @@ int check_not_enough() {
   return 0;
 }
 
+// 盘架的编排（ADR 0012）：PPSA03016 那样外包目录没挪干净、分卷散在两处，按 md5 照样对得上。
+int check_plan() {
+  const char* text = R"({"games":[{"title_id":"PPSA03016","name":"x","variants":[{"format":"unknown","surl":"1s","pwd":"p",
+    "plan":{"rev":3,"layers":[{"role":"main","name":"主游戏","files":[
+        {"path":"PPSA03016-app.part1.rar","size":100,"md5":"AA01"},
+        {"path":"PPSA03016-app.part2.rar","size":100,"md5":"aa02"},
+        {"path":"PPSA03016-app.part3.rar","size":7,"md5":""}]}],
+      "copies":[{"from":{"path":"apr0.4.2.1/libSceAmpr.sprx","size":5,"md5":"bb01"},"to":"fakelib/libSceAmpr.sprx"}],
+      "notes":["要用 ShadowMountPlus 1.7alpha12 或以上挂载"]}}]}]})";
+  std::string error;
+  const auto library = parse_shelf_library(text, &error);
+  if (!library) return fail("带编排的资源库解析失败：" + error);
+  const ShelfVariant* variant = library->variant("PPSA03016", "other");
+  if (variant == nullptr || !variant->plan) return fail("@other 应该对上 unknown 格式和它的编排");
+  const ShelfPlan& plan = *variant->plan;
+  if (plan.rev != 3 || plan.layers.size() != 1 || plan.layers[0].files.size() != 3 || plan.copies.size() != 1 ||
+      plan.notes.size() != 1) {
+    return fail("编排读错了");
+  }
+
+  FakeDrive drive;
+  const std::string dir = "/lib/PPSA03016/@other";
+  drive.add_file(dir + "/PPSA03016-app.part1.rar", 100);
+  drive.add_file(dir + "/PPSA03016-app.part2.rar", 100);
+  drive.add_file(dir + "/PPSA03016 LZ4/PPSA03016-app.part3.rar", 7);
+  drive.add_file(dir + "/PPSA03016 LZ4/使用说明.txt", 3);
+  drive.add_file(dir + "/apr0.4.2.1/libSceAmpr.sprx", 5);
+  drive.md5s[dir + "/PPSA03016-app.part1.rar"] = "aa01";
+  drive.md5s[dir + "/PPSA03016-app.part2.rar"] = "AA02";
+  drive.md5s[dir + "/apr0.4.2.1/libSceAmpr.sprx"] = "BB01";
+  // 第 3 卷编排里没写 md5、路径也不同：只按路径对不上，要报缺。
+  ResolvedPlan resolved = resolve_plan(drive, dir, plan, &error);
+  if (!error.empty()) return fail("核对编排时列目录出错：" + error);
+  if (resolved.missing.size() != 1 || resolved.missing[0] != "PPSA03016-app.part3.rar") return fail("没 md5、路径又不同的分卷应该报缺");
+
+  // 给第 3 卷配上 md5：散在子目录里也认得出，一层三卷，放的文件对到网盘里那个。
+  ShelfPlan with_md5 = plan;
+  with_md5.layers[0].files[2].md5 = "cc03";
+  drive.md5s[dir + "/PPSA03016 LZ4/PPSA03016-app.part3.rar"] = "CC03";
+  resolved = resolve_plan(drive, dir, with_md5, &error);
+  if (!resolved.missing.empty()) return fail("按 md5 应该都对得上：" + resolved.missing.front());
+  if (resolved.plan.layers.size() != 1 || resolved.plan.layers[0].parts.size() != 3 ||
+      resolved.plan.layers[0].parts[2].name != "PPSA03016-app.part3.rar" || resolved.plan.layers[0].format != "rar") {
+    return fail("主游戏三卷没按卷序认成一组");
+  }
+  if (resolved.plan.copies.size() != 1 || resolved.plan.copies[0].target != "fakelib/libSceAmpr.sprx" ||
+      resolved.plan.copies[0].file.path != dir + "/apr0.4.2.1/libSceAmpr.sprx") {
+    return fail("要放的文件没对上");
+  }
+
+  // 没 md5 时按相对路径和大小认。
+  ShelfPlan by_path = plan;
+  by_path.layers[0].files[2].path = "PPSA03016 LZ4/PPSA03016-app.part3.rar";
+  resolved = resolve_plan(drive, dir, by_path, &error);
+  if (!resolved.missing.empty()) return fail("没 md5 时按路径应该对得上");
+  return 0;
+}
+
 }  // namespace
 
 int run_shelf_self_test() {
   const auto saved = shelf_library();
   if (const int parse = check_parse()) return parse;
+  if (const int planned = check_plan()) return planned;
   use_shelf_library(parse_shelf_library(kLibrary, nullptr));
   int result = check_transfer_and_room();
   if (result == 0) result = check_not_enough();

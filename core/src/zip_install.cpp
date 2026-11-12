@@ -488,6 +488,22 @@ bool read_marker(InstallSink& sink, const std::string& dest_prefix, const std::s
   return parse_error.empty();
 }
 
+// 编排要放的单独文件是不是都已经在装好的游戏里（按完成标记的文件清单，名字和大小对得上）。
+// 编排后来才多了要放的文件时，压缩包没变也要补上（ADR 0012）。
+bool marker_has_copies(const Json& marker, const std::vector<PlanCopy>& copies) {
+  const Json* entries = marker.get("entries");
+  for (const auto& copy : copies) {
+    std::string name;
+    bool directory = false;
+    if (!safe_archive_name(copy.target, &name, &directory)) return false;
+    const bool present = entries != nullptr && std::any_of(entries->array.begin(), entries->array.end(), [&](const Json& entry) {
+      return entry.str("name") == name && entry.str("size") == std::to_string(copy.file.size);
+    });
+    if (!present) return false;
+  }
+  return true;
+}
+
 // 完成标记里记的格式。旧版本没记、或者装的是没分格式的游戏目录时为空 optional，和哪种格式都对得上：
 // 盘架把旧目录迁进 @格式 子目录后，装好的游戏不用重装。
 std::optional<std::string> marker_variant(const Json& marker) {
@@ -499,10 +515,12 @@ std::optional<std::string> marker_variant(const Json& marker) {
 }  // namespace
 
 bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
-                      const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets) {
+                      const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets,
+                      const std::vector<PlanCopy>& copies) {
   Json marker;
   if (!read_marker(sink, dest_prefix, source_dir, &marker)) return false;
   if (const auto variant = marker_variant(marker); variant && *variant != variant_format(source_dir)) return false;
+  if (!marker_has_copies(marker, copies)) return true;
   std::vector<ArchiveSet> installable;
   for (const auto& set : sets) {
     if ((set.format == "zip" || set.format == "rar" || set.format == "7z") && skip_sets.count(archive_set_id(set)) == 0) {
@@ -588,9 +606,16 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
   report("正在读取压缩包…");
 
   std::string error;
-  const auto files = collect_archives(drive, request.source_dir, &error);
-  if (!error.empty()) return fail(error);
-  const auto sets = group_archives(files);
+  // 有编排时只装编排里的压缩包组，按编排的顺序（ADR 0012）；没有时按目录里的压缩包猜。
+  const bool planned = request.plan.has_value();
+  std::vector<ArchiveSet> sets;
+  if (planned) {
+    sets = request.plan->layers;
+  } else {
+    const auto files = collect_archives(drive, request.source_dir, &error);
+    if (!error.empty()) return fail(error);
+    sets = group_archives(files);
+  }
   std::vector<ArchiveSet> zips;
   std::vector<ArchiveSet> rars;
   std::vector<ArchiveSet> sevens;
@@ -600,6 +625,7 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
     else if (set.format == "7z") sevens.push_back(set);
   }
   if (zips.empty() && rars.empty() && sevens.empty()) return fail("这个目录里没有压缩包");
+  if (planned && zips.size() + rars.size() + sevens.size() != sets.size()) return fail("编排里有认不出格式的压缩包");
 
   // 每个压缩包（可能分卷）各自原样解压到暂存区，最后按各自的游戏根目录合并。
   // 多个压缩包时各占暂存区里的 "<序号>/" 子目录，免得同名文件互相覆盖。
@@ -621,11 +647,18 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
     SevenZipArchive seven;
   };
   std::vector<Source> sources;
-  for (const auto& set : zips) sources.push_back(Source{false, &set});
-  for (const auto& set : rars) sources.push_back(Source{true, &set});
-  for (const auto& set : sevens) {
-    sources.push_back(Source{false, &set});
-    sources.back().sevenzip = true;
+  if (planned) {
+    for (const auto& set : sets) {
+      sources.push_back(Source{set.format == "rar", &set});
+      sources.back().sevenzip = set.format == "7z";
+    }
+  } else {
+    for (const auto& set : zips) sources.push_back(Source{false, &set});
+    for (const auto& set : rars) sources.push_back(Source{true, &set});
+    for (const auto& set : sevens) {
+      sources.push_back(Source{false, &set});
+      sources.back().sevenzip = true;
+    }
   }
   // 暂存区序号按全部压缩包编，改了要装哪些之后，没跳过的仍落在原来的子目录里。
   for (std::size_t i = 0; i < sources.size(); ++i) {
@@ -722,7 +755,8 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
         old_entries.push_back(std::move(member));
       }
     }
-    if (parse_error.empty() && entries != nullptr && old.str("source") == signature && old.str("plugin") == drive.id()) {
+    if (parse_error.empty() && entries != nullptr && old.str("source") == signature && old.str("plugin") == drive.id() &&
+        (!planned || marker_has_copies(old, request.plan->copies))) {
       sink.remove_file(journal_path);
       sink.remove_dir(staging_root);
       sink.remove_dir(parent_path(staging_root));
@@ -877,7 +911,7 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
   }
   std::vector<Source*> download_order;
   for (auto& source : sources) download_order.push_back(&source);
-  std::stable_sort(download_order.begin(), download_order.end(), [&](const Source* left, const Source* right) {
+  if (!planned) std::stable_sort(download_order.begin(), download_order.end(), [&](const Source* left, const Source* right) {
     const auto rank = [&](const Source* source) { return source == main_source ? 0 : source->folder.empty() ? 2 : 1; };
     if (rank(left) != rank(right)) return rank(left) < rank(right);
     if (const int order = natural_compare(left->folder, right->folder); order != 0) return order < 0;
@@ -896,7 +930,7 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
   // 同类里游戏目录里直接放的在前，子目录里的按子目录名排；同一处的按文件名排。名字里的数字按大小比。
   std::vector<Source*> layers;
   for (auto& source : sources) layers.push_back(&source);
-  std::stable_sort(layers.begin(), layers.end(), [](const Source* left, const Source* right) {
+  if (!planned) std::stable_sort(layers.begin(), layers.end(), [](const Source* left, const Source* right) {
     if (left->has_param != right->has_param) return left->has_param;
     if (left->folder.empty() != right->folder.empty()) return left->folder.empty();
     if (const int order = natural_compare(left->folder, right->folder); order != 0) return order < 0;
@@ -958,13 +992,53 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
       }
       // 后叠的覆盖先叠的。只有同一处的两个固件补丁之间分不出先后，这时报错。
       const Source* below = found->second.second;
-      const bool ordered = below != source && (below->has_param || below->folder != source->folder);
+      const bool ordered = below != source && (planned || below->has_param || below->folder != source->folder);
       if (earlier.directory != final_member.directory || !ordered) {
         return fail("压缩包里有重复文件（" + final_member.name + "），分不出哪个该覆盖哪个");
       }
       leftovers.push_back(earlier.staged);
       earlier = std::move(final_member);
       found->second.second = source;
+    }
+  }
+  // 编排里要放进游戏目录的单独文件（ADR 0012）：每次都重新下载写进暂存区，同名的覆盖压缩包里的。
+  if (planned) {
+    constexpr std::int64_t kMaxCopyBytes = 64ll << 20;
+    for (std::size_t i = 0; i < request.plan->copies.size(); ++i) {
+      const PlanCopy& copy = request.plan->copies[i];
+      Member member;
+      bool directory = false;
+      if (!safe_archive_name(copy.target, &member.name, &directory) || directory || member.name.empty()) {
+        return fail("编排里要放的位置不对：" + copy.target);
+      }
+      if (copy.file.size > kMaxCopyBytes) return fail("编排里要放的文件太大：" + copy.file.name);
+      std::vector<std::uint8_t> bytes;
+      if (copy.file.size > 0) {
+        ReadResult read = drive.read_at(copy.file.file_id, 0, static_cast<std::size_t>(copy.file.size));
+        if (!read.error.empty()) return fail("下载 " + copy.file.name + " 失败：" + read.error);
+        if (static_cast<std::int64_t>(read.bytes.size()) != copy.file.size) return fail("下载 " + copy.file.name + " 不完整");
+        bytes = std::move(read.bytes);
+      }
+      member.staged = ".panplay-plan/" + std::to_string(i) + "/" + base_name(member.name);
+      OutputFile out(sink, join_storage_path(staging_root, member.staged), copy.file.size, -1, &written);
+      if (!bytes.empty()) {
+        if (auto write_error = out.write(bytes.data(), bytes.size()); !write_error.empty()) return fail(write_error);
+      }
+      if (auto finish_error = out.finish(); !finish_error.empty()) return fail(finish_error);
+      member.crc = out.crc();
+      member.uncomp_size = static_cast<std::uint64_t>(copy.file.size);
+      staged.push_back(member.staged);
+      const auto found = placed.find(member.name);
+      if (found == placed.end()) {
+        placed[member.name] = {members.size(), nullptr};
+        members.push_back(std::move(member));
+      } else {
+        Member& earlier = members[found->second.first];
+        if (earlier.directory) return fail("编排要放的 " + member.name + " 在游戏里是个目录");
+        leftovers.push_back(earlier.staged);
+        earlier = std::move(member);
+      }
+      log_info("按编排放进游戏目录：" + copy.file.name + " → " + copy.target);
     }
   }
   result.files_total = 0;
