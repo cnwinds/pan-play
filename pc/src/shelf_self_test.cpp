@@ -428,8 +428,18 @@ int check_packages() {
   game_pkg_config.replace(game_pkg_config.find("PS5AC"), 5, "PS5GD");
   const std::string game_pkg = check_unlock_package(write_pkg("game.pkg", "\x7F" "FIH", game_pkg_config), "PPSA08560", &content_id);
   const std::string ps4 = check_unlock_package(write_pkg("ps4.pkg", "\x7F" "CNT", config), "PPSA08560", &content_id);
+  // 文件夹格式的激活包在压缩包里，解压到游戏目录的 DLC 下；游戏自己的 .pkg 数据文件、太深的不算。
+  std::filesystem::create_directories(dir_on_disk / "game" / "DLC");
+  std::filesystem::create_directories(dir_on_disk / "game" / "a" / "b" / "c");
+  std::filesystem::rename(dir_on_disk / "good.pkg", dir_on_disk / "game" / "DLC" / "Crack.pkg");
+  std::filesystem::rename(dir_on_disk / "ps4.pkg", dir_on_disk / "game" / "data.pkg");
+  std::filesystem::copy_file(dir_on_disk / "game" / "DLC" / "Crack.pkg", dir_on_disk / "game" / "a" / "b" / "c" / "deep.pkg");
+  const auto in_game = find_unlock_packages((dir_on_disk / "game").u8string(), "PPSA08560");
   std::error_code ec;
   std::filesystem::remove_all(dir_on_disk, ec);
+  if (in_game.size() != 1 || in_game[0].find("Crack.pkg") == std::string::npos) {
+    return fail("游戏目录里应该只找到 DLC 下的激活包，找到 " + std::to_string(in_game.size()) + " 个");
+  }
   if (!good.empty()) return fail("PS5 附加内容包应该过：" + good);
   if (other_game.empty() || game_pkg.empty() || ps4.empty()) return fail("别的游戏的、整款游戏的、PS4 的包都不该过");
 

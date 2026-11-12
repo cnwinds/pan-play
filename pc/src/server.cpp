@@ -1398,23 +1398,33 @@ bool register_after_install(const std::string& path, bool files_changed) {
   return error.empty();
 }
 
-// 照编排装好、注册到主机后，把编排里要在主机上安装的包（激活完整版、解锁 DLC 的授权包）装上。
-void install_planned_packages(const std::string& path) {
+// 装好、注册到主机后，把激活完整版、解锁 DLC 的授权包装上：编排里列出的（网盘里单独放着的），
+// 和压缩包里带着、解压到游戏目录里的。
+void install_console_side_packages(const std::string& path) {
   std::vector<panplay::DriveEntry> packages;
   {
     std::lock_guard<std::mutex> lock(planned_packages_mu);
     const auto found = planned_packages.find(path);
-    if (found == planned_packages.end()) return;
-    packages = std::move(found->second);
-    planned_packages.erase(found);
+    if (found != planned_packages.end()) {
+      packages = std::move(found->second);
+      planned_packages.erase(found);
+    }
   }
-  if (packages.empty() || pending_console_packages(path) == 0) return;
-  auto drive = open_drive();
-  const std::string error = install_console_packages(
-      *drive, path, panplay::find_title_id(folder_name_of(path)), packages, [&](const std::string& message) {
-        std::lock_guard<std::mutex> lock(installs.mu);
-        if (installs.current && installs.current->path == path) installs.current->result.message = message;
-      });
+  const auto progress = [&](const std::string& message) {
+    std::lock_guard<std::mutex> lock(installs.mu);
+    if (installs.current && installs.current->path == path) installs.current->result.message = message;
+  };
+  const std::string title_id = panplay::find_title_id(folder_name_of(path));
+  std::string error;
+  if (!packages.empty() && pending_console_packages(path) > 0) {
+    auto drive = open_drive();
+    error = install_console_packages(*drive, path, title_id, packages, progress);
+  }
+  const std::string game_dir = console_game_dir(load_settings(), path);
+  if (!game_dir.empty()) {
+    const std::string in_game = install_game_dir_packages(path, game_dir, title_id, progress);
+    if (!in_game.empty()) error += (error.empty() ? "" : "；") + in_game;
+  }
   if (!error.empty()) notify("激活包没装上，详情页里有原因：" + error);
 }
 
@@ -1831,7 +1841,7 @@ void queue_worker() {
       forget_install_progress(path);
 #if defined(PANPLAY_PS5)
       const bool registered = register_after_install(path, result.status == "installed");
-      if (registered) install_planned_packages(path);
+      if (registered) install_console_side_packages(path);
       if (result.status == "installed") announce_installed(path, registered);
 #endif
     } else {
@@ -2798,6 +2808,8 @@ void handle_client(SOCKET client, bool local_peer) {
     {
       const ConsolePathClaim claim{path};
       error = register_console_title(game_dir);
+      // 以前装好的游戏目录里带着激活包的，重新注册时顺便装上。
+      if (error.empty()) install_console_side_packages(path);
     }
     remember_console_error(path, error);
     if (!error.empty()) {

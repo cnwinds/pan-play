@@ -28,6 +28,15 @@ int pending_console_packages(const std::string& path);
 // manual 是电脑上的盘游：装不了主机安装包。
 std::string console_packages_json(const std::string& path);
 
+// 游戏目录里往下三层（第三层是文件）、32 MB 以内、核对得上的 .pkg，按路径排好。
+std::vector<std::string> find_unlock_packages(const std::string& game_dir, const std::string& title_id);
+
+// 压缩包里带着激活包的（文件夹格式常见：游戏目录/DLC/xxx.pkg）：装好、注册后在主机上的游戏目录里往下三层找
+// 32 MB 以内、核对得上的 .pkg，装上并记下。核对不上的当游戏自己的数据文件，不碰。电脑上什么都不做。
+// 返回失败的汇总，没有要装的或全部装好为空。
+std::string install_game_dir_packages(const std::string& path, const std::string& game_dir, const std::string& title_id,
+                                      const std::function<void(const std::string&)>& progress);
+
 // 游戏从主机上删掉后调用：这款游戏（各种格式）装过的包都当成没装，再装游戏时重新装。
 // 包本身不卸：注销游戏时系统可能已经一起删了；还在的话再装时系统回「已经装过」，照样算装好。
 void forget_console_packages(const std::string& path);
