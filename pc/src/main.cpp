@@ -15,6 +15,7 @@
 #include "server.hpp"
 #include "settings.hpp"
 #include "shelf_transfer.hpp"
+#include "console_packages.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -170,6 +171,7 @@ void print_usage() {
             << "  panplay install <游戏目录> --to <本机目录或 ftp://主机:端口>\n"
             << "  panplay read <fsid> <offset> <length>\n"
             << "  panplay store-meta <conceptId>\n"
+            << "  panplay check-pkg <本机 PKG 文件> <游戏编号>\n"
             << "  panplay http-get <地址>\n";
 }
 
@@ -491,6 +493,12 @@ int main(int argc, char** argv) {
   }
   if (command == "read" && argc >= 5) return read_range(argv[2], argv[3], argv[4]);
   if (command == "store-meta" && argc >= 3) return panplay::run_store_meta_cli(argv[2]);
+  if (command == "check-pkg" && argc >= 4) {
+    std::string content_id;
+    const std::string error = check_unlock_package(argv[2], argv[3], &content_id);
+    std::cout << (error.empty() ? "可以在主机上自动安装：" + content_id : "不会自动安装：" + error) << "\n";
+    return error.empty() ? 0 : 1;
+  }
   if (command == "http-get" && argc >= 3) return http_get(argv[2]);
   print_usage();
   return 1;

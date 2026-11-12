@@ -34,3 +34,17 @@ std::string register_app(const std::string& title_id);
 
 // 注销应用。先 load_app_inst_util，再在 with_privileged_auth 里调用。返回错误，成功为空。
 std::string uninstall_app(const std::string& title_id);
+
+// 和 with_privileged_auth 一样，换的是 ShellCore 的身份：从安装包安装、查安装进度要用它。
+std::string with_shellcore_auth(const std::function<std::string()>& action);
+
+// 从主机上的安装包文件安装（激活、解锁用的附加内容包），调用后在后台装。已经装过的也算成功。
+// 先 load_app_inst_util，再在 with_shellcore_auth 里调用。content_id 写包的内容 ID，查进度用。返回错误，成功为空。
+std::string install_package(const std::string& file, const std::string& name, std::string* content_id);
+
+// 安装进度：status 是 transferring / promoting / playable / error / none，出错时 error_code 是原因。
+// 先 load_app_inst_util，再在 with_shellcore_auth 里调用。返回错误，查到了为空。
+std::string package_install_status(const std::string& content_id, std::string* status, int* error_code);
+
+// 安装接口的错误码换成一句话。
+std::string installer_error_text(int code);

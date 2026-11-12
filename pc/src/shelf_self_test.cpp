@@ -1,3 +1,4 @@
+#include "console_packages.hpp"
 #include "shelf_library.hpp"
 #include "shelf_plan.hpp"
 #include "shelf_transfer.hpp"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 
@@ -376,6 +378,72 @@ int check_plan_on_demand() {
   return 0;
 }
 
+// 编排里要在主机上安装的包（packages）：解析、对到网盘里、下载后核对是这款游戏的 PS5 附加内容包、记下装没装好。
+int check_packages() {
+  const char* text = R"({"games":[{"title_id":"PPSA08560","name":"x","variants":[{"format":"exfat","surl":"1pk","pwd":"p",
+    "plan":{"rev":2,"layers":[{"role":"main","name":"主游戏","files":[{"path":"g.part01.rar","size":100,"md5":"m1"}]}],
+      "copies":[],"packages":[{"path":"DLC/Crack.pkg","size":9,"md5":"PK01"}],"notes":[]}}]}]})";
+  std::string error;
+  const auto library = parse_shelf_library(text, &error);
+  const ShelfVariant* variant = library ? library->variant("PPSA08560", "exfat") : nullptr;
+  if (variant == nullptr || !variant->plan || variant->plan->packages.size() != 1 || variant->plan->package_count != 1 ||
+      variant->plan->packages[0].path != "DLC/Crack.pkg") {
+    return fail("编排里的 packages 读错了");
+  }
+  const auto summary = parse_shelf_library(
+      R"({"version":2,"games":[{"title_id":"PPSA08560","name":"x","variants":[{"format":"exfat","surl":"1pk","pwd":"p",
+        "plan":{"rev":2,"layers":["主游戏"],"copies":0,"packages":1,"notes":[]}}]}]})",
+      &error);
+  const ShelfVariant* brief = summary ? summary->variant("PPSA08560", "exfat") : nullptr;
+  if (brief == nullptr || !brief->plan || brief->plan->package_count != 1 || !brief->plan->packages.empty()) {
+    return fail("编排摘要里包的个数读错了");
+  }
+
+  FakeDrive drive;
+  const std::string dir = "/lib/PPSA08560/@exfat";
+  drive.add_file(dir + "/g.part01.rar", 100);
+  drive.add_file(dir + "/DLC/改了名的激活包.pkg", 9);
+  drive.md5s[dir + "/g.part01.rar"] = "m1";
+  drive.md5s[dir + "/DLC/改了名的激活包.pkg"] = "pk01";
+  ResolvedPlan resolved = resolve_plan(drive, dir, *variant->plan, &error);
+  if (!resolved.missing.empty() || resolved.plan.packages.size() != 1 ||
+      resolved.plan.packages[0].path != dir + "/DLC/改了名的激活包.pkg") {
+    return fail("要装的包没按 md5 对到网盘里");
+  }
+
+  // 包配置是明文 XML，放在 1 MB 分块的交界上也要找得到。
+  const auto dir_on_disk = std::filesystem::temp_directory_path() / ("panplay-pkg-test-" + std::to_string(std::rand()));
+  std::filesystem::create_directories(dir_on_disk);
+  const auto write_pkg = [&](const std::string& name, const std::string& magic, const std::string& config) {
+    std::string bytes = magic + std::string((1 << 20) - 20, '\0') + config + std::string(64, '\0');
+    const auto file = dir_on_disk / name;
+    std::ofstream(file, std::ios::binary) << bytes;
+    return file.u8string();
+  };
+  const std::string config = "<content-id>UP0006-PPSA08560_00-FULLGAMEUNLOCK00</content-id><content-type>PS5AC</content-type>";
+  std::string content_id;
+  const std::string good = check_unlock_package(write_pkg("good.pkg", "\x7F" "FIH", config), "PPSA08560", &content_id);
+  const std::string other_game = check_unlock_package(write_pkg("other.pkg", "\x7F" "FIH", config), "PPSA00001", &content_id);
+  std::string game_pkg_config = config;
+  game_pkg_config.replace(game_pkg_config.find("PS5AC"), 5, "PS5GD");
+  const std::string game_pkg = check_unlock_package(write_pkg("game.pkg", "\x7F" "FIH", game_pkg_config), "PPSA08560", &content_id);
+  const std::string ps4 = check_unlock_package(write_pkg("ps4.pkg", "\x7F" "CNT", config), "PPSA08560", &content_id);
+  std::error_code ec;
+  std::filesystem::remove_all(dir_on_disk, ec);
+  if (!good.empty()) return fail("PS5 附加内容包应该过：" + good);
+  if (other_game.empty() || game_pkg.empty() || ps4.empty()) return fail("别的游戏的、整款游戏的、PS4 的包都不该过");
+
+  // 记下要装的包：没装好时算待装，删掉游戏后清掉装过的记录。
+  const std::string path = dir + "-selftest";
+  note_console_packages(path, resolved.plan.packages);
+  if (pending_console_packages(path) != 1) return fail("没装过的包应该算待装");
+  if (console_packages_json(path).find("改了名的激活包.pkg") == std::string::npos) return fail("详情里应该列出要装的包");
+  forget_console_packages(path);
+  note_console_packages(path, {});
+  if (pending_console_packages(path) != 0 || console_packages_json(path) != "[]") return fail("编排里没包了应该清掉记录");
+  return 0;
+}
+
 }  // namespace
 
 int run_shelf_self_test() {
@@ -383,6 +451,7 @@ int run_shelf_self_test() {
   if (const int parse = check_parse()) return parse;
   if (const int planned = check_plan()) return planned;
   if (const int on_demand = check_plan_on_demand()) return on_demand;
+  if (const int packages = check_packages()) return packages;
   use_shelf_library(parse_shelf_library(kLibrary, nullptr));
   int result = check_transfer_and_room();
   if (result == 0) result = check_not_enough();

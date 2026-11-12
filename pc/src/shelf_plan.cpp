@@ -84,5 +84,9 @@ ResolvedPlan resolve_plan(panplay::DrivePlugin& drive, const std::string& varian
     if (const auto* found = match(copy.from)) resolved.plan.copies.push_back({*found, copy.to});
     else resolved.missing.push_back(copy.from.path);
   }
+  for (const auto& package : plan.packages) {
+    if (const auto* found = match(package)) resolved.plan.packages.push_back(*found);
+    else resolved.missing.push_back(package.path);
+  }
   return resolved;
 }

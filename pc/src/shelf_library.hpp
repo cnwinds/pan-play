@@ -35,6 +35,10 @@ struct ShelfPlan {
   // 按叠放顺序，第一层是主游戏。资源库里只有摘要时为空，要用 load_shelf_plan 取完整的。
   std::vector<ShelfPlanLayer> layers;
   std::vector<ShelfPlanCopy> copies;
+  // 装好、注册到主机后要在主机上安装的小 PKG（激活完整版、解锁 DLC 的授权包）。
+  std::vector<ShelfPlanFile> packages;
+  // 要装几个包；资源库摘要里只有这个数，packages 要取完整编排才有。
+  int package_count = 0;
   // 盘游做不了、要提醒用户的步骤。
   std::vector<std::string> notes;
 

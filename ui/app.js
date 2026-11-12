@@ -1346,6 +1346,9 @@ function openDetail(game, opener) {
   // 盘架编排里盘游做不了、要用户自己做的步骤（ADR 0012）。
   const shelfNotes = el("div", "shelf-notes");
   let shelfNotesKey = null;
+  // 编排里要在主机上安装的包（激活完整版这类），装好游戏后盘游自动装。
+  const packageNotes = el("div", "shelf-notes packages");
+  let packageNotesKey = null;
   // 不常用的操作（调整补丁、注册到主机、删除）收在主按钮旁的「⋯」菜单里，主按钮只管安装和显示状态。
   const menuItem = (text, className = "") => {
     const item = el("button", "more-item " + className, text);
@@ -1612,7 +1615,7 @@ function openDetail(game, opener) {
     }));
   };
 
-  install.append(variantRow, remoteNote, shelfNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
+  install.append(variantRow, remoteNote, shelfNotes, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1731,6 +1734,21 @@ function openDetail(game, opener) {
       const list = el("ul");
       for (const note of notes) list.append(el("li", "", note));
       shelfNotes.replaceChildren(el("strong", "", "盘架说明：这些要你自己做"), list);
+    }
+    const packages = game.console_packages || [];
+    packageNotes.hidden = !packages.length || picking || confirm.open;
+    const packagesKey = JSON.stringify(packages);
+    if (packagesKey !== packageNotesKey) {
+      packageNotesKey = packagesKey;
+      const list = el("ul");
+      for (const item of packages) {
+        const state = item.state === "installed" ? "已装好"
+          : item.state === "failed" ? `没装上：${item.error}`
+          : item.state === "manual" ? "电脑上的盘游装不了，用主机上的盘游装这款游戏会自动装"
+          : "装好游戏后自动装";
+        list.append(el("li", item.state === "failed" || item.state === "manual" ? "warn" : "", `${item.name}（${formatBytes(item.size)}）：${state}`));
+      }
+      packageNotes.replaceChildren(el("strong", "", "要在主机上安装的包"), list);
     }
     remoteNote.classList.toggle("warn", linkDead || remoteVariant?.review_state === "bad");
     if (picking && (running || queued)) {

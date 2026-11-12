@@ -152,6 +152,7 @@ std::optional<ShelfPlan> parse_plan(const panplay::Json* json) {
   const bool summary = layer_list == nullptr || layer_list->array.empty() ||
                        layer_list->array.front().type != panplay::Json::Type::object;
   if (summary) {
+    plan.package_count = static_cast<int>(json->num("packages"));
     if (const panplay::Json* notes = json->get("notes")) {
       for (const auto& note : notes->array) {
         if (note.type == panplay::Json::Type::string && !note.text.empty()) plan.notes.push_back(note.text);
@@ -177,6 +178,14 @@ std::optional<ShelfPlan> parse_plan(const panplay::Json* json) {
       plan.copies.push_back({parse_plan_file(*from), item.str("to")});
     }
   }
+  if (const panplay::Json* packages = json->get("packages"); packages && packages->type == panplay::Json::Type::array) {
+    for (const auto& item : packages->array) {
+      ShelfPlanFile file = parse_plan_file(item);
+      if (file.path.empty()) return std::nullopt;
+      plan.packages.push_back(std::move(file));
+    }
+  }
+  plan.package_count = static_cast<int>(plan.packages.size());
   if (const panplay::Json* notes = json->get("notes")) {
     for (const auto& note : notes->array) {
       if (note.type == panplay::Json::Type::string && !note.text.empty()) plan.notes.push_back(note.text);

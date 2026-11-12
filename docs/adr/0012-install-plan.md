@@ -37,13 +37,18 @@
   "layers":[{"role":"main","name":"主游戏","files":[{"path":"PPSA03016-app.part01.rar","size":4294967296,"md5":"…"}]},
             {"role":"patch","name":"v1.05 补丁","files":[…]}],
   "copies":[{"from":{"path":"apr0.4.2.1/libSceAmpr.sprx","size":423350,"md5":"…"},"to":"fakelib/libSceAmpr.sprx"}],
+  "packages":[{"path":"DLC/Split.Fiction.Crack.PS5-DUPLEX.pkg","size":1320845,"md5":"…"}],
   "notes":["主机的 /data/shadowmount/emus/ 也要放一份 libSceAmpr.sprx","要用 ShadowMountPlus 1.7alpha12 或以上挂载"]}
 ```
+
+资源库摘要里 `packages` 是个数，没有时不写。
 
 `notes` 只写用户必须在主机上亲手做的步骤；编排里已经处理了的、对资源本身的描述不写。
 
 - `layers` 按叠放顺序，第一层是主游戏。`files` 是一组压缩包的全部分卷，按卷序。
 - `copies` 只能放进这款游戏的安装目录里（相对游戏根目录）。说明里要求往主机别处放文件、换挂载工具的，写进 `notes` 给用户看，盘游不做。
+- `packages` 是要在主机上安装才生效的小 PKG：激活完整版、解锁 DLC 的授权包（比如双影奇境的 `UP0006-PPSA08560_00-FULLGAMEUNLOCK00`，类型 `PS5AC`，1.3 MB，里面没有游戏文件，装上后系统记下这条附加内容，游戏查到就当完整版）。这种包解开放进游戏目录没用，只能走主机的安装接口。盘架只收 32 MB 以内的 `.pkg`，整款游戏、补丁的 PKG 不收。
+- 2026-11 之前排的编排没有 `packages`；分享里有 32 MB 以内 `.pkg` 的，盘架启动时排上重新分析。
 - `size` 是分享里全部文件的大小，也就是下载要多大。
 
 ### 盘游：照编排装
@@ -52,6 +57,8 @@
 - 找齐了：只装编排里的压缩包组、按编排的顺序叠；装完把 `copies` 的文件写进游戏目录，同名的覆盖压缩包里的。不在编排里的压缩包不装。
 - 找不齐：自动反馈给盘架（「对不上」），这次照旧按规则装。
 - 详情页列出压缩包组、判断有没有更新也按编排；有 `notes` 时在详情页显示「盘架说明」。
+- `packages`：主机上的盘游装好游戏、注册到主机后，把每个包下载到数据目录 `packages/`，核对是 PS5 的 PKG（`\x7FFIH` 开头）、包配置里类型是 `PS5AC`、内容 ID 里有这款游戏的编号，再换成 ShellCore 的进程身份调 `sceAppInstUtilInstallByPackage`，按 `sceAppInstUtilGetInstallStatus` 等到 `playable`，删掉下载的文件。做法照 etaHEN 的「PS5 Package Installation」说明。系统回「附加内容已经装过」也算装好。结果按包的 md5 记在数据目录 `console-packages.json`，装好的不再装；详情页「要在主机上安装的包」列出每个包装好没有、没装上的原因。已装好的游戏还有包没装好时显示有更新，点更新会补装（游戏文件没变的不重装）。电脑上的盘游装不了，只提示。
+- 删掉主机上的游戏时包本身不卸：注销游戏时系统可能已经一起删了，留着也只占系统里一条记录。盘游只把这款游戏装过的包记成没装，再装游戏时重新装一遍，系统回「已经装过」时照样算装好。
 - 已知限制：编排改了但压缩包没变时（比如只多了一个要拷的文件），已装好的游戏不会自动补上，要删掉重装。
 
 ### 反馈：`/盘游/反馈/<设备 ID>.json`

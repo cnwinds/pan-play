@@ -904,6 +904,8 @@ body.drawer-open { overflow: hidden; }
 .shelf-notes[hidden] { display: none; }
 .shelf-notes strong { display: block; margin-bottom: 0.25rem; color: var(--amber); font-weight: 500; }
 .shelf-notes ul { margin: 0; padding-left: 1.1rem; }
+.shelf-notes.packages strong { color: inherit; }
+.shelf-notes.packages .warn { color: var(--amber); }
 .remote-note[hidden] { display: none; }
 .remote-note.warn,
 .shelf-library.warn { color: var(--amber); }

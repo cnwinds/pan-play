@@ -9,6 +9,7 @@
 #include "shelf_feedback.hpp"
 #include "shelf_library.hpp"
 #include "shelf_plan.hpp"
+#include "console_packages.hpp"
 #include "shelf_transfer.hpp"
 
 #include "panplay/app_paths.hpp"
@@ -1165,6 +1166,7 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
     if (full && plan_error.empty() && resolved.missing.empty()) {
       game.sets = std::move(resolved.plan.layers);
       plan_copies = std::move(resolved.plan.copies);
+      note_console_packages(path, resolved.plan.packages);
     }
   }
   for (const auto& set : game.sets) {
@@ -1198,6 +1200,10 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
           if (panplay::install_outdated(*sink, settings.prefix(), path, game.sets, load_skipped_sets(path), plan_copies)) {
             detail.state = "update";
           }
+#if defined(PANPLAY_PS5)
+          // 编排里要在主机上安装的包还没装好：再装一次会补装（游戏文件没变的不重装）。
+          if (detail.state == "installed" && pending_console_packages(path) > 0) detail.state = "update";
+#endif
           detail.installed = panplay::installed_sets(*sink, settings.prefix(), path);
         }
       }
@@ -1312,6 +1318,10 @@ void review_install_package(const std::string& path, const std::string& set_id) 
   panplay::log_info("自动评价 " + review.name + "：有问题，" + review.note);
 }
 
+// 照编排装的游戏要在主机上安装的包，安装时对到网盘里的文件，装好、注册后取走去装。按网盘变体目录记。
+std::mutex planned_packages_mu;
+std::map<std::string, std::vector<panplay::DriveEntry>> planned_packages;
+
 #if defined(PANPLAY_PS5)
 // 主机上装到本机文件夹的游戏才能注册到主机桌面。
 std::string console_game_dir(const AppSettings& settings, const std::string& path) {
@@ -1386,6 +1396,26 @@ bool register_after_install(const std::string& path, bool files_changed) {
   const std::string error = register_console_title(game_dir);
   remember_console_error(path, error);
   return error.empty();
+}
+
+// 照编排装好、注册到主机后，把编排里要在主机上安装的包（激活完整版、解锁 DLC 的授权包）装上。
+void install_planned_packages(const std::string& path) {
+  std::vector<panplay::DriveEntry> packages;
+  {
+    std::lock_guard<std::mutex> lock(planned_packages_mu);
+    const auto found = planned_packages.find(path);
+    if (found == planned_packages.end()) return;
+    packages = std::move(found->second);
+    planned_packages.erase(found);
+  }
+  if (packages.empty() || pending_console_packages(path) == 0) return;
+  auto drive = open_drive();
+  const std::string error = install_console_packages(
+      *drive, path, panplay::find_title_id(folder_name_of(path)), packages, [&](const std::string& message) {
+        std::lock_guard<std::mutex> lock(installs.mu);
+        if (installs.current && installs.current->path == path) installs.current->result.message = message;
+      });
+  if (!error.empty()) notify("激活包没装上，详情页里有原因：" + error);
 }
 
 // 新装或装了更新时在主机上弹「已安装完成」，带游戏图标。
@@ -1477,7 +1507,8 @@ std::string one_game_json(const std::string& path, bool cached) {
     if (const ShelfVariant* variant = library->variant(title_id, panplay::variant_format(path))) {
       json += ",\"shelf_notes\":" + json_string_array(variant->plan ? variant->plan->notes : std::vector<std::string>{}) +
               ",\"shelf_plan\":" + (variant->plan ? std::to_string(variant->plan->rev) : "0") +
-              ",\"shelf_feedback\":" + (shelf_feedback_pending(path) ? "true" : "false");
+              ",\"shelf_feedback\":" + (shelf_feedback_pending(path) ? "true" : "false") +
+              ",\"console_packages\":" + console_packages_json(path);
     }
   }
   if (detail) {
@@ -1692,6 +1723,11 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
       request.max_dictionary = settings.max_dictionary_mb << 20;
       request.download.memory = download_memory();
       request.plan = install_plan_for(*drive, path);
+      if (request.plan) {
+        note_console_packages(path, request.plan->packages);
+        std::lock_guard<std::mutex> lock(planned_packages_mu);
+        planned_packages[path] = request.plan->packages;
+      }
       result = panplay::install_game(*drive, *sink, request);
       save_download_memory();
       // 照编排装，失败原因在压缩包或编排上（不是网络、内存、空间这些）时告诉盘架重新分析。
@@ -1795,6 +1831,7 @@ void queue_worker() {
       forget_install_progress(path);
 #if defined(PANPLAY_PS5)
       const bool registered = register_after_install(path, result.status == "installed");
+      if (registered) install_planned_packages(path);
       if (result.status == "installed") announce_installed(path, registered);
 #endif
     } else {
@@ -2905,6 +2942,7 @@ void handle_client(SOCKET client, bool local_peer) {
       if (error.empty()) erase_path(installs.finished, path);
     }
     if (error.empty()) forget_install_progress(path);
+    if (error.empty() && whole) forget_console_packages(path);
     if (!error.empty()) {
       reply_json(client, running ? 409 : 500, json_error(error));
       return;

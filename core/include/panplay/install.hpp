@@ -52,6 +52,8 @@ struct InstallPlan {
   // 按叠放顺序，第一层是主游戏。
   std::vector<ArchiveSet> layers;
   std::vector<PlanCopy> copies;
+  // 装好、注册到主机后要在主机上安装的小 PKG（激活、解锁用）。install_game 不管，由安装队列在注册后装。
+  std::vector<DriveEntry> packages;
 };
 
 struct InstallRequest {
