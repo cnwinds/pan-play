@@ -2,8 +2,11 @@
 #include "shelf_plan.hpp"
 #include "shelf_transfer.hpp"
 
+#include "panplay/app_paths.hpp"
+
 #include <algorithm>
 #include <ctime>
+#include <filesystem>
 #include <iostream>
 #include <map>
 
@@ -322,12 +325,53 @@ int check_plan() {
   return 0;
 }
 
+// 资源库第 2 版只放编排摘要，完整的按需到网盘 /盘游/编排/<编号>/<surl>.json 取，按版本号缓存在本机。
+int check_plan_on_demand() {
+  const char* text = R"({"version":2,"games":[{"title_id":"PPSA03016","name":"x","variants":[{"format":"unknown","surl":"1sumtest","pwd":"p",
+    "plan":{"rev":4,"size":207,"layers":["主游戏"],"copies":1,"notes":["要用 ShadowMountPlus 挂载"]}}]}]})";
+  std::string error;
+  const auto library = parse_shelf_library(text, &error);
+  const ShelfVariant* variant = library ? library->variant("PPSA03016", "other") : nullptr;
+  if (variant == nullptr || !variant->plan || variant->plan->rev != 4 || variant->plan->complete() || variant->plan->notes.size() != 1) {
+    return fail("编排摘要读错了");
+  }
+  const auto cache = panplay::app_data_dir() / "shelf-plans" / "1sumtest.json";
+  std::error_code ec;
+  std::filesystem::remove(cache, ec);
+  const auto full_plan = [](int rev) {
+    return std::string(R"({"rev":)") + std::to_string(rev) +
+           R"(,"layers":[{"role":"main","name":"主游戏","files":[{"path":"a.part1.rar","size":200,"md5":"m1"}]}],)"
+           R"("copies":[{"from":{"path":"x.sprx","size":7,"md5":"m2"},"to":"fakelib/x.sprx"}],"notes":["要用 ShadowMountPlus 挂载"]})";
+  };
+
+  FakeDrive drive;
+  auto loaded = load_shelf_plan(drive, "PPSA03016", *variant, &error);
+  if (loaded || error.empty()) return fail("网盘上没有编排时应该报错");
+  drive.add_file("/盘游/编排/PPSA03016/1sumtest.json", 0, full_plan(3));
+  error.clear();
+  loaded = load_shelf_plan(drive, "PPSA03016", *variant, &error);
+  if (loaded || error.find("版本") == std::string::npos) return fail("网盘上是旧版编排时不该拿来用");
+  drive.add_file("/盘游/编排/PPSA03016/1sumtest.json", 0, full_plan(4));
+  error.clear();
+  loaded = load_shelf_plan(drive, "PPSA03016", *variant, &error);
+  if (!loaded || !loaded->complete() || loaded->copies.size() != 1 || loaded->layers[0].files[0].md5 != "m1") {
+    return fail("没取到完整编排：" + error);
+  }
+  // 取过一次后本机有缓存，网盘上的没了也照样用。
+  drive.remove_path("/盘游/编排/PPSA03016/1sumtest.json", nullptr);
+  loaded = load_shelf_plan(drive, "PPSA03016", *variant, &error);
+  std::filesystem::remove(cache, ec);
+  if (!loaded || loaded->rev != 4) return fail("同一版编排应该用本机缓存");
+  return 0;
+}
+
 }  // namespace
 
 int run_shelf_self_test() {
   const auto saved = shelf_library();
   if (const int parse = check_parse()) return parse;
   if (const int planned = check_plan()) return planned;
+  if (const int on_demand = check_plan_on_demand()) return on_demand;
   use_shelf_library(parse_shelf_library(kLibrary, nullptr));
   int result = check_transfer_and_room();
   if (result == 0) result = check_not_enough();

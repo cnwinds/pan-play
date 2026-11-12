@@ -143,11 +143,24 @@ ShelfPlanFile parse_plan_file(const panplay::Json& json) {
 }
 
 // 编排里缺东西（没有主游戏、文件没路径）时整个不用，照旧按规则装。
+// 资源库第 2 版起只放摘要（layers 是名字、copies 是个数），这时只留版本号和提醒，layers 为空。
 std::optional<ShelfPlan> parse_plan(const panplay::Json* json) {
   if (json == nullptr || json->type != panplay::Json::Type::object) return std::nullopt;
   ShelfPlan plan;
   plan.rev = static_cast<int>(json->num("rev"));
-  if (const panplay::Json* layers = json->get("layers")) {
+  const panplay::Json* layer_list = json->get("layers");
+  const bool summary = layer_list == nullptr || layer_list->array.empty() ||
+                       layer_list->array.front().type != panplay::Json::Type::object;
+  if (summary) {
+    if (const panplay::Json* notes = json->get("notes")) {
+      for (const auto& note : notes->array) {
+        if (note.type == panplay::Json::Type::string && !note.text.empty()) plan.notes.push_back(note.text);
+      }
+    }
+    if (plan.rev <= 0) return std::nullopt;
+    return plan;
+  }
+  if (const panplay::Json* layers = layer_list) {
     for (const auto& item : layers->array) {
       ShelfPlanLayer layer{item.str("role"), item.str("name"), {}};
       if (const panplay::Json* files = item.get("files")) {
@@ -224,6 +237,53 @@ std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::
     library->games.push_back(std::move(game));
   }
   return library;
+}
+
+std::optional<ShelfPlan> load_shelf_plan(panplay::DrivePlugin& drive, const std::string& title_id,
+                                         const ShelfVariant& variant, std::string* error) {
+  if (!variant.plan) return std::nullopt;
+  if (variant.plan->complete()) return variant.plan;
+  const int rev = variant.plan->rev;
+  const auto parse = [&](const std::string& text) -> std::optional<ShelfPlan> {
+    const panplay::Json json = panplay::Json::parse(text, nullptr);
+    auto plan = parse_plan(&json);
+    if (!plan || !plan->complete() || plan->rev != rev) return std::nullopt;
+    return plan;
+  };
+  const auto cache = panplay::app_data_dir() / "shelf-plans" / (variant.surl + ".json");
+  {
+    std::ifstream in(cache, std::ios::binary);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    if (auto plan = parse(buffer.str())) return plan;
+  }
+  std::string list_error;
+  const auto entries = drive.list(kLibraryDir + "/编排/" + title_id, &list_error);
+  if (!list_error.empty()) {
+    if (error) *error = "取编排失败：" + list_error;
+    return std::nullopt;
+  }
+  for (const auto& entry : entries) {
+    if (entry.is_dir || entry.name != variant.surl + ".json") continue;
+    if (entry.size <= 0 || entry.size > kMaxFileBytes) break;
+    const panplay::ReadResult read = drive.read_at(entry.file_id, 0, static_cast<std::size_t>(entry.size));
+    if (!read.error.empty()) {
+      if (error) *error = "读编排失败：" + read.error;
+      return std::nullopt;
+    }
+    const std::string text(read.bytes.begin(), read.bytes.end());
+    auto plan = parse(text);
+    if (!plan) {
+      if (error) *error = "网盘上的编排和资源库的版本对不上";
+      return std::nullopt;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(cache.parent_path(), ec);
+    std::ofstream(cache, std::ios::binary | std::ios::trunc) << text;
+    return plan;
+  }
+  if (error) *error = "网盘上没有这份编排";
+  return std::nullopt;
 }
 
 std::string shelf_variant_dir(const std::string& format) { return format == "unknown" ? "@other" : "@" + format; }

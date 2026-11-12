@@ -18,17 +18,29 @@
 - 模型用 OpenAI 兼容接口（`/chat/completions`，要求返回 JSON），在盘架设置里填地址、密钥和模型名；没填时不分析，盘游照旧按规则装。
 - 一条链接一份编排，存在 `link_plans` 表，`rev` 每次重新分析加一。分享内容的指纹（全部文件的路径、大小、md5）也记下：链接检查（0011）列出来的分享变了，就重新分析。
 
-### 资源库里的编排
+### 编排放在哪
 
-每种格式多一个 `plan`（分析失败或没分析时不写）：
+资源库只放摘要，完整的编排一条链接一个文件，盘游装的时候才去取（2026-11-12 起，资源库 `version` 2）。全放在资源库里时，1500 种格式的分卷清单让资源库从 0.5 MB 涨到 1.7 MB，盘游每次解析要 16 MB，盘架发布得勤时正好撞上装大字典的游戏；只放摘要后解析约 5 MB。
+
+资源库里每种格式的 `plan`（分析失败或没分析时不写）：
 
 ```json
-"plan":{"rev":2,"model":"deepseek-chat","at":1794470400,"size":128849018880,
+"plan":{"rev":2,"size":128849018880,"layers":["主游戏","降级补丁 4.xx"],"copies":1,"notes":["要用 ShadowMountPlus 1.7alpha12 或以上挂载"]}
+```
+
+完整的在 `/盘游/编排/<游戏编号>/<surl>.json`。盘架先传完整的、确认传上去了才在资源库里写摘要；盘游按 `rev` 核对，取到的缓存在数据目录 `shelf-plans/`，同一版不再下载。资源库里的 `plan` 本身带着 `layers` 文件清单时（`version` 1）照旧直接用。
+
+完整编排的内容：
+
+```json
+{"rev":2,"model":"deepseek-chat","at":1794470400,"size":128849018880,
   "layers":[{"role":"main","name":"主游戏","files":[{"path":"PPSA03016-app.part01.rar","size":4294967296,"md5":"…"}]},
             {"role":"patch","name":"v1.05 补丁","files":[…]}],
   "copies":[{"from":{"path":"apr0.4.2.1/libSceAmpr.sprx","size":423350,"md5":"…"},"to":"fakelib/libSceAmpr.sprx"}],
   "notes":["主机的 /data/shadowmount/emus/ 也要放一份 libSceAmpr.sprx","要用 ShadowMountPlus 1.7alpha12 或以上挂载"]}
 ```
+
+`notes` 只写用户必须在主机上亲手做的步骤；编排里已经处理了的、对资源本身的描述不写。
 
 - `layers` 按叠放顺序，第一层是主游戏。`files` 是一组压缩包的全部分卷，按卷序。
 - `copies` 只能放进这款游戏的安装目录里（相对游戏根目录）。说明里要求往主机别处放文件、换挂载工具的，写进 `notes` 给用户看，盘游不做。

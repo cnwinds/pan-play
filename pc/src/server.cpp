@@ -1151,8 +1151,9 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
   if (const ShelfVariant* planned = library ? library->variant(game.title_id, panplay::variant_format(path)) : nullptr;
       planned && planned->plan) {
     std::string plan_error;
-    ResolvedPlan resolved = resolve_plan(drive, path, *planned->plan, &plan_error);
-    if (plan_error.empty() && resolved.missing.empty()) {
+    const auto full = load_shelf_plan(drive, game.title_id, *planned, &plan_error);
+    ResolvedPlan resolved = full ? resolve_plan(drive, path, *full, &plan_error) : ResolvedPlan{};
+    if (full && plan_error.empty() && resolved.missing.empty()) {
       game.sets = std::move(resolved.plan.layers);
       plan_copies = std::move(resolved.plan.copies);
     }
@@ -1605,7 +1606,12 @@ std::optional<panplay::InstallPlan> install_plan_for(panplay::DrivePlugin& drive
       library ? library->variant(panplay::find_title_id(folder_name_of(path)), panplay::variant_format(path)) : nullptr;
   if (variant == nullptr || !variant->plan) return std::nullopt;
   std::string error;
-  ResolvedPlan resolved = resolve_plan(drive, path, *variant->plan, &error);
+  const auto full = load_shelf_plan(drive, panplay::find_title_id(folder_name_of(path)), *variant, &error);
+  if (!full) {
+    panplay::log_warn("没取到盘架的编排（第 " + std::to_string(variant->plan->rev) + " 版），按规则装：" + error);
+    return std::nullopt;
+  }
+  ResolvedPlan resolved = resolve_plan(drive, path, *full, &error);
   if (!error.empty()) {
     panplay::log_warn("没能核对盘架的编排，按规则装：" + error);
     return std::nullopt;

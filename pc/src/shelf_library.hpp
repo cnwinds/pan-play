@@ -32,11 +32,13 @@ struct ShelfPlanCopy {
 
 struct ShelfPlan {
   int rev = 0;
-  // 按叠放顺序，第一层是主游戏。
+  // 按叠放顺序，第一层是主游戏。资源库里只有摘要时为空，要用 load_shelf_plan 取完整的。
   std::vector<ShelfPlanLayer> layers;
   std::vector<ShelfPlanCopy> copies;
   // 盘游做不了、要提醒用户的步骤。
   std::vector<std::string> notes;
+
+  bool complete() const { return !layers.empty(); }
 };
 
 struct ShelfVariant {
@@ -78,6 +80,11 @@ struct ShelfLibrary {
 };
 
 std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::string* error);
+
+// 这种格式的完整编排：资源库里是旧格式、本来就带着时直接用；只有摘要时到网盘 /盘游/编排/<编号>/<surl>.json 取，
+// 按版本号缓存在本机，同一版不再下载。没有编排时为空，取不到时 error 写原因。见 ADR 0012。
+std::optional<ShelfPlan> load_shelf_plan(panplay::DrivePlugin& drive, const std::string& title_id,
+                                         const ShelfVariant& variant, std::string* error);
 
 // 资源库格式（unknown）和网盘里变体目录名（@other）互换。
 std::string shelf_variant_dir(const std::string& format);
