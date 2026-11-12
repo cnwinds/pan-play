@@ -60,11 +60,24 @@ struct ShelfVariant {
   std::optional<ShelfPlan> plan;
 };
 
+// 商店里已经没有这款游戏的页面（下架了）时，盘架从资源站帖子里取的资料。cover 是图片地址。
+struct ShelfGameInfo {
+  std::string cover;
+  std::string description;
+  std::string publisher;
+  std::string release_date;
+
+  bool empty() const { return cover.empty() && description.empty() && publisher.empty() && release_date.empty(); }
+};
+
 struct ShelfGame {
   std::string title_id;
   std::int64_t concept_id = 0;
+  // 这款的商店页是空的、盘架借了同名游戏那页的资料时，那页的 conceptId；查商店用它。没借时为 0。
+  std::int64_t store_concept_id = 0;
   std::string name;
   std::int64_t added_at = 0;
+  ShelfGameInfo info;
   std::vector<ShelfVariant> variants;
 };
 

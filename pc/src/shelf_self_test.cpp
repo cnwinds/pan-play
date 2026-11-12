@@ -162,8 +162,10 @@ const char* kLibrary = R"({"version":1,"generated_at":1794393246,"library_dir":"
    {"format":"exfat","surl":"1s1","pwd":"abcd","version":"1.05","size":0,"checked_at":0},
    {"format":"unknown","surl":"1s1b","pwd":"","size":5,"alive":false,"checked_at":9,"review":{"playable":false,"note":"黑屏"}}]},
  {"title_id":"PPSA00002","name":"装在主机上","variants":[{"format":"folder","surl":"1s2","pwd":"x","alive":true}]},
- {"title_id":"PPSA00003","name":"很久没用","variants":[{"format":"exfat","surl":"1s3","pwd":"x"}]},
- {"title_id":"PPSA00004","name":"刚用过","variants":[{"format":"exfat","surl":"1s4","pwd":"x"}]},
+ {"title_id":"PPSA00003","name":"很久没用","store_concept_id":33,"variants":[{"format":"exfat","surl":"1s3","pwd":"x"}]},
+ {"title_id":"PPSA00004","name":"刚用过","info":{"cover":"https://img.test/c.jpg","description":"帖子里的介绍","publisher":"发行商","release_date":"2021-08-17"},
+  "variants":[{"format":"exfat","surl":"1s4","pwd":"x"}]},
+ {"title_id":"PPSA00010","name":"封面地址不对","info":{"cover":"javascript:void 0"},"variants":[{"format":"exfat","surl":"1s10","pwd":"x"}]},
  {"title_id":"PPSA00005","name":"别的设备在装","variants":[{"format":"exfat","surl":"1s5","pwd":"x"}]},
  {"title_id":"PPSA00006","name":"链接失效","variants":[{"format":"exfat","surl":"1s6","pwd":"x","alive":false}]},
  {"title_id":"PPSA00007","name":"分享打不开","variants":[{"format":"exfat","surl":"1s7","pwd":"x"}]},
@@ -174,7 +176,16 @@ int check_parse() {
   std::string error;
   const auto library = parse_shelf_library(kLibrary, &error);
   if (!library) return fail("解析失败：" + error);
-  if (library->games.size() != 7) return fail("没编号、没格式的游戏应该跳过，实际 " + std::to_string(library->games.size()));
+  if (library->games.size() != 8) return fail("没编号、没格式的游戏应该跳过，实际 " + std::to_string(library->games.size()));
+  if (library->find("PPSA00003")->store_concept_id != 33 || library->find("PPSA00001")->store_concept_id != 0) {
+    return fail("借来的商店 conceptId 读错了");
+  }
+  const ShelfGameInfo& info = library->find("PPSA00004")->info;
+  if (info.cover != "https://img.test/c.jpg" || info.description != "帖子里的介绍" || info.publisher != "发行商" ||
+      info.release_date != "2021-08-17" || !library->find("PPSA00001")->info.empty()) {
+    return fail("帖子资料读错了");
+  }
+  if (!library->find("PPSA00010")->info.cover.empty()) return fail("不是网址的封面应该丢掉");
   const ShelfGame* target = library->find("PPSA00001");
   if (!target || target->name != "目标" || target->concept_id != 11 || target->variants.size() != 2) return fail("目标游戏读错了");
   const ShelfVariant& dead = target->variants[1];

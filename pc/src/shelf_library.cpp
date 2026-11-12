@@ -208,8 +208,13 @@ std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::
     ShelfGame game;
     game.title_id = item.str("title_id");
     game.concept_id = static_cast<std::int64_t>(item.num("concept_id"));
+    game.store_concept_id = static_cast<std::int64_t>(item.num("store_concept_id"));
     game.name = item.str("name");
     game.added_at = static_cast<std::int64_t>(item.num("added_at"));
+    if (const panplay::Json* info = item.get("info"); info && info->type == panplay::Json::Type::object) {
+      game.info = {info->str("cover"), info->str("description"), info->str("publisher"), info->str("release_date")};
+      if (game.info.cover.rfind("https://", 0) != 0 && game.info.cover.rfind("http://", 0) != 0) game.info.cover.clear();
+    }
     if (const panplay::Json* variants = item.get("variants")) {
       for (const auto& entry : variants->array) {
         ShelfVariant variant;

@@ -541,18 +541,33 @@ std::string store_meta_fields(const panplay::StoreMeta& meta, bool detail) {
   return json;
 }
 
-// shelf_name 是盘架资源库里的名字，商店和资料库都没有这款游戏时用它。
+// 查商店用哪个 conceptId：这款的商店页是空的、盘架借了同名游戏的那页时用那页的；资料库没收录时用盘架认出来的。
+std::int64_t store_concept_of(const panplay::CatalogMatch& match, const ShelfGame* shelf) {
+  if (shelf != nullptr && shelf->store_concept_id > 0) return shelf->store_concept_id;
+  if (match.found && match.entry.concept_id > 0) return match.entry.concept_id;
+  return shelf != nullptr ? shelf->concept_id : 0;
+}
+
+// 盘架资源库里有这款游戏时，商店和资料库都没有的名字、封面、介绍用盘架的（介绍取自资源站帖子）。
 std::string game_meta_fields(const std::string& name, const std::string& title_id, const NameOverrides& overrides,
-                             bool detail, std::string* search_text = nullptr, panplay::StoreMeta* meta_out = nullptr,
-                             const std::string& shelf_name = "") {
+                             bool detail, std::string* search_text = nullptr, panplay::StoreMeta* meta_out = nullptr) {
   panplay::CatalogMatch match;
   if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
-  const std::int64_t concept_id = match.found ? match.entry.concept_id : 0;
+  const auto library = shelf_library();
+  const ShelfGame* shelf = library ? library->find(title_id) : nullptr;
+  const std::string shelf_name = shelf != nullptr ? shelf->name : "";
+  const std::int64_t concept_id = store_concept_of(match, shelf);
 
   panplay::StoreMeta meta;
   std::string meta_state = "none";
   if (concept_id > 0 && store_meta != nullptr) meta_state = panplay::store_meta_state_name(store_meta->lookup(concept_id, &meta));
   if (meta_out != nullptr) *meta_out = meta;
+  const bool site_info = !meta.found && shelf != nullptr && !shelf->info.empty();
+  if (site_info) {
+    meta.description = shelf->info.description;
+    meta.publisher = shelf->info.publisher;
+    meta.release_date = shelf->info.release_date;
+  }
 
   std::string display_name;
   std::string name_source;
@@ -578,9 +593,11 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
   std::string cover_url;
   // 封面从 AVIF、WebP 换成 JPEG 时抓取时间不变，加上 jpg 让浏览器别用缓存的旧图。
   if (meta.has_cover) cover_url = "/api/cover/" + std::to_string(concept_id) + "?v=" + std::to_string(meta.fetched_at) + "jpg";
-  else if (match.found) cover_url = match.entry.cover_url;
+  else if (match.found && !match.entry.cover_url.empty()) cover_url = match.entry.cover_url;
+  else if (site_info) cover_url = shelf->info.cover;
 
   std::string json = ",\"display_name\":\"" + panplay::json_escape(display_name) + "\",\"name_source\":\"" + name_source +
+                     "\",\"description_source\":\"" + (meta.description.empty() ? "" : site_info ? "site" : "store") +
                      "\",\"store_locale\":\"" + panplay::json_escape(meta.found ? meta.locale : "") +
                      "\",\"catalog_name\":\"" + panplay::json_escape(match.found ? match.entry.name : "") +
                      "\",\"cover_url\":\"" + panplay::json_escape(cover_url) + "\",\"meta_state\":\"" + meta_state +
@@ -592,17 +609,10 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
   return json + store_meta_fields(meta, detail);
 }
 
-// 盘架资源库里这款游戏的名字，没有时为空。
-std::string shelf_name_of(const std::string& title_id) {
-  const auto library = shelf_library();
-  const ShelfGame* game = library ? library->find(title_id) : nullptr;
-  return game ? game->name : "";
-}
-
 std::string meta_json(const std::string& name, const NameOverrides& overrides, bool detail) {
   const std::string title_id = panplay::find_title_id(name);
   return "{\"name\":\"" + panplay::json_escape(name) + "\",\"title_id\":\"" + panplay::json_escape(title_id) + "\"" +
-         game_meta_fields(name, title_id, overrides, detail, nullptr, nullptr, shelf_name_of(title_id)) + "}";
+         game_meta_fields(name, title_id, overrides, detail) + "}";
 }
 
 std::string folder_json(const std::string& name, const std::string& path, const std::string& title_id,
@@ -928,8 +938,7 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
     if (filter == "continue" && state != "continue") continue;
     std::string search_text;
     panplay::StoreMeta store;
-    const std::string meta = game_meta_fields(folder.name, folder.title_id, overrides, false, &search_text, &store,
-                                              shelf ? shelf->name : "");
+    const std::string meta = game_meta_fields(folder.name, folder.title_id, overrides, false, &search_text, &store);
     if (!needle.empty() &&
         ascii_lower(folder.name + "\n" + folder.title_id + "\n" + search_text).find(needle) == std::string::npos) {
       continue;
@@ -1225,11 +1234,14 @@ std::string game_display_name(const std::string& path) {
   if (const auto custom = overrides.find(name_key(name, title_id)); custom != overrides.end()) return custom->second;
   panplay::CatalogMatch match;
   if (!title_id.empty()) match = panplay::GameCatalog::instance().lookup(title_id, name);
+  const auto library = shelf_library();
+  const ShelfGame* shelf = library ? library->find(title_id) : nullptr;
+  const std::int64_t concept_id = store_concept_of(match, shelf);
   panplay::StoreMeta meta;
-  if (match.found && match.entry.concept_id > 0 && store_meta != nullptr) store_meta->lookup(match.entry.concept_id, &meta);
+  if (concept_id > 0 && store_meta != nullptr) store_meta->lookup(concept_id, &meta);
   if (meta.found && !meta.name.empty()) return meta.name;
   if (match.found && !match.entry.name.empty()) return match.entry.name;
-  if (const std::string shelf = shelf_name_of(title_id); !shelf.empty()) return shelf;
+  if (shelf != nullptr && !shelf->name.empty()) return shelf->name;
   return name;
 }
 
@@ -1498,7 +1510,7 @@ std::string one_game_json(const std::string& path, bool cached) {
     const auto others = reviews_of_title(title_id, detail->fingerprint);
     json += ",\"other_review\":" + (others.empty() ? std::string("null") : review_json(others.front()));
   }
-  return json + game_meta_fields(name, title_id, load_name_overrides(), true, nullptr, nullptr, shelf_name_of(title_id)) + "}";
+  return json + game_meta_fields(name, title_id, load_name_overrides(), true) + "}";
 }
 
 constexpr double kRecentRateSeconds = 60;
@@ -1925,7 +1937,7 @@ std::string task_json(const InstallTask& task, const char* state, const NameOver
          ",\"files_checked\":" + std::to_string(r.files_checked) + ",\"files_to_check\":" + std::to_string(r.files_to_check) +
          ",\"dictionary\":" + std::to_string(r.dictionary) + ",\"slow\":\"" + panplay::json_escape(r.slow) + "\"" +
          ",\"retryable\":" + (r.retryable ? "true" : "false") + rate_fields(task, std::strcmp(state, "running") == 0) +
-         game_meta_fields(name, title_id, overrides, false, nullptr, nullptr, shelf_name_of(title_id)) + "}";
+         game_meta_fields(name, title_id, overrides, false) + "}";
 }
 
 // 队列顺序：正在装的，排队的，最近完成的。
@@ -2310,12 +2322,15 @@ void handle_client(SOCKET client, bool local_peer) {
       }
       library_changed();
     } else {
-      const panplay::CatalogMatch match = panplay::GameCatalog::instance().lookup(panplay::find_title_id(name), name);
-      if (!match.found || match.entry.concept_id <= 0 || store_meta == nullptr) {
+      const std::string title_id = panplay::find_title_id(name);
+      const panplay::CatalogMatch match = panplay::GameCatalog::instance().lookup(title_id, name);
+      const auto library = shelf_library();
+      const std::int64_t concept_id = store_concept_of(match, library ? library->find(title_id) : nullptr);
+      if (concept_id <= 0 || store_meta == nullptr) {
         reply_json(client, 400, json_error("这款游戏没有 conceptId，无法从商店获取"));
         return;
       }
-      store_meta->refresh(match.entry.concept_id);
+      store_meta->refresh(concept_id);
     }
     reply_json(client, 200, meta_json(name, load_name_overrides(), true));
     return;

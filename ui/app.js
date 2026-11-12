@@ -1816,7 +1816,8 @@ function openDetail(game, opener) {
     paintRating(rating, game);
     specs.replaceChildren(...storeSpecs(game).flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]));
     specs.hidden = specs.childElementCount === 0;
-    if (game.catalog_matched === false && !metaStateNote[game.meta_state]) metaNote.textContent = "资料库里没有这款游戏，仍然可以按目录名安装。";
+    if (game.description_source === "site") metaNote.textContent = "PlayStation 商店里已经没有这款游戏的页面，介绍取自资源站帖子。";
+    else if (game.catalog_matched === false && !metaStateNote[game.meta_state]) metaNote.textContent = "资料库里没有这款游戏，仍然可以按目录名安装。";
     else if (game.meta_state === "pending" && game.store_locale && !refreshing) metaNote.textContent = "正在下载封面…";
     else metaNote.textContent = metaStateNote[game.meta_state] || "";
     metaNote.hidden = !metaNote.textContent;
