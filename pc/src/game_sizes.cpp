@@ -23,7 +23,8 @@ using Clock = std::chrono::steady_clock;
 constexpr std::int64_t kStaleSeconds = 24 * 60 * 60;
 // 每量完一款游戏歇一下，别把百度的列目录接口打到限流。
 constexpr auto kGap = std::chrono::milliseconds(300);
-constexpr auto kNotifyEvery = std::chrono::seconds(3);
+// 每通知一次页面就重取一遍游戏库，太勤了 PS5 上整页跟着刷。
+constexpr auto kNotifyEvery = std::chrono::seconds(10);
 constexpr auto kRetryDelay = std::chrono::minutes(5);
 constexpr int kMaxFailures = 3;
 

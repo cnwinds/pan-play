@@ -340,19 +340,25 @@ async function fetchShelf({ reset = false, fresh = false, keep = false } = {}) {
     // 格子整个换掉后，手柄焦点和关详情时要回到的格子都换到同一款游戏的新格子上。
     let focusPath = null;
     let openerPath = null;
+    let previous = null;
     if (reset) {
       for (const [path, entry] of tiles) {
         if (entry.tile === document.activeElement) focusPath = path;
         if (detail && entry.tile === detail.opener) openerPath = path;
       }
       games = [];
+      previous = new Map(tiles);
       tiles.clear();
-      shelf.replaceChildren();
     }
+    const placed = [];
     for (const game of page) {
       if (tiles.has(game.path)) continue;
       games.push(game);
-      shelf.append(buildTile(game));
+      placed.push(tileFor(game, previous));
+    }
+    if (!reset) shelf.append(...placed);
+    else if (placed.length !== shelf.children.length || placed.some((tile, index) => shelf.children[index] !== tile)) {
+      shelf.replaceChildren(...placed);
     }
     if (focusPath && tiles.has(focusPath)) tiles.get(focusPath).tile.focus({ preventScroll: true });
     if (openerPath && tiles.has(openerPath) && detail) detail.opener = tiles.get(openerPath).tile;
@@ -396,9 +402,31 @@ function reloadShelf() {
   fetchShelf({ reset: true }).catch((error) => { lede.textContent = error.message; });
 }
 
+// 格子上画出来的东西：这些都没变时格子原样留着。整个换掉封面要重新加载，游戏库一重取整页就闪一下。
+function tileLook(game) {
+  return [game.cover_url, game.title_id, game.name, displayName(game), platformText(game), game.has_cn_sub,
+    game.has_cn_voice, game.rating, game.rating_count].join("\n");
+}
+
+// previous 是重取前的格子，样子没变的留用，换上新的游戏对象。
+function tileFor(game, previous) {
+  const old = previous && previous.get(game.path);
+  if (!old || old.look !== tileLook(game)) return buildTile(game);
+  old.game = game;
+  tiles.set(game.path, old);
+  paintTile(game);
+  return old.tile;
+}
+
 function refreshTile(game) {
   const entry = tiles.get(game.path);
-  if (entry) entry.tile.replaceWith(buildTile(game));
+  if (!entry) return;
+  if (entry.look !== tileLook(game)) {
+    entry.tile.replaceWith(buildTile(game));
+    return;
+  }
+  entry.game = game;
+  paintTile(game);
 }
 
 function buildTile(game) {
@@ -420,8 +448,9 @@ function buildTile(game) {
     sub.append(rating);
   }
   tile.append(art, el("span", "tile-name", displayName(game)), sub);
-  tile.addEventListener("click", () => openDetail(game, tile));
-  tiles.set(game.path, { tile, art });
+  const entry = { tile, art, game, look: tileLook(game) };
+  tile.addEventListener("click", () => openDetail(entry.game, tile));
+  tiles.set(game.path, entry);
   paintTile(game);
   return tile;
 }

@@ -19,7 +19,7 @@ struct GameSize {
   std::vector<panplay::GameVariant> variants;
 };
 
-// on_change 在量到新的容量后调用（连着量时几秒一次），页面据此重取游戏库。
+// on_change 在量到新的容量后调用（连着量时十秒一次），页面据此重取游戏库。
 void start_size_scan(std::function<std::shared_ptr<panplay::DrivePlugin>()> open_drive, std::function<void()> on_change);
 // 列表重新列过网盘目录后调用：没量过的、量过超过一天的游戏目录在后台排队去量，已经不在网盘上的记录删掉。
 void want_game_sizes(const std::string& key, const std::vector<std::string>& game_dirs);
