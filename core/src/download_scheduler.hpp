@@ -184,6 +184,7 @@ class DownloadScheduler {
   void release_range(std::map<std::int64_t, Range>::iterator it, std::int64_t from);
   void unassign(std::int64_t start, std::int64_t end);
   void add_hole(std::int64_t start, std::int64_t end);
+  std::int64_t wanted_segment(double rate = 0) const;
   std::int64_t segment_length(const Lane& lane) const;
   std::int64_t extent_end(std::int64_t offset) const;
   int extent_of(std::int64_t offset) const;

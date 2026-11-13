@@ -22,6 +22,12 @@ struct SimScenario {
   double consume_mbps = 100;
   double first_byte = 0.2;
   double first_byte_jitter = 0.1;
+  // 连接断开过（被中止、段被截短没下完、出错）或第一次用时，首字节前还要多等这么久建连接。
+  double connect = 0;
+  // 每条连接的速度隔 wobble_period 秒左右换一次：wobble_dip 的概率掉到 wobble_low 以下，其余在 0.6～1.4 倍之间。0 是不换。
+  double wobble_period = 0;
+  double wobble_dip = 0;
+  double wobble_low = 0.3;
   // 每个请求有这个概率整段都慢（乘 straggler_factor）、中途卡死、中途出错。
   double straggler_chance = 0;
   double straggler_factor = 0.1;
@@ -44,6 +50,8 @@ struct SimResult {
   int final_lanes = 1;
   int most_lanes = 1;
   int lane_changes = 0;
+  // 新建的连接（含第一次）。
+  int connections = 0;
   LaneMemory memory;
   std::vector<std::string> log;
 };

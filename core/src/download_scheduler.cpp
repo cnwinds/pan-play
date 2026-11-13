@@ -34,6 +34,8 @@ constexpr double kLateBy = 1.0;
 constexpr double kStealGain = 1.0;
 constexpr double kPreemptGain = 2.0;
 constexpr double kStealCooldown = 3.0;
+// 没有空着的连接、要断开别人来接时，慢要持续这么久才算：忽快忽慢的连接一两秒就恢复，断开重连反而更慢。
+constexpr double kPreemptWindow = 4.0;
 constexpr double kRestartCooldown = 10.0;
 constexpr std::int64_t kMinSteal = 512ll << 10;
 // 往上加被判成分流后，从同一个条数再往上试要等 1、2、5 分钟。
@@ -253,7 +255,7 @@ std::int64_t DownloadScheduler::received(int lane, std::uint64_t lease, std::int
   } else {
     state.trail.back().second = state.lease_bytes;
   }
-  while (state.trail.size() > 2 && state.trail[1].first <= now - 3) state.trail.pop_front();
+  while (state.trail.size() > 2 && state.trail[1].first <= now - kPreemptWindow - 1) state.trail.pop_front();
   return accepted;
 }
 
@@ -484,12 +486,13 @@ void DownloadScheduler::sample(double now) {
   sample_from_ = now;
 }
 
-// 缓冲按总速度 × 6 秒：慢时少占内存，快时让每条连接都放得下一整段。
+// 缓冲按总速度 × 6 秒：慢时少占内存。首字节慢时段要长，再放大到每条连接都放得下一整段。
 void DownloadScheduler::update_window(double now) {
   const Span recent = span(now - 5, now);
   const double speed = std::max(recent.total, lanes_ * lane_estimate());
   if (speed <= 0) return;
   std::int64_t target = static_cast<std::int64_t>(speed * kWindowSeconds);
+  if (lanes_ > 1) target = std::max(target, (lanes_ + 1) * wanted_segment());
   target = std::max(target, (lanes_ + 1) * kMinSegment);
   window_ = std::clamp(target, std::min(kWindowFloor, options_.window_cap), options_.window_cap);
 }
@@ -659,7 +662,7 @@ void DownloadScheduler::set_lanes(int lanes, double now) {
     }
   }
   if (lanes_ > old && lane_estimate() > 0) {
-    const auto wanted = static_cast<std::int64_t>(lanes_ * lane_estimate() * kWindowSeconds);
+    const auto wanted = std::max(static_cast<std::int64_t>(lanes_ * lane_estimate() * kWindowSeconds), (lanes_ + 1) * wanted_segment());
     window_ = std::max(window_, std::min(options_.window_cap, wanted));
   }
 }
@@ -709,13 +712,25 @@ void DownloadScheduler::check_lanes(double now) {
   for (; it != ranges_.end(); ++it) {
     if (it->second.lane >= 0 && it->second.next < it->second.end) keys.push_back(it->first);
   }
+  // 下载跟不上时读取方随时在等，慢的那段真正耽误事是在别的连接都被缓冲挡住以后：
+  // 在那之前别的连接还有手上没下完的、缓冲里还能派的可下，读取方晚一点追上不影响总速度。
+  std::int64_t pending = std::max<std::int64_t>(0, position_ + window_ - frontier_);
+  for (const auto& [start, range] : ranges_) {
+    if (range.lane >= 0) pending += range.end - range.next;
+  }
+  for (const auto& [start, end] : holes_) pending += end - start;
+  double flow = 0;
+  for (const auto& lane : lane_state_) flow += std::max(0.0, recent_rate(lane, now));
   double ready = 0;
   for (const std::int64_t key : keys) {
     const auto found = ranges_.find(key);
     if (found == ranges_.end()) continue;
     const double reach = consume_rate_ > 0 ? static_cast<double>(found->second.next - position_) / consume_rate_ : 0;
+    const double others = flow - std::max(0.0, recent_rate(lane_state_[static_cast<std::size_t>(found->second.lane)], now));
+    const double slack =
+        others > 0 ? static_cast<double>(pending - (found->second.end - found->second.next)) / others : 0;
     double eta = 0;
-    if (steal_from(key, std::max(ready, reach), now, &eta)) return;
+    if (steal_from(key, std::max({ready, reach, slack}), now, &eta)) return;
     ready = std::max(ready, eta);
   }
 }
@@ -786,24 +801,33 @@ bool DownloadScheduler::steal_from(std::int64_t key, double need_in, double now,
   if (stuck || (idle < 0 && victim < 0)) {
     // 卡住了，或者只有这一条又明显变慢：断开换一条连接，没下的部分放回去（空着的连接或它自己马上来接）。
     if (!stuck && compared) return false;
-    log(Event::Kind::debug, where + " 时" + speed + "，读取方 " + fixed(std::max(0.0, need_in)) + " 秒后要用，断开重下剩下的 " +
+    log(Event::Kind::debug, where + " 时" + speed + "，" + fixed(std::max(0.0, need_in)) + " 秒后开始耽误，断开重下剩下的 " +
                                 mb(remaining));
     lane.touched_at = now;
     ++totals_.steals;
     abort_lane(k);
     return true;
   }
+  double v = std::max(rate, 1.0);
+  double late = *eta;
+  if (idle < 0) {
+    const double steady = recent_rate(lane, now, kPreemptWindow);
+    if (steady < 0 || steady >= ratio * normal) return false;
+    v = std::max(v, steady);
+    late = static_cast<double>(remaining) / v;
+    if (late - need_in < kLateBy) return false;
+  }
   // 切点让两边同时下完：慢的留前面一截，快的从切点接手（要先等一个首字节）。
   const double fast = normal;
-  const double v = std::max(rate, 1.0);
   const double g = first_byte_avg_;
   std::int64_t cut = range.next + static_cast<std::int64_t>(v * (static_cast<double>(remaining) + g * fast) / (v + fast));
   cut = std::clamp(align_up(cut), range.next, range.end);
   if (range.end - cut < kMinSteal) return false;
   const double after = std::max(static_cast<double>(cut - range.next) / v, g + static_cast<double>(range.end - cut) / fast);
-  const double gain = *eta - after;
+  // 只算真正少等的：分了以后在要用之前就能下完的那部分不算省下。
+  const double gain = late - std::max(after, need_in);
   if (gain < (idle >= 0 ? kStealGain : kPreemptGain)) return false;
-  log(Event::Kind::debug, where + " 时" + speed + "，读取方 " + fixed(std::max(0.0, need_in)) + " 秒后要用，后 " +
+  log(Event::Kind::debug, where + " 时" + speed + "，" + fixed(std::max(0.0, need_in)) + " 秒后开始耽误，后 " +
                               mb(range.end - cut) + " 分给" + (idle >= 0 ? std::string("空着的连接") : "断开最靠后的段 @" + mb(victim_start) + " 的连接") +
                               "，预计早 " + fixed(gain) + " 秒");
   const std::int64_t end = range.end;
@@ -869,13 +893,16 @@ void DownloadScheduler::add_hole(std::int64_t start, std::int64_t end) {
   holes_[start] = end;
 }
 
-std::int64_t DownloadScheduler::segment_length(const Lane& lane) const {
-  double rate = lane_estimate();
-  if (rate <= 0) rate = lane.rate;
+// 段长按单条速度 × 4 秒，首字节慢时 × 20 倍首字节，让请求开销在 5% 左右。
+std::int64_t DownloadScheduler::wanted_segment(double rate) const {
+  if (rate <= 0) rate = lane_estimate();
   if (rate <= 0) rate = 4.0 * (1 << 20);
-  const double span_seconds = std::max(kSegmentSeconds, 20 * first_byte_avg_);
+  return static_cast<std::int64_t>(rate * std::max(kSegmentSeconds, 20 * first_byte_avg_));
+}
+
+std::int64_t DownloadScheduler::segment_length(const Lane& lane) const {
   const std::int64_t room = window_ / (lanes_ + 1);
-  const auto wanted = static_cast<std::int64_t>(rate * span_seconds);
+  const std::int64_t wanted = wanted_segment(lane_estimate() > 0 ? lane_estimate() : lane.rate);
   return align_up(std::clamp(wanted, kMinSegment, std::max(kMinSegment, room)));
 }
 

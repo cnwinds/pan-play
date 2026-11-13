@@ -38,6 +38,13 @@ struct SimLane {
   double carry = 0;
 };
 
+// 一条连接跨请求的状态：连接还能不能复用、现在的速度倍数。
+struct SimLink {
+  bool warm = false;
+  double speed = 1;
+  double change_at = 0;
+};
+
 std::string fixed(double value) {
   char text[32];
   std::snprintf(text, sizeof(text), "%.1f", value);
@@ -54,13 +61,20 @@ std::int64_t total_size(const SimScenario& scenario) {
   return size;
 }
 
+// 速度来回换时每条的平均倍数：掉下去时在 0.05～wobble_low 之间均匀取。
+double mean_wobble(const SimScenario& scenario) {
+  if (scenario.wobble_period <= 0) return 1;
+  return scenario.wobble_dip * (0.05 + scenario.wobble_low) / 2 + (1 - scenario.wobble_dip);
+}
+
 double ideal_seconds(const SimScenario& scenario) {
   const std::int64_t size = total_size(scenario);
   const double lanes = scenario.options.adaptive ? 8 : std::clamp(scenario.options.max_lanes, 1, 16);
+  const double lane_rate = scenario.lane_mbps * kMB * mean_wobble(scenario);
   double done = 0;
   double t = 0;
   while (done < static_cast<double>(size) && t < scenario.time_limit) {
-    const double rate = std::min({scenario.consume_mbps * kMB, total_at(scenario, t), scenario.lane_mbps * kMB * lanes});
+    const double rate = std::min({scenario.consume_mbps * kMB, total_at(scenario, t), lane_rate * lanes});
     done += rate * kStep;
     t += kStep;
   }
@@ -75,6 +89,7 @@ SimResult run_download_sim(const SimScenario& scenario) {
   const std::int64_t size = total_size(scenario);
   DownloadScheduler scheduler(scenario.extents, scenario.options, scenario.memory, 0, 0.0);
   std::vector<SimLane> lanes(static_cast<std::size_t>(std::clamp(scenario.options.max_lanes, 1, 16)));
+  std::vector<SimLink> links(lanes.size());
   const std::string fault = "模拟的连接出错";
   double t = 0;
   double next_tick = kTick;
@@ -89,6 +104,7 @@ SimResult run_download_sim(const SimScenario& scenario) {
       if (event.kind == DownloadScheduler::Event::Kind::abort) {
         if (event.lane >= 0 && event.lane < static_cast<int>(lanes.size())) {
           lanes[static_cast<std::size_t>(event.lane)].state = SimLane::State::idle;
+          links[static_cast<std::size_t>(event.lane)].warm = false;
         }
         continue;
       }
@@ -102,8 +118,10 @@ SimResult run_download_sim(const SimScenario& scenario) {
       path += "→" + std::to_string(lanes_seen);
     }
   };
+  // 服务器把请求的范围发完了连接才能复用；段被截短、出错时没发完，得断开。
   const auto release = [&](std::size_t k, const std::string* error) {
     scheduler.released(static_cast<int>(k), lanes[k].lease.id, error, t);
+    if (error != nullptr || lanes[k].lease.start + lanes[k].got < lanes[k].lease.end) links[k].warm = false;
     lanes[k].state = SimLane::State::idle;
   };
 
@@ -127,6 +145,11 @@ SimResult run_download_sim(const SimScenario& scenario) {
       lane.state = SimLane::State::connecting;
       lane.lease = lease;
       lane.ready_at = t + scenario.first_byte + scenario.first_byte_jitter * random.uniform();
+      if (!links[k].warm) {
+        lane.ready_at += scenario.connect;
+        links[k].warm = true;
+        ++result.connections;
+      }
       const std::int64_t length = lease.end - lease.start;
       lane.factor = random.uniform() < scenario.straggler_chance ? scenario.straggler_factor : 1.0;
       if (random.uniform() < scenario.stall_chance) lane.stall_after = static_cast<std::int64_t>(random.uniform() * length);
@@ -140,6 +163,14 @@ SimResult run_download_sim(const SimScenario& scenario) {
         lane.state = SimLane::State::receiving;
       }
     }
+    if (scenario.wobble_period > 0) {
+      for (SimLink& link : links) {
+        if (t < link.change_at) continue;
+        link.speed = random.uniform() < scenario.wobble_dip ? 0.05 + (scenario.wobble_low - 0.05) * random.uniform()
+                                                            : 0.6 + 0.8 * random.uniform();
+        link.change_at = t + scenario.wobble_period * (0.5 + random.uniform());
+      }
+    }
     // 共享带宽按水位线分：每条要的不超过平均份额就全给，剩下的再平分给要得多的。
     std::vector<std::pair<double, std::size_t>> demand;
     std::vector<std::int64_t> allowance(lanes.size(), 0);
@@ -151,7 +182,7 @@ SimResult run_download_sim(const SimScenario& scenario) {
         release(k, nullptr);
         continue;
       }
-      double want = scenario.lane_mbps * kMB * lane.factor;
+      double want = scenario.lane_mbps * kMB * lane.factor * links[k].speed;
       if (lane.stall_after >= 0 && lane.got >= lane.stall_after) want = 0;
       if (allowance[k] > 0 && want > 0) demand.emplace_back(want, k);
     }
@@ -220,7 +251,9 @@ std::string describe_sim(const SimScenario& scenario, const SimResult& result) {
                      " 秒（理想 " + fixed(result.bound) + "，多 " +
                      std::to_string(static_cast<int>((result.seconds / std::max(result.bound, 0.01) - 1) * 100 + 0.5)) +
                      "%），等数据 " + std::to_string(static_cast<int>(totals.wait / std::max(totals.elapsed, 0.01) * 100 + 0.5)) +
-                     "%，请求 " + std::to_string(totals.requests) + "，分走 " + std::to_string(totals.steals) + "，断开 " +
+                     "%，请求 " + std::to_string(totals.requests) + "（首字节占 " +
+                     std::to_string(static_cast<int>(totals.first_byte / std::max(totals.leased, 0.01) * 100 + 0.5)) +
+                     "%），新建连接 " + std::to_string(result.connections) + "，分走 " + std::to_string(totals.steals) + "，断开 " +
                      std::to_string(totals.aborts) + "，出错 " + std::to_string(totals.failures) + "，丢弃 " +
                      fixed(static_cast<double>(totals.discarded) / kMB) + " MB，最后 " + std::to_string(result.final_lanes) +
                      " 条（记下 " + std::to_string(result.memory.lanes) + " 条、每条 " + fixed(result.memory.lane_rate / kMB) +
@@ -323,6 +356,24 @@ std::vector<SimScenario> download_sim_scenarios() {
   errors.total_mbps = 40;
   errors.error_chance = 0.05;
   out.push_back(errors);
+
+  // 照 2026-11-13 PS5 上装游戏的日志：8 条，每条平均约 2 MB/s 但隔一两秒就忽快忽慢，首字节约 0.5 秒，
+  // 断开后重连再多 0.35 秒；解压远比下载快，字典小时缓冲上限 256 MB。
+  SimScenario baidu = base;
+  baidu.name = "百度忽快忽慢（记下 8 条，每条约 2.3，首字节 0.5，重连 0.35）";
+  baidu.extents = {1500 * MB};
+  baidu.lane_mbps = 2.3;
+  baidu.total_mbps = 40;
+  baidu.first_byte = 0.3;
+  baidu.first_byte_jitter = 0.4;
+  baidu.connect = 0.35;
+  baidu.wobble_period = 1.5;
+  baidu.wobble_dip = 0.15;
+  baidu.wobble_low = 0.35;
+  baidu.options.window_cap = 256 * MB;
+  baidu.memory.lanes = 8;
+  baidu.memory.lane_rate = 2 * MB;
+  out.push_back(baidu);
   return out;
 }
 

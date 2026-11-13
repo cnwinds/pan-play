@@ -969,6 +969,8 @@ int download_sim_tests() {
       if (!within(1.45)) return bad("带宽波动时太慢");
     } else if (is("出错")) {
       if (result.totals.failures < 1 || !within(1.4)) return bad("出错后应该重试并读完");
+    } else if (is("百度")) {
+      if (result.connections > 45 || !within(1.25)) return bad("连接忽快忽慢时不该频繁断开重连");
     }
   }
   SimScenario broken;
