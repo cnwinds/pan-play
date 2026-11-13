@@ -1512,11 +1512,10 @@ std::string one_game_json(const std::string& path, bool cached) {
   // 读到详情就带上：详情页切换格式时用 Object.assign 合并，不带的话上一种格式的 true 会留下来。
   // 还没读到时不带，免得把游戏库格子上的标记冲掉。
   if (detail) json += std::string(",\"remote\":") + (not_on_drive(*detail, path) ? "true" : "false");
-  // 盘架编排里要提醒的步骤，和这种格式有没有已经通知盘架、还没重新分析的问题（ADR 0012）。
+  // 盘架编排的版本，和这种格式有没有已经通知盘架、还没重新分析的问题（ADR 0012）。
   if (const auto library = shelf_library()) {
     if (const ShelfVariant* variant = library->variant(title_id, panplay::variant_format(path))) {
-      json += ",\"shelf_notes\":" + json_string_array(variant->plan ? variant->plan->notes : std::vector<std::string>{}) +
-              ",\"shelf_plan\":" + (variant->plan ? std::to_string(variant->plan->rev) : "0") +
+      json += std::string(",\"shelf_plan\":") + (variant->plan ? std::to_string(variant->plan->rev) : "0") +
               ",\"shelf_feedback\":" + (shelf_feedback_pending(path) ? "true" : "false") +
               ",\"console_packages\":" + console_packages_json(path);
     }

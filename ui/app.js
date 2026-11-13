@@ -1370,11 +1370,8 @@ function openDetail(game, opener) {
   queueRow.append(queueText, queueLinks);
   const status = el("p", "status-text");
   status.setAttribute("role", "status");
-  // 网盘里还没有的格式：说一句装的时候会先转存，链接失效、评过有问题的也在这里说。
+  // 网盘里还没有的格式：链接失效、评过有问题时在这里说。
   const remoteNote = el("p", "remote-note");
-  // 盘架编排里盘游做不了、要用户自己做的步骤（ADR 0012）。
-  const shelfNotes = el("div", "shelf-notes");
-  let shelfNotesKey = null;
   // 编排里要在主机上安装的包（激活完整版这类），装好游戏后盘游自动装。
   const packageNotes = el("div", "shelf-notes packages");
   let packageNotesKey = null;
@@ -1644,7 +1641,7 @@ function openDetail(game, opener) {
     }));
   };
 
-  install.append(variantRow, remoteNote, shelfNotes, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
+  install.append(variantRow, remoteNote, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1745,25 +1742,12 @@ function openDetail(game, opener) {
     if (remoteVariant && toInstall) {
       if (remoteVariant.alive === false) {
         remoteText = "盘架检查时这个分享链接已经失效，装不了，换别的格式试试。";
-      } else {
-        const size = remoteVariant.size ? `（约 ${formatBytes(remoteVariant.size)}）` : "";
-        remoteText = `网盘里还没有${variantLabel(remoteVariant.format)}版，安装时先从分享转存到网盘${size}，再开始下载。`;
-        if (remoteVariant.review_state === "bad") {
-          remoteText += `盘游评过这份资源有问题${remoteVariant.review_note ? `：${remoteVariant.review_note}` : ""}。`;
-        }
+      } else if (remoteVariant.review_state === "bad") {
+        remoteText = `盘游评过这份资源有问题${remoteVariant.review_note ? `：${remoteVariant.review_note}` : ""}。`;
       }
     }
     remoteNote.textContent = remoteText;
     remoteNote.hidden = !remoteText || picking || confirm.open;
-    const notes = game.shelf_notes || [];
-    shelfNotes.hidden = !notes.length || picking || confirm.open;
-    const notesKey = JSON.stringify(notes);
-    if (notesKey !== shelfNotesKey) {
-      shelfNotesKey = notesKey;
-      const list = el("ul");
-      for (const note of notes) list.append(el("li", "", note));
-      shelfNotes.replaceChildren(el("strong", "", "盘架说明：这些要你自己做"), list);
-    }
     const packages = game.console_packages || [];
     packageNotes.hidden = !packages.length || picking || confirm.open;
     const packagesKey = JSON.stringify(packages);
