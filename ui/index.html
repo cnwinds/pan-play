@@ -159,11 +159,11 @@
           <div class="field-pair">
             <label class="field">游戏最多占用网盘（GB）
               <input name="drive_cap_gb" type="number" min="1" step="1" inputmode="numeric" placeholder="2048">
-              <span class="hint">装盘架资源库里的游戏时自动转存；游戏库目录超过这么大，先把能再转回来的游戏移出网盘。</span>
+              <span class="hint">装盘架资源库里的游戏时自动转存；转存后游戏库目录超过这么大，边装边把能再转回来的游戏移出网盘。</span>
             </label>
             <label class="field">网盘至少留出（GB）
               <input name="drive_reserve_gb" type="number" min="0" step="1" inputmode="numeric" placeholder="200">
-              <span class="hint">网盘总剩余低于这么多时，也先腾空间再转存。</span>
+              <span class="hint">转存后网盘总剩余低于这么多时，也这样腾空间。网盘剩下的装不下这款时，转存前先腾。</span>
             </label>
           </div>
           <section class="speedtest" aria-labelledby="speedtest-title">

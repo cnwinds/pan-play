@@ -38,6 +38,7 @@ class FakeDrive : public panplay::DrivePlugin {
   std::map<std::string, Share> shares;
   std::set<std::string> need_verify;
   int transfers = 0;
+  std::int64_t total = 100000 * kGb;
 
   void add_file(const std::string& path, std::int64_t size, const std::string& text = "") {
     add_dirs(parent(path));
@@ -142,7 +143,7 @@ class FakeDrive : public panplay::DrivePlugin {
 
   panplay::DriveQuota quota() override {
     panplay::DriveQuota quota;
-    quota.total = 100000 * kGb;
+    quota.total = total;
     for (const auto& [path, node] : nodes) quota.used += std::max<std::int64_t>(0, node.size);
     return quota;
   }
@@ -234,10 +235,13 @@ int check_transfer_and_room() {
   panplay::CancelToken cancel;
   std::vector<std::string> said;
   const auto say = [&](const std::string& message) { said.push_back(message); };
-  // 游戏区 155 GB，要装 30 GB，上限 150 GB：要腾出 35 GB。
+  // 游戏区 155 GB，要装 30 GB，上限 150 GB；网盘剩下的装得下，先转存，一个都不退。
   PrepareResult result = prepare_on_drive(drive, test_settings(150), "shelf-self-test", "/lib/PPSA00001/@exfat", {}, cancel, say);
   if (!result.error.empty() || !result.transferred) return fail("转存应该成功：" + result.error);
+  if (!drive.has("/lib/PPSA00002") || !drive.has("/lib/PPSA00003")) return fail("网盘装得下时转存前不该移出游戏");
+  // 转存后整理：游戏区 185 GB，上限 150 GB，要腾出 35 GB。
   // 先退装在主机上的（20 GB），再退最久没用的：分享打不开的跳过，接着是很久没用的（25 GB），够了就停。
+  if (tidy_drive(drive, test_settings(150), "shelf-self-test", "/lib/PPSA00001", {}) != 2) return fail("转存后应该移出两个游戏");
   if (drive.has("/lib/PPSA00002")) return fail("装在主机上的应该先退");
   if (drive.has("/lib/PPSA00003")) return fail("很久没用的应该退掉，游戏目录一起删");
   if (!drive.has("/lib/PPSA00007/@exfat")) return fail("分享打不开的不能退");
@@ -249,6 +253,7 @@ int check_transfer_and_room() {
       drive.has("/lib/PPSA00001/@exfat/对马岛")) {
     return fail("外包目录应该去掉");
   }
+  if (!drive.has("/lib/PPSA00001/@exfat/game.part1.rar")) return fail("刚转存的不能退");
   if (said.empty()) return fail("应该报告进度");
 
   // 已经在网盘里的不再转存。
@@ -262,14 +267,29 @@ int check_transfer_and_room() {
   return 0;
 }
 
+int check_fit_first() {
+  FakeDrive drive;
+  fill(drive);
+  panplay::CancelToken cancel;
+  // 网盘只剩 11 GB、要装 30 GB：转存前只腾差的 19 GB，退掉装在主机上的那个（20 GB）就够，上限再低也不多退。
+  drive.total = drive.quota().used + 11 * kGb;
+  const PrepareResult result = prepare_on_drive(drive, test_settings(50), "shelf-self-test", "/lib/PPSA00001/@exfat", {}, cancel,
+                                                [](const std::string&) {});
+  if (!result.error.empty() || !result.transferred) return fail("腾出差的之后应该转存成功：" + result.error);
+  if (drive.has("/lib/PPSA00002")) return fail("装不下时应该先退装在主机上的");
+  if (!drive.has("/lib/PPSA00003/@exfat")) return fail("转存前只该腾出差的那些");
+  return 0;
+}
+
 int check_not_enough() {
   FakeDrive drive;
   fill(drive);
   drive.need_verify.insert("/lib/PPSA00002/@folder");
   panplay::CancelToken cancel;
-  // 上限 50 GB：能退的全退了也不够；要安全验证的移进待删除，不算腾出空间。
+  // 网盘只剩 4 GB、要装 30 GB：差 26 GB，能退的只有很久没用的 25 GB；要安全验证的移进待删除，不算腾出空间。
+  drive.total = drive.quota().used + 4 * kGb;
   const PrepareResult result =
-      prepare_on_drive(drive, test_settings(50), "shelf-self-test", "/lib/PPSA00001/@exfat", {"/lib/PPSA00004/@exfat"}, cancel,
+      prepare_on_drive(drive, test_settings(1000), "shelf-self-test", "/lib/PPSA00001/@exfat", {"/lib/PPSA00004/@exfat"}, cancel,
                        [](const std::string&) {});
   if (result.error.find("网盘空间不够") == std::string::npos || result.error.find("待删除") == std::string::npos) {
     return fail("空间不够时应该说明原因：" + result.error);
@@ -464,6 +484,7 @@ int run_shelf_self_test() {
   if (const int packages = check_packages()) return packages;
   use_shelf_library(parse_shelf_library(kLibrary, nullptr));
   int result = check_transfer_and_room();
+  if (result == 0) result = check_fit_first();
   if (result == 0) result = check_not_enough();
   use_shelf_library(saved);
   return result;

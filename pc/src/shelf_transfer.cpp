@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -91,16 +93,29 @@ struct Candidate {
   std::int64_t used = 0;
 };
 
-// 网盘空间不够装 need 这么大的游戏时，按 ADR 0011 挑游戏移出网盘。返回出错原因。
-std::string make_room(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& key,
-                      const ShelfLibrary& library, const std::string& target_dir, std::int64_t need,
-                      const std::set<std::string>& busy, panplay::CancelToken& cancel,
-                      const std::function<void(const std::string&)>& say) {
+// fit：只管网盘真正剩下的装得下这次的 need，安装前用；limits：按设置的游戏区上限和保底算，转存完在后台用。
+enum class Room { fit, limits };
+
+struct RoomResult {
+  std::string error;
+  // 移出了几个（移进待删除的也算），游戏库列表要重列。
+  int removed = 0;
+};
+
+// 按 ADR 0011 挑游戏移出网盘，腾出 mode 要求的空间。target_dir 是这次要装的游戏目录，不动。
+RoomResult make_room(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& key,
+                     const ShelfLibrary& library, const std::string& target_dir, std::int64_t need, Room mode,
+                     const std::set<std::string>& busy, panplay::CancelToken& cancel,
+                     const std::function<void(const std::string&)>& say) {
+  RoomResult out;
   const std::int64_t cap = static_cast<std::int64_t>(settings.drive_cap_gb) * kGb;
   const std::int64_t reserve = static_cast<std::int64_t>(settings.drive_reserve_gb) * kGb;
   std::string error;
   const auto folders = drive.list(settings.library_path(), &error);
-  if (!error.empty()) return "列游戏库目录失败：" + error;
+  if (!error.empty()) {
+    out.error = "列游戏库目录失败：" + error;
+    return out;
+  }
 
   std::string usage_error;
   const DriveUsage usage = read_drive_usage(drive, &usage_error);
@@ -127,14 +142,18 @@ std::string make_room(panplay::DrivePlugin& drive, const AppSettings& settings, 
     }
   }
 
-  std::int64_t to_free = area + need - cap;
+  std::int64_t to_free = mode == Room::limits ? area + need - cap : 0;
   const panplay::DriveQuota quota = drive.quota();
   if (quota.error.empty() && quota.total > 0) {
-    to_free = std::max(to_free, reserve + need - (quota.total - quota.used));
+    to_free = std::max(to_free, (mode == Room::limits ? reserve : 0) + need - (quota.total - quota.used));
+  } else if (mode == Room::fit) {
+    // 百度说空间不够、又查不到还剩多少：按这次的大小腾。
+    panplay::log_warn("查不到网盘空间，按这次要转存的大小腾：" + quota.error);
+    to_free = need;
   } else {
     panplay::log_warn("查不到网盘空间，只按游戏区上限算：" + quota.error);
   }
-  if (to_free <= 0) return "";
+  if (to_free <= 0) return out;
 
   // 先退已经装在主机上的，再按最久没用过的；同样时先退大的，少删几个。
   std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& left, const Candidate& right) {
@@ -142,27 +161,32 @@ std::string make_room(panplay::DrivePlugin& drive, const AppSettings& settings, 
     if (left.used != right.used) return left.used < right.used;
     return left.bytes > right.bytes;
   });
-  panplay::log_info("网盘要腾出 " + gb_text(to_free) + " 才能装（游戏区 " + gb_text(area) + "，上限 " + gb_text(cap) +
-                    "），能退的有 " + std::to_string(candidates.size()) + " 个");
+  panplay::log_info(std::string(mode == Room::fit ? "网盘剩下的装不下，" : "转存后整理网盘，") + "要腾出 " +
+                    gb_text(to_free) + "（游戏区 " + gb_text(area) + "，上限 " + gb_text(cap) + "），能退的有 " +
+                    std::to_string(candidates.size()) + " 个");
   std::int64_t freed = 0;
   std::vector<std::string> removed;
   bool trashed = false;
   for (const auto& candidate : candidates) {
     if (freed >= to_free) break;
-    if (cancel.cancelled()) return "已暂停";
-    say("腾网盘空间：核对「" + candidate.title + "」的分享还能不能转回来…");
+    if (cancel.cancelled()) {
+      out.error = "已暂停";
+      return out;
+    }
+    say("腾网盘空间：核对「" + candidate.title + "」");
     // 退之前当场核对：退掉之后要能再转回来。
     const panplay::ShareListing share = drive.list_share(candidate.variant->surl, candidate.variant->pwd);
     if (!share.error.empty()) {
       panplay::log_info("不退「" + candidate.title + "」：分享链接" + (share.invalid ? "已经不能用了：" : "暂时打不开：") + share.error);
       continue;
     }
-    say("腾网盘空间：移出「" + candidate.title + "」…");
+    say("腾网盘空间：移出「" + candidate.title + "」");
     std::string moved_to;
     if (const std::string remove_error = drive.remove_path(candidate.path, &moved_to); !remove_error.empty()) {
       panplay::log_warn("移出「" + candidate.title + "」失败：" + remove_error);
       continue;
     }
+    ++out.removed;
     forget_game_detail(candidate.path);
     // 这款游戏的格式都退光了，游戏目录也删掉。
     std::string list_error;
@@ -184,15 +208,64 @@ std::string make_room(panplay::DrivePlugin& drive, const AppSettings& settings, 
     for (const auto& title : removed) list += (list.empty() ? "" : "、") + title;
     panplay::log_info("为了装 " + folder_name(target_dir) + "，移出网盘：" + list + "，腾出约 " + gb_text(freed));
   }
-  if (freed >= to_free) return "";
-  std::string message = "网盘空间不够：还差约 " + gb_text(to_free - freed) +
-                        "。能再转回来的游戏都退出网盘了，自己放的、链接失效的、正在装的不会动。";
-  if (trashed) message += "有的游戏百度要求安全验证、只移到了 /盘游/待删除，在百度网盘 App 里清空这个文件夹才会腾出空间。";
-  message += "可以在设置里调高游戏占用上限，或者自己清理网盘。";
-  return message;
+  if (freed >= to_free) return out;
+  const std::string trash_note =
+      trashed ? "有的游戏百度要求安全验证、只移到了 /盘游/待删除，在百度网盘 App 里清空这个文件夹才会腾出空间。" : "";
+  if (mode == Room::limits) {
+    panplay::log_warn("转存后整理网盘：能再转回来的游戏都退出网盘了，离设置的上限和保底还差约 " + gb_text(to_free - freed) +
+                      "。" + trash_note);
+    return out;
+  }
+  out.error = "网盘空间不够：还差约 " + gb_text(to_free - freed) +
+              "。能再转回来的游戏都退出网盘了，自己放的、链接失效的、正在装的不会动。" + trash_note + "可以自己清理网盘。";
+  return out;
 }
 
+std::mutex tidy_mu;
+bool tidy_running = false;
+std::function<void()> tidy_next;
+
 }  // namespace
+
+int tidy_drive(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& sizes_key,
+               const std::string& keep, const std::set<std::string>& busy) {
+  const auto library = shelf_library();
+  if (!library) return 0;
+  panplay::CancelToken cancel;
+  const RoomResult room =
+      make_room(drive, settings, sizes_key, *library, keep, 0, Room::limits, busy, cancel, [](const std::string&) {});
+  if (!room.error.empty()) panplay::log_warn("转存后整理网盘没做完：" + room.error);
+  return room.removed;
+}
+
+void tidy_drive_later(std::shared_ptr<panplay::DrivePlugin> drive, AppSettings settings, std::string sizes_key,
+                      std::string keep, std::function<std::set<std::string>()> busy, std::function<void()> changed) {
+  std::lock_guard<std::mutex> lock(tidy_mu);
+  tidy_next = [=] {
+    if (tidy_drive(*drive, settings, sizes_key, keep, busy()) > 0 && changed) changed();
+  };
+  if (tidy_running) return;
+  tidy_running = true;
+  std::thread([] {
+    for (;;) {
+      std::function<void()> job;
+      {
+        std::lock_guard<std::mutex> lock(tidy_mu);
+        if (!tidy_next) {
+          tidy_running = false;
+          return;
+        }
+        job = std::move(tidy_next);
+        tidy_next = nullptr;
+      }
+      try {
+        job();
+      } catch (const std::exception& ex) {
+        panplay::log_warn(std::string("转存后整理网盘出错：") + ex.what());
+      }
+    }
+  }).detach();
+}
 
 PrepareResult prepare_on_drive(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& sizes_key,
                                const std::string& path, const std::set<std::string>& busy, panplay::CancelToken& cancel,
@@ -234,14 +307,24 @@ PrepareResult prepare_on_drive(panplay::DrivePlugin& drive, const AppSettings& s
   for (const auto& file : share.files) need += file.size;
   if (cancel.cancelled()) return out;
 
-  if (std::string room = make_room(drive, settings, sizes_key, *library, game_dir, need, busy, cancel, say); !room.empty()) {
-    out.error = room;
-    return out;
-  }
-  if (cancel.cancelled()) return out;
+  // 网盘真正剩下的装得下就直接转存、马上开始装，按游戏区上限和保底退游戏留给转存后的 tidy_drive_later；
+  // 装不下时先腾出差的那些。查不到网盘空间时先转，百度说不够再腾。
+  const auto fit = [&]() {
+    const RoomResult room = make_room(drive, settings, sizes_key, *library, game_dir, need, Room::fit, busy, cancel, say);
+    out.error = room.error;
+    return room.error.empty() && !cancel.cancelled();
+  };
+  const panplay::DriveQuota quota = drive.quota();
+  if (quota.error.empty() && quota.total > 0 && quota.total - quota.used < need && !fit()) return out;
 
   say("正在转存到网盘（" + gb_text(need) + "）…");
-  const panplay::ShareTransfer transfer = drive.transfer_share(variant->surl, variant->pwd, path);
+  panplay::ShareTransfer transfer = drive.transfer_share(variant->surl, variant->pwd, path);
+  if (!transfer.error.empty() && transfer.quota && !cancel.cancelled()) {
+    panplay::log_info("转存时百度说网盘空间不够，腾出空间再转一次：" + transfer.error);
+    if (!fit()) return out;
+    say("正在转存到网盘（" + gb_text(need) + "）…");
+    transfer = drive.transfer_share(variant->surl, variant->pwd, path);
+  }
   if (!transfer.error.empty()) {
     out.error = transfer.quota ? "网盘空间不够，转存失败：" + transfer.error : "转存失败：" + transfer.error;
     out.retryable = !transfer.invalid;

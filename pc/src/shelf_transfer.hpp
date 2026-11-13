@@ -5,6 +5,7 @@
 #include "panplay/drive.hpp"
 
 #include <functional>
+#include <memory>
 #include <set>
 #include <string>
 
@@ -18,12 +19,22 @@ struct PrepareResult {
   bool transferred = false;
 };
 
-// 安装前调用（ADR 0011）：path 这个变体网盘里还没有、盘架资源库里有时，先核对分享链接，网盘空间不够就把能再转回来的
-// 游戏移出网盘，然后转存进来。网盘里已经有了什么都不做。busy 是本机安装队列里的变体目录，不会被移出。
-// sizes_key 是容量缓存的 key；say 报告现在在做什么，显示在安装进度上。
 // 自测：资源库解析，用内存里的假网盘跑转存和腾空间。返回 0 表示通过。
 int run_shelf_self_test();
 
+// 安装前调用（ADR 0011）：path 这个变体网盘里还没有、盘架资源库里有时，先核对分享链接，网盘真正剩下的装不下时把能再转回来的
+// 游戏移出网盘，然后转存进来。网盘里已经有了什么都不做。busy 是本机安装队列里的变体目录，不会被移出。
+// 设置的游戏区上限和保底不在这里管，转存后调 tidy_drive_later。
+// sizes_key 是容量缓存的 key；say 报告现在在做什么，显示在安装进度上。
 PrepareResult prepare_on_drive(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& sizes_key,
                                const std::string& path, const std::set<std::string>& busy, panplay::CancelToken& cancel,
                                const std::function<void(const std::string&)>& say);
+
+// 游戏区超过设置的上限、或网盘剩余低于保底时，把能再转回来的游戏移出网盘，keep 这个游戏目录不动。返回移出了几个。
+int tidy_drive(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& sizes_key,
+               const std::string& keep, const std::set<std::string>& busy);
+
+// 转存之后调用：在后台做 tidy_drive，不让安装等着。整理中又要求的，做完接着按最新的再做一次。
+// busy 在开始整理时取本机安装队列里的变体目录；移出过游戏后调 changed。
+void tidy_drive_later(std::shared_ptr<panplay::DrivePlugin> drive, AppSettings settings, std::string sizes_key,
+                      std::string keep, std::function<std::set<std::string>()> busy, std::function<void()> changed);

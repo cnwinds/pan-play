@@ -839,7 +839,7 @@ function paintDock() {
   dockTitle.textContent = displayName(summary.head);
   dockStatus.textContent = summary.text;
   const pace = taskPace(running);
-  dockStatus.title = pace && pace.left !== null ? `最近 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : queuePauseReason;
+  dockStatus.title = pace && pace.left !== null ? `最近 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : summary.text;
   const artKey = summary.head.path + "\n" + (summary.head.cover_url || "");
   if (dockArtKey !== artKey) {
     dockArtKey = artKey;

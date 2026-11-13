@@ -1700,7 +1700,7 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
       result.auto_resume = !settings.dest().empty();
       return result;
     }
-    // 网盘里还没有、盘架资源库里有的：先腾空间、转存进来（ADR 0011）。
+    // 网盘里还没有、盘架资源库里有的：先转存进来，网盘装不下时才先腾空间；按上限退游戏在转存后的后台做（ADR 0011）。
     const PrepareResult prepared =
         prepare_on_drive(*drive, settings, sizes_key(settings), path, queued_paths(), *cancel, [](const std::string& message) {
           panplay::InstallResult step;
@@ -1710,6 +1710,10 @@ panplay::InstallResult run_install(const std::string& path, panplay::CancelToken
     if (prepared.transferred) {
       std::string listing_error;
       shelf_listing(*drive, true, &listing_error);
+      tidy_drive_later(drive, settings, sizes_key(settings), panplay::game_dir_of(path), queued_paths, [] {
+        std::string error;
+        shelf_listing(*open_drive(), true, &error);
+      });
     }
     if (cancel->cancelled()) {
       result.status = "interrupted";
