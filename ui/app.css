@@ -821,16 +821,17 @@ body.drawer-open { overflow: hidden; }
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  isolation: isolate;
 }
 
 /* 主按钮兼做安装进度条（ADR 0013）。用户看底色填到几成和文字里的百分比、速度；
-   阶段看填充的纹理，copy 阶段底边细条的颜色是慢在哪、长度是字典多大。 */
+   阶段看填充的纹理，copy 阶段底边细条的颜色是慢在哪、长度是字典多大。
+   填充和光带在第 0 层、文字和图标在第 1 层：PS5 的浏览器不认按钮里 z-index 为负的层，会画到按钮底色后面。 */
 .job-fill,
 .job-strip { display: none; }
 
 .job-label {
   position: relative;
+  z-index: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -853,7 +854,7 @@ body.drawer-open { overflow: hidden; }
   top: 0;
   bottom: 0;
   left: 0;
-  z-index: -1;
+  z-index: 0;
   width: calc(var(--p, 0) * 100%);
   background: var(--signal);
   transition: width 0.6s ease, opacity 0.3s;
@@ -878,7 +879,7 @@ body.drawer-open { overflow: hidden; }
   top: 0;
   bottom: 0;
   left: 0;
-  z-index: -1;
+  z-index: 0;
   width: 40%;
   background: linear-gradient(90deg, transparent, rgba(122, 168, 255, 0.35), transparent);
   animation: job-sweep 1.6s linear infinite;
@@ -891,6 +892,7 @@ body.drawer-open { overflow: hidden; }
   position: absolute;
   bottom: 0;
   left: 0;
+  z-index: 1;
   height: 3px;
   width: calc(var(--dict, 0) * 100%);
   background: rgba(255, 255, 255, 0.55);
@@ -905,6 +907,7 @@ body.drawer-open { overflow: hidden; }
 .job-icon {
   display: none;
   position: absolute;
+  z-index: 1;
   top: 50%;
   right: 0.95rem;
   box-sizing: content-box;
