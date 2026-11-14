@@ -223,6 +223,14 @@ std::string console_packages_json(const std::string& path) {
 #if defined(PANPLAY_PS5)
 namespace {
 
+// 安装接口把路径当 URI 解析，原文件名里的 [ ] 之类会坏事，所以先放到数据目录下用简单的名字再装。
+std::filesystem::path staging_file(const std::string& key) {
+  const std::filesystem::path dir = panplay::app_data_dir() / "packages";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  return dir / (std::to_string(std::hash<std::string>{}(key)) + ".pkg");
+}
+
 // 交给主机安装接口，等到装好。content_id 是核对时从包里读到的，装的时候接口另给了就换成那个。
 std::string install_local_file(const std::string& file, const std::string& name, std::string* content_id) {
   std::string error = load_app_inst_util();
@@ -313,7 +321,12 @@ std::string install_game_dir_packages(const std::string& path, const std::string
     progress("正在主机上安装游戏目录里的 " + found[i].name + "…");
     std::string content_id;
     check_unlock_package(files[i], title_id, &content_id);
-    const std::string error = install_local_file(files[i], found[i].name, &content_id);
+    const std::filesystem::path staged = staging_file(found[i].key);
+    std::error_code ec;
+    std::filesystem::copy_file(std::filesystem::u8path(files[i]), staged, std::filesystem::copy_options::overwrite_existing, ec);
+    const std::string error =
+        ec ? "复制到数据目录失败：" + ec.message() : install_local_file(staged.u8string(), found[i].name, &content_id);
+    std::filesystem::remove(staged, ec);
     remember(found[i].key, error, content_id);
     if (error.empty()) {
       panplay::log_info("主机上装好了游戏目录里的 " + found[i].name + "（" + content_id + "）");
@@ -356,10 +369,8 @@ std::string install_console_packages(panplay::DrivePlugin& drive, const std::str
     }
     const std::string count = packages.size() > 1 ? "（" + std::to_string(i + 1) + "/" + std::to_string(packages.size()) + "）" : "";
     progress("正在下载要在主机上安装的 " + entry.name + count + "…");
-    const std::filesystem::path dir = panplay::app_data_dir() / "packages";
+    const std::filesystem::path file = staging_file(key);
     std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    const std::filesystem::path file = dir / (std::to_string(std::hash<std::string>{}(key)) + ".pkg");
     std::string error;
     {
       std::ofstream out(file, std::ios::binary | std::ios::trunc);

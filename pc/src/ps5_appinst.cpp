@@ -258,6 +258,7 @@ std::string installer_error_text(int code) {
     case 0x80A2000Fu: return "包和游戏的内容 ID 对不上";
     case 0x80A20015u: return "主机正忙，稍后再试";
     case 0x80A20021u: return "这个附加内容正在安装";
+    case 0x80B2150Fu: return "主机安装服务读不到包文件（0x80b2150f）";
     default: return "安装接口返回 " + hex_code(code);
   }
 }
@@ -265,13 +266,16 @@ std::string installer_error_text(int code) {
 std::string install_package(const std::string& file, const std::string& name, std::string* content_id) {
   if (!util_ready) return "安装库还没加载";
   if (util.install_by_package == nullptr) return "这个固件上找不到 sceAppInstUtilInstallByPackage";
-  PackageMetaInfo meta{file.c_str(), "", "", "", name.c_str(), ""};
+  // 安装服务在沙盒里只看得到 /user/data，给 /data/... 会报 invalid content_uri（0x80b2150f）。
+  // 要裸路径：加 file:// 在固件 11 以下会报 0x80b21106。
+  const std::string uri = file.rfind("/data/", 0) == 0 ? "/user" + file : file;
+  PackageMetaInfo meta{uri.c_str(), "", "", "", name.c_str(), ""};
   PackageInfo info{};
   auto playgo = std::make_unique<PlayGoInfo>();
   std::memset(playgo.get(), 0, sizeof(PlayGoInfo));
   const int code = util.install_by_package(&meta, &info, playgo.get());
   *content_id = std::string(info.content_id, strnlen(info.content_id, sizeof(info.content_id)));
-  panplay::log_info("安装包 " + file + " 返回 " + hex_code(code) + "，内容 ID " + *content_id);
+  panplay::log_info("安装包 " + uri + " 返回 " + hex_code(code) + "，内容 ID " + *content_id);
   if (code == kAddcontAlreadyInstalled) return "";
   return code == 0 ? "" : installer_error_text(code);
 }
