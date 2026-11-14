@@ -1614,7 +1614,7 @@ function openDetail(game, opener) {
     loadCached();
     reload();
   };
-  // 打开的是游戏目录本身、它又按格式分了：默认打开主机上装着的那种，没装就按 exFAT、文件夹、其他的顺序取第一个。
+  // 打开的是游戏目录本身、它又按格式分了：默认打开主机上装着的那种，没装就按文件夹、exFAT、其他的顺序取第一个（服务端排好了）。
   const pickVariant = () => {
     const variants = game.variants || [];
     if (!variants.length || variants.some((item) => item.path === game.path)) return false;

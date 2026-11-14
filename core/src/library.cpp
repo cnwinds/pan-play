@@ -144,6 +144,12 @@ std::string variant_format(const std::string& path) {
   return is_variant_dir(name) ? name.substr(1) : "";
 }
 
+int variant_rank(const std::string& format) {
+  if (format == "folder") return 0;
+  if (format == "exfat") return 1;
+  return format.empty() ? 3 : 2;
+}
+
 std::string game_dir_of(const std::string& path) {
   if (variant_format(path).empty()) return path;
   std::string trimmed = path;
@@ -274,9 +280,8 @@ std::vector<GameVariant> variants_in(const std::string& game_dir, const std::vec
     if (!is_variant_dir(entry.name)) continue;
     variants.push_back({entry.name.substr(1), entry.path.empty() ? join_storage_path(game_dir, entry.name) : entry.path});
   }
-  const auto rank = [](const std::string& format) { return format == "exfat" ? 0 : format == "folder" ? 1 : 2; };
   std::sort(variants.begin(), variants.end(), [&](const GameVariant& left, const GameVariant& right) {
-    if (rank(left.format) != rank(right.format)) return rank(left.format) < rank(right.format);
+    if (variant_rank(left.format) != variant_rank(right.format)) return variant_rank(left.format) < variant_rank(right.format);
     return left.format < right.format;
   });
   if (!variants.empty() && loose) variants.push_back({"", game_dir});

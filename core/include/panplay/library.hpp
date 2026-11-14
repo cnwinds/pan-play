@@ -33,12 +33,14 @@ std::string find_title_id(const std::string& name);
 bool is_variant_dir(const std::string& name);
 // 变体目录的格式（"@exfat" → "exfat"），不是变体目录时为空。
 std::string variant_format(const std::string& path);
+// 几种格式里优先哪种，小的在前：文件夹版解压快得多排第一，其次 exFAT 镜像，再其次别的，没分格式的最后。
+int variant_rank(const std::string& format);
 // 变体目录所在的游戏目录；本身就是游戏目录时原样返回。
 std::string game_dir_of(const std::string& path);
 std::vector<ArchiveSet> group_archives(const std::vector<DriveEntry>& files);
 // 游戏目录和下一层子目录里的压缩包；@格式 子目录是别的变体，不算。
 std::vector<DriveEntry> collect_archives(DrivePlugin& drive, const std::string& dir, std::string* error);
-// 游戏目录下的各个变体，按 exfat、folder、其他的顺序。没分格式时为空；分了格式、游戏目录里又直接放着压缩包时，
+// 游戏目录下的各个变体，按 variant_rank（folder、exfat、其他）的顺序。没分格式时为空；分了格式、游戏目录里又直接放着压缩包时，
 // 游戏目录本身也算一个（format 为空），排在最后。
 std::vector<GameVariant> list_variants(DrivePlugin& drive, const std::string& game_dir, std::string* error);
 

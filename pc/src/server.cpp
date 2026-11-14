@@ -848,7 +848,10 @@ std::string listed_fingerprint(const std::string& key, const std::string& path) 
 std::int64_t listed_bytes(const std::string& sizes, const std::string& key, const std::string& path) {
   const auto size = cached_game_size(sizes, path);
   if (!size || size->variants.empty()) return size ? size->bytes : 0;
-  std::string pick = size->variants.front().path;
+  // 量容量时记下的顺序可能是旧的，按现在的优先顺序挑。
+  std::string pick = std::min_element(size->variants.begin(), size->variants.end(), [](const auto& left, const auto& right) {
+                       return panplay::variant_rank(left.format) < panplay::variant_rank(right.format);
+                     })->path;
   if (const auto detail = cached_game_detail(key, path); detail && !detail->installed_variant.empty()) {
     for (const auto& variant : size->variants) {
       if (variant.format == detail->installed_variant) pick = variant.path;
@@ -961,7 +964,12 @@ std::string games_json(panplay::DrivePlugin& drive, const std::string& query) {
       }
     }
     std::int64_t bytes = on_drive ? listed_bytes(sizes, listing->key, folder.path) : 0;
-    if (!on_drive && shelf) bytes = shelf->variants.front().size;
+    if (!on_drive && shelf) {
+      bytes = std::min_element(shelf->variants.begin(), shelf->variants.end(), [](const auto& left, const auto& right) {
+                return panplay::variant_rank(shelf_variant_dir(left.format).substr(1)) <
+                       panplay::variant_rank(shelf_variant_dir(right.format).substr(1));
+              })->size;
+    }
     rows.push_back({folder_json(folder.name, folder.path, folder.title_id, bytes, state, meta + review_field),
                     shown.empty() ? folder.name : shown, std::move(store)});
   }
@@ -1154,11 +1162,9 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
       if (!present) listed.push_back({dir.substr(1), variant_path, &item});
     }
   }
-  const auto rank = [](const std::string& format) {
-    return format == "exfat" ? 0 : format == "folder" ? 1 : format.empty() ? 3 : 2;
-  };
-  std::stable_sort(listed.begin(), listed.end(),
-                   [&](const Listed& left, const Listed& right) { return rank(left.format) < rank(right.format); });
+  std::stable_sort(listed.begin(), listed.end(), [](const Listed& left, const Listed& right) {
+    return panplay::variant_rank(left.format) < panplay::variant_rank(right.format);
+  });
   const ShelfVariant* remote_here = nullptr;
   if (!listed.empty()) {
     detail.variants = "[";

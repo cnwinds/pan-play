@@ -1651,8 +1651,8 @@ int variant_test() {
   drive.add("/apps/panplay/Var PPSA41000/@other/game.zip", make_zip({{"x.bin", folder, false}}, {}).front());
   std::string error;
   const auto variants = list_variants(drive, "/apps/panplay/Var PPSA41000", &error);
-  if (!error.empty() || variants.size() != 3 || variants[0].format != "exfat" || variants[1].format != "folder" ||
-      variants[2].format != "other" || variants[0].path != "/apps/panplay/Var PPSA41000/@exfat") {
+  if (!error.empty() || variants.size() != 3 || variants[0].format != "folder" || variants[1].format != "exfat" ||
+      variants[2].format != "other" || variants[0].path != "/apps/panplay/Var PPSA41000/@folder") {
     return fail("格式子目录列得不对: " + error);
   }
   if (!collect_archives(drive, "/apps/panplay/Var PPSA41000", &error).empty()) return fail("游戏目录把格式子目录里的压缩包也算进来了");
