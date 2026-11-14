@@ -23,6 +23,9 @@ struct ShelfPlanLayer {
   std::string role;
   std::string name;
   std::vector<ShelfPlanFile> files;
+  // 只适用于这些主机固件主版本的层（backport），0 是这一头不限；两头都是 0 时哪种固件都装。
+  int firmware_min = 0;
+  int firmware_max = 0;
 };
 
 struct ShelfPlanCopy {
@@ -102,6 +105,9 @@ std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::
 // 按版本号缓存在本机，同一版不再下载。没有编排时为空，取不到时 error 写原因。见 ADR 0012。
 std::optional<ShelfPlan> load_shelf_plan(panplay::DrivePlugin& drive, const std::string& title_id,
                                          const ShelfVariant& variant, std::string* error);
+
+// 去掉不适用于这台主机固件主版本的层（主游戏不动），返回去掉的层名。firmware_major 为 0（不知道主机固件）时什么都不去。
+std::vector<std::string> drop_layers_for_firmware(ShelfPlan& plan, unsigned firmware_major);
 
 // 资源库格式（unknown）和网盘里变体目录名（@other）互换。
 std::string shelf_variant_dir(const std::string& format);

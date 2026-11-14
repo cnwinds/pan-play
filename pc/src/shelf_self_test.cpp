@@ -398,6 +398,41 @@ int check_plan_on_demand() {
   return 0;
 }
 
+// 只适用于某些固件的层（backport）：按主机固件主版本去掉不适用的，主游戏和没标固件的层留着。
+int check_firmware_layers() {
+  const char* text = R"({"games":[{"title_id":"PPSA31544","name":"x","variants":[{"format":"folder","surl":"1fw","pwd":"p",
+    "plan":{"rev":1,"layers":[{"role":"main","name":"主游戏","files":[{"path":"g.part1.rar","size":100,"md5":"m1"}]},
+      {"role":"patch","name":"v1.02","files":[{"path":"u.rar","size":9,"md5":"m2"}]},
+      {"role":"patch","name":"FW 4xx backport","firmware":{"min":4,"max":4},"files":[{"path":"b4.zip","size":5,"md5":"m3"}]},
+      {"role":"patch","name":"FW 5xx backport","firmware":{"min":5,"max":5},"files":[{"path":"b5.zip","size":5,"md5":"m4"}]},
+      {"role":"patch","name":"7.xx 及以下","firmware":{"max":7},"files":[{"path":"b7.zip","size":5,"md5":"m5"}]}],
+      "copies":[],"notes":[]}}]}]})";
+  std::string error;
+  const auto library = parse_shelf_library(text, &error);
+  const ShelfVariant* variant = library ? library->variant("PPSA31544", "folder") : nullptr;
+  if (variant == nullptr || !variant->plan || variant->plan->layers.size() != 5 || variant->plan->layers[2].firmware_min != 4 ||
+      variant->plan->layers[2].firmware_max != 4 || variant->plan->layers[4].firmware_min != 0 || variant->plan->layers[4].firmware_max != 7) {
+    return fail("编排里补丁层的 firmware 读错了：" + error);
+  }
+  const auto names = [](const ShelfPlan& plan) {
+    std::string out;
+    for (const auto& layer : plan.layers) out += (out.empty() ? "" : "|") + layer.name;
+    return out;
+  };
+  ShelfPlan plan = *variant->plan;
+  auto dropped = drop_layers_for_firmware(plan, 13);
+  if (names(plan) != "主游戏|v1.02" || dropped.size() != 3 || dropped[0] != "FW 4xx backport") {
+    return fail("13.xx 主机三个 backport 都不该装：" + names(plan));
+  }
+  plan = *variant->plan;
+  drop_layers_for_firmware(plan, 4);
+  if (names(plan) != "主游戏|v1.02|FW 4xx backport|7.xx 及以下") return fail("4.xx 主机只该装 4xx 的 backport：" + names(plan));
+  plan = *variant->plan;
+  dropped = drop_layers_for_firmware(plan, 0);
+  if (!dropped.empty() || plan.layers.size() != 5) return fail("不知道主机固件时一层都不该去掉");
+  return 0;
+}
+
 // 编排里要在主机上安装的包（packages）：解析、对到网盘里、下载后核对是这款游戏的 PS5 附加内容包、记下装没装好。
 int check_packages() {
   const char* text = R"({"games":[{"title_id":"PPSA08560","name":"x","variants":[{"format":"exfat","surl":"1pk","pwd":"p",
@@ -481,6 +516,7 @@ int run_shelf_self_test() {
   if (const int parse = check_parse()) return parse;
   if (const int planned = check_plan()) return planned;
   if (const int on_demand = check_plan_on_demand()) return on_demand;
+  if (const int firmware = check_firmware_layers()) return firmware;
   if (const int packages = check_packages()) return packages;
   use_shelf_library(parse_shelf_library(kLibrary, nullptr));
   int result = check_transfer_and_room();

@@ -167,6 +167,10 @@ std::optional<ShelfPlan> parse_plan(const panplay::Json* json) {
       if (const panplay::Json* files = item.get("files")) {
         for (const auto& file : files->array) layer.files.push_back(parse_plan_file(file));
       }
+      if (const panplay::Json* firmware = item.get("firmware"); firmware && firmware->type == panplay::Json::Type::object) {
+        layer.firmware_min = static_cast<int>(firmware->num("min"));
+        layer.firmware_max = static_cast<int>(firmware->num("max"));
+      }
       if (layer.files.empty()) return std::nullopt;
       plan.layers.push_back(std::move(layer));
     }
@@ -251,6 +255,26 @@ std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::
     library->games.push_back(std::move(game));
   }
   return library;
+}
+
+std::vector<std::string> drop_layers_for_firmware(ShelfPlan& plan, unsigned firmware_major) {
+  std::vector<std::string> dropped;
+  if (firmware_major == 0 || plan.layers.size() < 2) return dropped;
+  const int major = static_cast<int>(firmware_major);
+  const auto fits = [&](const ShelfPlanLayer& layer) {
+    return (layer.firmware_min <= 0 || major >= layer.firmware_min) && (layer.firmware_max <= 0 || major <= layer.firmware_max);
+  };
+  auto kept = plan.layers.begin() + 1;
+  for (auto it = plan.layers.begin() + 1; it != plan.layers.end(); ++it) {
+    if (fits(*it)) {
+      if (kept != it) *kept = std::move(*it);
+      ++kept;
+    } else {
+      dropped.push_back(it->name);
+    }
+  }
+  plan.layers.erase(kept, plan.layers.end());
+  return dropped;
 }
 
 std::optional<ShelfPlan> load_shelf_plan(panplay::DrivePlugin& drive, const std::string& title_id,

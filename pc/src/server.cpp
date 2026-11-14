@@ -1134,6 +1134,21 @@ bool clear_stale_staging(panplay::InstallSink& sink, const AppSettings& settings
   return true;
 }
 
+// 编排里只适用于某些固件的层（backport）按这台主机的固件去掉，返回给用户看的一句话，没去掉时为空。
+// 电脑上的盘游不知道主机的固件，全留着。
+std::string fit_plan_to_console(ShelfPlan& plan) {
+#if defined(PANPLAY_PS5)
+  const auto dropped = drop_layers_for_firmware(plan, firmware_major());
+  if (dropped.empty()) return "";
+  std::string names;
+  for (const auto& name : dropped) names += (names.empty() ? "" : "、") + name;
+  return "主机固件 " + firmware_text() + " 用不上，不装：" + names;
+#else
+  (void)plan;
+  return "";
+#endif
+}
+
 GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& path,
                             const std::optional<GameDetail>& fallback, std::string* error) {
   GameDetail detail;
@@ -1193,12 +1208,14 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
   if (const ShelfVariant* planned = library ? library->variant(game.title_id, panplay::variant_format(path)) : nullptr;
       planned && planned->plan) {
     std::string plan_error;
-    const auto full = load_shelf_plan(drive, game.title_id, *planned, &plan_error);
+    auto full = load_shelf_plan(drive, game.title_id, *planned, &plan_error);
+    const std::string skipped = full ? fit_plan_to_console(*full) : "";
     ResolvedPlan resolved = full ? resolve_plan(drive, path, *full, &plan_error) : ResolvedPlan{};
     if (full && plan_error.empty() && resolved.missing.empty()) {
       game.sets = std::move(resolved.plan.layers);
       plan_copies = std::move(resolved.plan.copies);
       note_console_packages(path, resolved.plan.packages);
+      detail.firmware_skipped = skipped;
     }
   }
   for (const auto& set : game.sets) {
@@ -1571,7 +1588,8 @@ std::string one_game_json(const std::string& path, bool cached) {
     json += ",\"archive_bytes\":" + std::to_string(detail->archive_bytes) + ",\"formats\":\"" +
             panplay::json_escape(detail->formats) + "\",\"state\":\"" + state + "\",\"layers\":" +
             (detail->layers.empty() ? "[]" : detail->layers) + ",\"resume\":" + resume + ",\"install_dir\":\"" +
-            panplay::json_escape(install_location(settings, path)) + "\"";
+            panplay::json_escape(install_location(settings, path)) + "\",\"firmware_skipped\":\"" +
+            panplay::json_escape(detail->firmware_skipped) + "\"";
 #if defined(PANPLAY_PS5)
     const std::string game_dir = console_game_dir(settings, path);
     if (!game_dir.empty() && (state == "installed" || state == "update")) {
@@ -1693,11 +1711,12 @@ std::optional<panplay::InstallPlan> install_plan_for(panplay::DrivePlugin& drive
       library ? library->variant(panplay::find_title_id(folder_name_of(path)), panplay::variant_format(path)) : nullptr;
   if (variant == nullptr || !variant->plan) return std::nullopt;
   std::string error;
-  const auto full = load_shelf_plan(drive, panplay::find_title_id(folder_name_of(path)), *variant, &error);
+  auto full = load_shelf_plan(drive, panplay::find_title_id(folder_name_of(path)), *variant, &error);
   if (!full) {
     panplay::log_warn("没取到盘架的编排（第 " + std::to_string(variant->plan->rev) + " 版），按规则装：" + error);
     return std::nullopt;
   }
+  if (const std::string skipped = fit_plan_to_console(*full); !skipped.empty()) panplay::log_info(skipped);
   ResolvedPlan resolved = resolve_plan(drive, path, *full, &error);
   if (!error.empty()) {
     panplay::log_warn("没能核对盘架的编排，按规则装：" + error);

@@ -1404,6 +1404,8 @@ function openDetail(game, opener) {
   status.setAttribute("role", "status");
   // 网盘里还没有的格式：链接失效、评过有问题时在这里说。
   const remoteNote = el("p", "remote-note");
+  // 编排里只适用于别的固件的 backport，盘游按主机固件自动不装。
+  const firmwareNote = el("p", "remote-note");
   // 编排里要在主机上安装的包（激活完整版这类），装好游戏后盘游自动装。
   const packageNotes = el("div", "shelf-notes packages");
   let packageNotesKey = null;
@@ -1675,7 +1677,7 @@ function openDetail(game, opener) {
     }));
   };
 
-  install.append(variantRow, remoteNote, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, status);
+  install.append(variantRow, remoteNote, firmwareNote, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1795,6 +1797,8 @@ function openDetail(game, opener) {
     }
     remoteNote.textContent = remoteText;
     remoteNote.hidden = !remoteText || picking || confirm.open;
+    firmwareNote.textContent = game.firmware_skipped || "";
+    firmwareNote.hidden = !game.firmware_skipped || picking || confirm.open;
     // 激活包装好了、或者装好游戏后会自动装的不用说，只列没装上、得换到主机上装的。
     const packages = (game.console_packages || []).filter((item) => item.state === "failed" || item.state === "manual");
     packageNotes.hidden = !packages.length || picking || confirm.open;
