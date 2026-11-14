@@ -1100,6 +1100,32 @@ void read_remote_detail(const AppSettings& settings, const std::string& path, co
   }
 }
 
+// 暂存区里还留着东西，可装好的游戏和网盘里要装的一致：是以前中断的安装（比如另一种格式）留下的，再装也只会把它清掉。
+// 这款游戏的哪种格式都不在队列里、也没在删除或注册时先清掉，不然会一直显示没装完。清掉了返回 true。
+bool clear_stale_staging(panplay::InstallSink& sink, const AppSettings& settings, const std::string& path,
+                         const panplay::GameFolder& game, const std::vector<panplay::PlanCopy>& copies) {
+  if (!panplay::install_current(sink, settings.prefix(), path, game.sets, load_skipped_sets(path), copies)) return false;
+  {
+    std::lock_guard<std::mutex> lock(installs.mu);
+    const auto same_game = [&](const std::string& other) { return panplay::game_dir_of(other) == panplay::game_dir_of(path); };
+    const bool queued = (installs.current && same_game(installs.current->path)) ||
+                        std::any_of(installs.waiting.begin(), installs.waiting.end(),
+                                    [&](const InstallTask& task) { return same_game(task.path); });
+    if (queued || !installs.discarding.insert(path).second) return false;
+  }
+  const std::string error = panplay::discard_install(sink, settings.prefix(), path);
+  {
+    std::lock_guard<std::mutex> lock(installs.mu);
+    installs.discarding.erase(path);
+  }
+  if (!error.empty()) {
+    panplay::log_warn("清理 " + path + " 装好后留在暂存区的文件失败：" + error);
+    return false;
+  }
+  panplay::log_info("已清理 " + path + " 装好后留在暂存区的文件");
+  return true;
+}
+
 GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& path,
                             const std::optional<GameDetail>& fallback, std::string* error) {
   GameDetail detail;
@@ -1189,6 +1215,9 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
   if (detail.state.empty()) {
     if (auto sink = panplay::open_destination(destination, &dest_error)) {
       detail.state = game_state(*sink, settings.prefix(), game);
+      if (detail.state == "continue" && clear_stale_staging(*sink, settings, path, game, plan_copies)) {
+        detail.state = game_state(*sink, settings.prefix(), game);
+      }
       // 装好之后网盘里又放了补丁（或改了要装哪些）：读一下这款游戏的完成标记，和现在要装的压缩包对一下。
       if (detail.state == "installed") {
         const auto installed_variant = panplay::installed_variant(*sink, settings.prefix(), path);

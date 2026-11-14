@@ -449,7 +449,8 @@ void clean_staging(InstallSink& sink, const std::string& staging_root, const std
   sink.remove_file(journal_path);
   sink.remove_file(join_storage_path(staging_root, ".panplay-journal.json"));
   for (const auto& dir : ordered) sink.remove_dir(join_storage_path(staging_root, dir));
-  sink.remove_dir(staging_root);
+  // 以前中断的安装（比如另一种格式）留下的文件不在这次的清单里，不删掉的话暂存区还在，游戏会一直算没装完。
+  sink.remove_tree(staging_root);
   sink.remove_dir(parent_path(staging_root));
 }
 
@@ -514,20 +515,38 @@ std::optional<std::string> marker_variant(const Json& marker) {
 
 }  // namespace
 
-bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
-                      const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets,
-                      const std::vector<PlanCopy>& copies) {
+namespace {
+
+// 完成标记和现在要装的比：没装好、装的是另一种格式时为空，对得上为 true，要更新为 false。
+std::optional<bool> marker_current(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
+                                   const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets,
+                                   const std::vector<PlanCopy>& copies) {
   Json marker;
-  if (!read_marker(sink, dest_prefix, source_dir, &marker)) return false;
-  if (const auto variant = marker_variant(marker); variant && *variant != variant_format(source_dir)) return false;
-  if (!marker_has_copies(marker, copies)) return true;
+  if (!read_marker(sink, dest_prefix, source_dir, &marker)) return std::nullopt;
+  if (const auto variant = marker_variant(marker); variant && *variant != variant_format(source_dir)) return std::nullopt;
+  if (!marker_has_copies(marker, copies)) return false;
   std::vector<ArchiveSet> installable;
   for (const auto& set : sets) {
     if ((set.format == "zip" || set.format == "rar" || set.format == "7z") && skip_sets.count(archive_set_id(set)) == 0) {
       installable.push_back(set);
     }
   }
-  return !installable.empty() && marker.str("source") != source_signature(installable);
+  return installable.empty() || marker.str("source") == source_signature(installable);
+}
+
+}  // namespace
+
+bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
+                      const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets,
+                      const std::vector<PlanCopy>& copies) {
+  const auto current = marker_current(sink, dest_prefix, source_dir, sets, skip_sets, copies);
+  return current && !*current;
+}
+
+bool install_current(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
+                     const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets,
+                     const std::vector<PlanCopy>& copies) {
+  return marker_current(sink, dest_prefix, source_dir, sets, skip_sets, copies).value_or(false);
 }
 
 std::vector<std::string> installed_sets(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir) {
@@ -758,7 +777,7 @@ InstallResult install_layers(DrivePlugin& drive, InstallSink& sink, const Instal
     if (parse_error.empty() && entries != nullptr && old.str("source") == signature && old.str("plugin") == drive.id() &&
         (!planned || marker_has_copies(old, request.plan->copies))) {
       sink.remove_file(journal_path);
-      sink.remove_dir(staging_root);
+      sink.remove_tree(staging_root);
       sink.remove_dir(parent_path(staging_root));
       result.status = "already";
       result.message = "已安装 " + folder;

@@ -2321,14 +2321,33 @@ int run_install_pipeline_self_test() {
       if (!saw_total && snapshot.message == "正在读取压缩包…" && snapshot.files_total == 0) saw_reading_before_total = true;
       if (snapshot.files_total > 0) saw_total = true;
     };
+    // 以前中断的安装（比如另一种格式）留在暂存区的文件，不在这次的清单里，装好后也要清掉，不然一直算没装完。
+    const std::string staging = "/data/homebrew/.panplay-staging/CUSA00001";
+    const std::uint8_t stale[] = {'o', 'l', 'd'};
+    const auto leave_stale = [&] {
+      if (auto dir_error = local->ensure_dir(staging + "/other"); !dir_error.empty()) return dir_error;
+      return local->store(staging + "/other/stale.bin", stale, sizeof(stale));
+    };
+    const auto staging_left = [&] {
+      std::string list_error;
+      const auto names = local->list_children("/data/homebrew/.panplay-staging", &list_error);
+      return std::find(names.begin(), names.end(), "CUSA00001") != names.end();
+    };
+    if (error = leave_stale(); !error.empty()) return fail(error);
     InstallResult installed = install_game(drive, *local, request);
     if (!saw_reading_before_total || !saw_total) return fail("安装过程没有先报告正在读取压缩包");
     if (installed.status != "installed") return fail(installed.message);
+    if (staging_left()) return fail("装好后暂存区里以前留下的文件没清掉");
     std::vector<std::uint8_t> got;
     error = local->read_file("/data/homebrew/CUSA00001/hello.txt", &got, 100);
     if (!error.empty() || got != hello) return fail("单卷 ZIP 解压内容不对");
+    std::string list_error;
+    const auto sets = group_archives(collect_archives(drive, request.source_dir, &list_error));
+    if (!install_current(*local, request.dest_prefix, request.source_dir, sets)) return fail("装好的游戏没认成和网盘一致");
+    if (error = leave_stale(); !error.empty()) return fail(error);
     InstallResult again = install_game(drive, *local, request);
     if (again.status != "already") return fail("单卷安装后没有显示已安装");
+    if (staging_left()) return fail("已安装时暂存区里留下的文件没清掉");
   }
 
   {

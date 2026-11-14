@@ -198,6 +198,10 @@ void set_running_game_probe(std::function<std::string()> probe);
 bool install_outdated(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
                       const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets = {},
                       const std::vector<PlanCopy>& copies = {});
+// 游戏已经装好，而且和网盘目录里（除去 skip_sets）要装的一致：再装一次也只会直接算装好。
+bool install_current(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir,
+                     const std::vector<ArchiveSet>& sets, const std::set<std::string>& skip_sets = {},
+                     const std::vector<PlanCopy>& copies = {});
 // 已装好的游戏按顺序叠了哪些压缩包组（archive_set_id）。没装好或旧版本装的返回空。
 std::vector<std::string> installed_sets(InstallSink& sink, const std::string& dest_prefix, const std::string& source_dir);
 // 这款游戏装好的是哪种格式（variant_format）。没装好时为空 optional；旧版本装的、从没分格式的游戏目录装的也为空 optional，
