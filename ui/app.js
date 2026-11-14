@@ -144,6 +144,19 @@ function el(tag, className, text) {
   return node;
 }
 
+// 随进度刷新的悬停提示。title 一变浏览器就把正在显示的提示关掉重来，指针停在上面时会一直闪，
+// 所以停在上面时先不换，移开后再换上最新的。
+function setTip(node, text) {
+  if (!node.tipBound) {
+    node.tipBound = true;
+    node.addEventListener("mouseleave", () => {
+      if (node.title !== node.tipText) node.title = node.tipText;
+    });
+  }
+  node.tipText = text;
+  if (node.title !== text && !node.matches(":hover")) node.title = text;
+}
+
 function displayName(game) {
   return (game.display_name || "").trim() || (game.name || "").trim() || (game.title_id || "").trim() || "未知目录";
 }
@@ -868,7 +881,7 @@ function paintDock() {
   dockTitle.textContent = displayName(summary.head);
   dockStatus.textContent = summary.text;
   const pace = taskPace(running);
-  dockStatus.title = pace && pace.left !== null ? `最近 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : summary.text;
+  setTip(dockStatus, pace && pace.left !== null ? `最近 ${pace.speed}，预计 ${finishClock(pace.left)} 装完` : summary.text);
   const artKey = summary.head.path + "\n" + (summary.head.cover_url || "");
   if (dockArtKey !== artKey) {
     dockArtKey = artKey;
@@ -1779,7 +1792,7 @@ function openDetail(game, opener) {
     action.style.setProperty("--dict", look ? Math.max(dictionaryScale(look.dictionary || 0), look.slow ? 0.04 : 0) : 0);
     actionLabel.textContent = look ? look.text : label;
     actionIcon.dataset.icon = pausable ? "pause" : look && look.phase === "paused" ? "play" : "";
-    action.title = look ? look.detail : "";
+    setTip(action, look ? look.detail : "");
     action.classList.toggle("done", game.state === "installed");
     if (running) action.disabled = !pausable;
     else if (queued) action.disabled = !queuePaused;
