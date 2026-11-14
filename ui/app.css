@@ -1159,7 +1159,6 @@ body.drawer-open { overflow: hidden; }
 }
 
 .review-banner strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.95rem; font-weight: 600; }
-.review-meta { flex: none; margin-left: auto; font-size: 0.8rem; opacity: 0.85; white-space: nowrap; }
 .review-banner[data-state="good"] { border-color: var(--mint); background: rgba(95, 211, 160, 0.1); color: var(--mint); }
 .review-banner[data-state="bad"] { border-color: var(--danger); background: rgba(255, 138, 122, 0.1); color: var(--danger); }
 
@@ -1306,8 +1305,6 @@ body.drawer-open { overflow: hidden; }
 .layer-picker[hidden] { display: none; }
 
 .picker-head { font-weight: 700; }
-.picker-hint { color: var(--muted); font-size: 0.84rem; }
-
 .layer-list {
   display: grid;
   gap: 0.4rem;
@@ -1590,8 +1587,6 @@ body.drawer-open { overflow: hidden; }
 }
 
 .note.error { color: var(--danger); }
-
-.meta-note { color: var(--amber); font-size: 0.88rem; }
 
 /* 底部安装队列：收起是一条进度栏，展开后队列在进度栏上方 */
 .dock {

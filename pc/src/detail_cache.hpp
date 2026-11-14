@@ -21,14 +21,11 @@ struct GameDetail {
   std::string variants;
   // 主机上装着的是哪种格式（完成标记里记的），没装好或旧版本装的为空。
   std::string installed_variant;
-  // 编排里按主机固件不装的层（backport），给详情页的一句话；没有时为空。
-  std::string firmware_skipped;
 
   bool operator==(const GameDetail& other) const {
     return state == other.state && archive_bytes == other.archive_bytes && formats == other.formats &&
            layers == other.layers && installed == other.installed && fingerprint == other.fingerprint &&
-           variants == other.variants && installed_variant == other.installed_variant &&
-           firmware_skipped == other.firmware_skipped;
+           variants == other.variants && installed_variant == other.installed_variant;
   }
 };
 

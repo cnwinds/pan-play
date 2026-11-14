@@ -42,12 +42,6 @@ const catalogReload = $("#catalog-reload");
 const signedOutHint = "登录后才能看到网盘里的游戏。";
 const regionText = { UP: "美服", EP: "欧服", JP: "日服", HP: "港服", KP: "韩服", IP: "国际服" };
 const storeLocaleText = { "zh-hans-hk": "港服商店（简体）", "zh-hant-hk": "港服商店（繁体）", "en-us": "美服商店" };
-const metaStateNote = {
-  pending: "正在从商店补全中文名和封面…",
-  missing: "商店里没有找到这款游戏，可以在下面手动改名。",
-  offline: "商店暂时连不上，稍后会自动重试。",
-};
-
 const langNames = {
   zh: "中文", ch: "中文", en: "英语", ja: "日语", ko: "韩语", fr: "法语", de: "德语", es: "西班牙语", it: "意大利语",
   pt: "葡萄牙语", ru: "俄语", ar: "阿拉伯语", pl: "波兰语", nl: "荷兰语", th: "泰语", tr: "土耳其语", sv: "瑞典语",
@@ -656,10 +650,8 @@ function jobText(current, inDetail = false) {
   }
   if (current.status === "installed" && current.speed > 0 && current.elapsed > 0) {
     const message = current.message || "";
-    const parts = [message.startsWith("已更新") ? "已更新" : "已安装", `用时 ${formatDuration(current.elapsed)}`,
-      `${formatBytes(current.speed)}/s`];
-    const skipped = message.match(/（游戏目录外的 \d+ 个文件没有装）/);
-    return parts.join(" · ") + (skipped ? skipped[0] : "");
+    return [message.startsWith("已更新") ? "已更新" : "已安装", `用时 ${formatDuration(current.elapsed)}`,
+      `${formatBytes(current.speed)}/s`].join(" · ");
   }
   if (current.message) return current.message;
   if (current.status === "installed" || current.status === "already") return "安装完成";
@@ -1049,21 +1041,16 @@ function consoleSummary(info) {
 // 启动后这么多秒内就退出的，多半是崩溃了。
 const quickExitSeconds = 30;
 
-// backport 库（fakelib）的情况和最近一次在主机上启动的经过，一句话；没什么可说时为 null。
+// 最近一次在主机上启动出了问题（很快就退出、backport 库没挂上）时的一句话；一切正常时为 null，不显示。
 function launchSummary(info) {
   const report = info.launch;
-  const by = info.fakelib_by === "panplay" ? "盘游" : info.fakelib_by;
-  if (!report) return info.fakelib ? { text: `带 backport 库（${info.fakelib}），游戏启动时由${by}叠到系统库上`, state: "info" } : null;
-  let lib = "";
-  if (report.fakelib_error) lib = `backport 库没挂上：${report.fakelib_error}`;
-  else if (report.fakelib && report.fakelib_by === "panplay") lib = `backport 库已挂上（用时 ${report.mount_ms} 毫秒）`;
-  else if (report.fakelib) lib = `backport 库交给 ${report.fakelib_by} 挂`;
+  if (!report) return null;
+  const lib = report.fakelib_error ? `backport 库没挂上：${report.fakelib_error}` : "";
   if (report.exited_at) {
     const ran = Math.max(1, Math.round((report.exited_at - report.at) / 1000));
     if (ran < quickExitSeconds) return { text: `启动后 ${ran} 秒就退出了，多半是崩溃` + (lib ? `；${lib}` : ""), state: "warn" };
-    return report.fakelib_error ? { text: lib, state: "warn" } : null;
   }
-  return { text: "正在主机上运行" + (lib ? ` · ${lib}` : ""), state: report.fakelib_error ? "warn" : "info" };
+  return lib ? { text: lib, state: "warn" } : null;
 }
 
 function detailFacts(game) {
@@ -1072,10 +1059,8 @@ function detailFacts(game) {
   if (game.title_id) facts.push(game.title_id);
   if (platform) facts.push(platform);
   if (regionText[game.region]) facts.push(regionText[game.region]);
-  if (game.formats) facts.push(game.formats.toUpperCase());
   if (game.archive_bytes) facts.push(formatBytes(game.archive_bytes));
   if (game.on_drive === false) facts.push("网盘已删除");
-  else if (game.remote) facts.push("装时先转存到网盘");
   return facts;
 }
 
@@ -1143,7 +1128,6 @@ function buildLayerPicker(onConfirm, onCancel) {
   const panel = el("div", "layer-picker");
   panel.hidden = true;
   const head = el("p", "picker-head", "选择要安装的内容");
-  const hint = el("p", "picker-hint", "按从上到下的顺序叠加，后面的覆盖前面的同名文件。用不上的补丁可以不装。");
   const list = el("ul", "layer-list");
   const warn = el("p", "picker-warn");
   const total = el("p", "picker-total num");
@@ -1153,7 +1137,7 @@ function buildLayerPicker(onConfirm, onCancel) {
   const cancel = el("button", "btn quiet", "取消");
   cancel.type = "button";
   actions.append(confirm, cancel);
-  panel.append(head, hint, list, warn, total, actions);
+  panel.append(head, list, warn, total, actions);
 
   let layers = [];
   let unchanged = false;
@@ -1417,8 +1401,6 @@ function openDetail(game, opener) {
   status.setAttribute("role", "status");
   // 网盘里还没有的格式：链接失效、评过有问题时在这里说。
   const remoteNote = el("p", "remote-note");
-  // 编排里只适用于别的固件的 backport，盘游按主机固件自动不装。
-  const firmwareNote = el("p", "remote-note");
   // 编排里要在主机上安装的包（激活完整版这类），装好游戏后盘游自动装。
   const packageNotes = el("div", "shelf-notes packages");
   let packageNotesKey = null;
@@ -1515,8 +1497,7 @@ function openDetail(game, opener) {
   const reviewBox = el("div", "review");
   const reviewBanner = el("div", "review-banner");
   const reviewText = el("strong");
-  const reviewMeta = el("span", "review-meta");
-  reviewBanner.append(reviewText, reviewMeta);
+  reviewBanner.append(reviewText);
   const reviewAsk = el("div", "review-ask");
   const reviewQuestion = el("span", "review-question");
   const reviewButtons = el("span", "review-buttons");
@@ -1595,7 +1576,6 @@ function openDetail(game, opener) {
       if (!own && shown.format) meta.unshift(variantLabel(shown.format) + "版");
       if (shown.device) meta.push(shown.device);
       if (own && !sameLayers(shown, installedNow)) meta.push("补丁已变");
-      reviewMeta.textContent = meta.join(" · ");
       reviewBanner.title = `${shown.device ? `你在${shown.device}上` : "你"}标记过${own ? "这个版本" : "另一个版本"}` +
         `${verdict}（${meta.join(" · ")}）`;
     }
@@ -1683,14 +1663,14 @@ function openDetail(game, opener) {
       button.setAttribute("role", "radio");
       button.setAttribute("aria-checked", String(item.path === game.path));
       if (item.format === game.installed_variant && game.installed_variant) button.append(el("span", "variant-installed", "已装"));
-      else if (item.remote) button.append(el("span", "variant-installed", item.alive === false ? "链接失效" : "需转存"));
+      else if (item.remote && item.alive === false) button.append(el("span", "variant-installed", "链接失效"));
       button.disabled = busy && item.path !== game.path;
       button.addEventListener("click", () => switchVariant(item.path));
       return button;
     }));
   };
 
-  install.append(variantRow, remoteNote, firmwareNote, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, status);
+  install.append(variantRow, remoteNote, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1703,8 +1683,7 @@ function openDetail(game, opener) {
   });
   const rating = el("div", "rating-box");
   const specs = el("dl", "specs");
-  const metaNote = el("p", "meta-note");
-  about.append(desc, descMore, rating, specs, metaNote);
+  about.append(desc, descMore, rating, specs);
 
   const naming = el("details", "naming");
   const summary = el("summary", "", "名称与资料");
@@ -1810,8 +1789,6 @@ function openDetail(game, opener) {
     }
     remoteNote.textContent = remoteText;
     remoteNote.hidden = !remoteText || picking || confirm.open;
-    firmwareNote.textContent = game.firmware_skipped || "";
-    firmwareNote.hidden = !game.firmware_skipped || picking || confirm.open;
     // 激活包装好了、或者装好游戏后会自动装的不用说，只列没装上、得换到主机上装的。
     const packages = (game.console_packages || []).filter((item) => item.state === "failed" || item.state === "manual");
     packageNotes.hidden = !packages.length || picking || confirm.open;
@@ -1885,12 +1862,7 @@ function openDetail(game, opener) {
     paintRating(rating, game);
     specs.replaceChildren(...storeSpecs(game).flatMap(([key, value]) => [el("dt", "", key), el("dd", "", value)]));
     specs.hidden = specs.childElementCount === 0;
-    if (game.description_source === "site") metaNote.textContent = "PlayStation 商店里已经没有这款游戏的页面，介绍取自资源站帖子。";
-    else if (game.catalog_matched === false && !metaStateNote[game.meta_state]) metaNote.textContent = "资料库里没有这款游戏，仍然可以按目录名安装。";
-    else if (game.meta_state === "pending" && game.store_locale && !refreshing) metaNote.textContent = "正在下载封面…";
-    else metaNote.textContent = metaStateNote[game.meta_state] || "";
-    metaNote.hidden = !metaNote.textContent;
-    about.hidden = desc.hidden && rating.hidden && specs.hidden && metaNote.hidden;
+    about.hidden = desc.hidden && rating.hidden && specs.hidden;
 
     const originRows = [["名称来源", nameSourceText(game)]];
     const english = (game.catalog_name || "").trim();

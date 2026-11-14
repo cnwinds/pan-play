@@ -1194,7 +1194,7 @@ bool clear_stale_staging(panplay::InstallSink& sink, const AppSettings& settings
   return true;
 }
 
-// 编排里只适用于某些固件的层（backport）按这台主机的固件去掉，返回给用户看的一句话，没去掉时为空。
+// 编排里只适用于某些固件的层（backport）按这台主机的固件去掉，返回记日志用的一句话，没去掉时为空。
 // 电脑上的盘游不知道主机的固件，全留着。
 std::string fit_plan_to_console(ShelfPlan& plan) {
 #if defined(PANPLAY_PS5)
@@ -1269,13 +1269,12 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
       planned && planned->plan) {
     std::string plan_error;
     auto full = load_shelf_plan(drive, game.title_id, *planned, &plan_error);
-    const std::string skipped = full ? fit_plan_to_console(*full) : "";
+    if (full) fit_plan_to_console(*full);
     ResolvedPlan resolved = full ? resolve_plan(drive, path, *full, &plan_error) : ResolvedPlan{};
     if (full && plan_error.empty() && resolved.missing.empty()) {
       game.sets = std::move(resolved.plan.layers);
       plan_copies = std::move(resolved.plan.copies);
       note_console_packages(path, resolved.plan.packages);
-      detail.firmware_skipped = skipped;
     }
   }
   for (const auto& set : game.sets) {
@@ -1648,8 +1647,7 @@ std::string one_game_json(const std::string& path, bool cached) {
     json += ",\"archive_bytes\":" + std::to_string(detail->archive_bytes) + ",\"formats\":\"" +
             panplay::json_escape(detail->formats) + "\",\"state\":\"" + state + "\",\"layers\":" +
             (detail->layers.empty() ? "[]" : detail->layers) + ",\"resume\":" + resume + ",\"install_dir\":\"" +
-            panplay::json_escape(install_location(settings, path)) + "\",\"firmware_skipped\":\"" +
-            panplay::json_escape(detail->firmware_skipped) + "\"";
+            panplay::json_escape(install_location(settings, path)) + "\"";
 #if defined(PANPLAY_PS5)
     const std::string game_dir = console_game_dir(settings, path);
     if (!game_dir.empty() && (state == "installed" || state == "update")) {
