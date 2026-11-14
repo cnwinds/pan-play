@@ -4,6 +4,7 @@
 #include "shelf_transfer.hpp"
 
 #include "panplay/app_paths.hpp"
+#include "panplay/library.hpp"
 
 #include <algorithm>
 #include <ctime>
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 
 namespace {
 
@@ -398,6 +400,46 @@ int check_plan_on_demand() {
   return 0;
 }
 
+// 还没转存时列出要装的压缩包组（好先让用户挑补丁）：按编排、按分享里的文件认出来的组，ID 都和转存后网盘里的一样。
+int check_remote_layers() {
+  ShelfPlan plan;
+  plan.layers.push_back({"main", "主游戏", {{"G/PPSA1.part1.rar", 100, "AA"}, {"G/PPSA1.part2.rar", 50, "BB"}}});
+  plan.layers.push_back({"patch", "FW 4xx", {{"FW 4xx backport.zip", 7, "CC"}}});
+  const auto planned = plan_archive_sets("/lib/PPSA1/@folder", plan);
+  if (planned.size() != 2 || planned[0].parts.size() != 2 || planned[0].format != "rar" ||
+      planned[0].parts[0].path != "/lib/PPSA1/@folder/G/PPSA1.part1.rar") {
+    return fail("按编排认的压缩包组不对");
+  }
+  FakeDrive drive;
+  drive.add_file("/lib/PPSA1/@folder/PPSA1.part1.rar", 100);
+  drive.add_file("/lib/PPSA1/@folder/PPSA1.part2.rar", 50);
+  drive.add_file("/lib/PPSA1/@folder/FW 4xx backport.zip", 7);
+  std::string error;
+  const auto on_drive = panplay::group_archives(panplay::collect_archives(drive, "/lib/PPSA1/@folder", &error));
+  std::set<std::string> ids;
+  for (const auto& set : on_drive) ids.insert(panplay::archive_set_id(set));
+  for (const auto& set : planned) {
+    if (ids.count(panplay::archive_set_id(set)) == 0) return fail("转存前按编排算的 ID 和转存后的对不上");
+  }
+
+  // 分享里是分享人网盘的完整路径，外面包着一层目录；第三层的和说明文件不算。
+  const std::vector<panplay::ShareFile> files = {
+      {"/我的分享/PPSA1 游戏/PPSA1.part1.rar", 100, "aa"},
+      {"/我的分享/PPSA1 游戏/PPSA1.part2.rar", 50, "bb"},
+      {"/我的分享/PPSA1 游戏/补丁01/PPSA1-v1.02.rar", 9, "dd"},
+      {"/我的分享/PPSA1 游戏/补丁01/更深/别的.rar", 3, "ee"},
+      {"/我的分享/PPSA1 游戏/说明.txt", 1, "ff"},
+  };
+  const auto shared = share_archive_sets("/lib/PPSA1/@other", files);
+  std::set<std::string> paths;
+  for (const auto& set : shared) paths.insert(set.parts.front().path);
+  if (shared.size() != 2 || paths.count("/lib/PPSA1/@other/PPSA1.part1.rar") == 0 ||
+      paths.count("/lib/PPSA1/@other/补丁01/PPSA1-v1.02.rar") == 0) {
+    return fail("按分享里的文件认的压缩包组不对");
+  }
+  return 0;
+}
+
 // 只适用于某些固件的层（backport）：按主机固件主版本去掉不适用的，主游戏和没标固件的层留着。
 int check_firmware_layers() {
   const char* text = R"({"games":[{"title_id":"PPSA31544","name":"x","variants":[{"format":"folder","surl":"1fw","pwd":"p",
@@ -517,6 +559,7 @@ int run_shelf_self_test() {
   if (const int planned = check_plan()) return planned;
   if (const int on_demand = check_plan_on_demand()) return on_demand;
   if (const int firmware = check_firmware_layers()) return firmware;
+  if (const int remote = check_remote_layers()) return remote;
   if (const int packages = check_packages()) return packages;
   use_shelf_library(parse_shelf_library(kLibrary, nullptr));
   int result = check_transfer_and_room();

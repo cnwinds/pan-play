@@ -1209,6 +1209,45 @@ std::string fit_plan_to_console(ShelfPlan& plan) {
 #endif
 }
 
+std::mutex share_files_mu;
+// 没有编排的分享里有哪些文件，按 surl 记 30 分钟，免得每次打开详情都去列分享。
+std::map<std::string, std::pair<std::chrono::steady_clock::time_point, std::vector<panplay::ShareFile>>> share_files_cache;
+
+// 网盘里还没有的格式，转存前就列出要装的压缩包组，有补丁时点安装先让用户挑：有编排按编排（去掉不适用这台主机固件的层），
+// 没有编排看分享里的文件。archive_set_id 只看文件名和大小，挑的结果转存后照样用。列不出来时为空数组，照旧转存后全装。
+std::string remote_layers_json(panplay::DrivePlugin& drive, const std::string& path, const ShelfVariant& variant) {
+  panplay::GameFolder game;
+  game.path = path;
+  if (variant.plan) {
+    std::string error;
+    auto full = load_shelf_plan(drive, panplay::find_title_id(folder_name_of(path)), variant, &error);
+    if (!full) return "[]";
+    fit_plan_to_console(*full);
+    game.sets = plan_archive_sets(path, *full);
+  } else {
+    std::vector<panplay::ShareFile> files;
+    {
+      std::lock_guard<std::mutex> lock(share_files_mu);
+      const auto cached = share_files_cache.find(variant.surl);
+      if (cached != share_files_cache.end() && std::chrono::steady_clock::now() - cached->second.first < std::chrono::minutes(30)) {
+        files = cached->second.second;
+      }
+    }
+    if (files.empty()) {
+      const panplay::ShareListing share = drive.list_share(variant.surl, variant.pwd);
+      if (!share.error.empty() || share.files.empty()) {
+        panplay::log_warn("转存前列不出分享里的压缩包（" + path + "）：" + (share.error.empty() ? "分享是空的" : share.error));
+        return "[]";
+      }
+      files = share.files;
+      std::lock_guard<std::mutex> lock(share_files_mu);
+      share_files_cache[variant.surl] = {std::chrono::steady_clock::now(), files};
+    }
+    game.sets = share_archive_sets(path, files);
+  }
+  return layers_json(game, load_skipped_sets(path), {});
+}
+
 GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& settings, const std::string& path,
                             const std::optional<GameDetail>& fallback, std::string* error) {
   GameDetail detail;
@@ -1254,6 +1293,7 @@ GameDetail read_game_detail(panplay::DrivePlugin& drive, const AppSettings& sett
   }
   if (remote_here || missing) {
     read_remote_detail(settings, path, remote_here, fallback, detail);
+    if (remote_here) detail.layers = remote_layers_json(drive, path, *remote_here);
     return detail;
   }
   const auto files = panplay::collect_archives(drive, path, error);

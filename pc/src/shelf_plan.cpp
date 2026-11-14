@@ -90,3 +90,48 @@ ResolvedPlan resolve_plan(panplay::DrivePlugin& drive, const std::string& varian
   }
   return resolved;
 }
+
+std::vector<panplay::ArchiveSet> plan_archive_sets(const std::string& variant_dir, const ShelfPlan& plan) {
+  std::vector<panplay::ArchiveSet> layers;
+  for (const auto& layer : plan.layers) {
+    std::vector<panplay::DriveEntry> parts;
+    for (const auto& file : layer.files) {
+      panplay::DriveEntry entry;
+      entry.path = panplay::join_storage_path(variant_dir, file.path);
+      entry.name = file.path.substr(file.path.find_last_of('/') + 1);
+      entry.size = file.size;
+      entry.content_hash = lower(file.md5);
+      parts.push_back(std::move(entry));
+    }
+    const auto sets = panplay::group_archives(parts);
+    if (sets.size() == 1 && sets.front().parts.size() == parts.size()) layers.push_back(sets.front());
+  }
+  return layers;
+}
+
+std::vector<panplay::ArchiveSet> share_archive_sets(const std::string& variant_dir,
+                                                    const std::vector<panplay::ShareFile>& files) {
+  if (files.empty()) return {};
+  std::string common = files.front().path.substr(0, files.front().path.find_last_of('/') + 1);
+  for (const auto& file : files) {
+    while (!common.empty() && file.path.compare(0, common.size(), common) != 0) {
+      common.pop_back();
+      common.erase(common.find_last_of('/') + 1);
+    }
+  }
+  std::vector<panplay::DriveEntry> entries;
+  for (const auto& file : files) {
+    const std::string rel = file.path.substr(common.size());
+    const auto slash = rel.find('/');
+    if (slash != std::string::npos && (rel.find('/', slash + 1) != std::string::npos || panplay::is_variant_dir(rel.substr(0, slash)))) {
+      continue;
+    }
+    panplay::DriveEntry entry;
+    entry.path = panplay::join_storage_path(variant_dir, rel);
+    entry.name = rel.substr(rel.find_last_of('/') + 1);
+    entry.size = file.size;
+    entry.content_hash = file.content_hash;
+    entries.push_back(std::move(entry));
+  }
+  return panplay::group_archives(entries);
+}
