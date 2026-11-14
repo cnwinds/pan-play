@@ -17,6 +17,7 @@
 #include "panplay/catalog_sync.hpp"
 #include "panplay/drive.hpp"
 #include "panplay/game_launch.hpp"
+#include "panplay/http.hpp"
 #include "panplay/install.hpp"
 #include "panplay/json.hpp"
 #include "panplay/library.hpp"
@@ -549,6 +550,15 @@ std::int64_t store_concept_of(const panplay::CatalogMatch& match, const ShelfGam
   return shelf != nullptr ? shelf->concept_id : 0;
 }
 
+// 帖子封面地址的指纹（FNV-1a），换了图地址就变，浏览器不会用缓存的旧图。
+std::string site_cover_key(const std::string& url) {
+  std::uint64_t hash = 1469598103934665603ull;
+  for (const unsigned char c : url) hash = (hash ^ c) * 1099511628211ull;
+  char text[17];
+  std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+  return text;
+}
+
 // 盘架资源库里有这款游戏时，商店和资料库都没有的名字、封面、介绍用盘架的（介绍取自资源站帖子）。
 std::string game_meta_fields(const std::string& name, const std::string& title_id, const NameOverrides& overrides,
                              bool detail, std::string* search_text = nullptr, panplay::StoreMeta* meta_out = nullptr) {
@@ -595,7 +605,8 @@ std::string game_meta_fields(const std::string& name, const std::string& title_i
   // 封面从 AVIF、WebP 换成 JPEG 时抓取时间不变，加上 jpg 让浏览器别用缓存的旧图。
   if (meta.has_cover) cover_url = "/api/cover/" + std::to_string(concept_id) + "?v=" + std::to_string(meta.fetched_at) + "jpg";
   else if (match.found && !match.entry.cover_url.empty()) cover_url = match.entry.cover_url;
-  else if (site_info) cover_url = shelf->info.cover;
+  // 帖子封面在外面的图床上，PS5 的浏览器打不开，由盘游下载后再给页面。
+  else if (site_info && !shelf->info.cover.empty()) cover_url = "/api/site-cover/" + title_id + "?v=" + site_cover_key(shelf->info.cover);
 
   std::string json = ",\"display_name\":\"" + panplay::json_escape(display_name) + "\",\"name_source\":\"" + name_source +
                      "\",\"description_source\":\"" + (meta.description.empty() ? "" : site_info ? "site" : "store") +
@@ -641,6 +652,55 @@ std::string image_type(const std::string& bytes) {
   if (bytes.size() >= 12 && bytes.compare(8, 4, "WEBP") == 0) return "image/webp";
   if (bytes.size() >= 12 && bytes.compare(4, 4, "ftyp") == 0) return "image/avif";
   return "image/jpeg";
+}
+
+std::mutex site_cover_mu;
+// 帖子封面下载失败的时刻，过一阵才再试，免得一页几十个格子每次都去等慢图床。
+std::map<std::string, std::chrono::steady_clock::time_point> site_cover_failed;
+
+// 盘架资源库里这款游戏的帖子封面：按地址缓存在数据目录的 site-covers/，没有时下载。取不到时为空。
+std::string site_cover_bytes(const std::string& title_id) {
+  const auto library = shelf_library();
+  const ShelfGame* shelf = library ? library->find(title_id) : nullptr;
+  if (shelf == nullptr || shelf->info.cover.empty()) return "";
+  const std::string url = shelf->info.cover;
+  const std::string key = site_cover_key(url);
+  const auto dir = panplay::app_data_dir() / "site-covers";
+  const auto path = dir / (title_id + "-" + key + ".img");
+  if (std::string bytes = read_file(path); !bytes.empty()) return bytes;
+  {
+    std::lock_guard<std::mutex> lock(site_cover_mu);
+    const auto failed = site_cover_failed.find(key);
+    if (failed != site_cover_failed.end() && std::chrono::steady_clock::now() - failed->second < std::chrono::minutes(10)) {
+      return "";
+    }
+  }
+  panplay::HttpRequest request;
+  request.url = url;
+  request.timeout_ms = 30000;
+  const panplay::HttpResponse response = panplay::http_send(request);
+  const std::string& body = response.body;
+  const bool image = body.size() > 4 && ((static_cast<unsigned char>(body[0]) == 0xFF && static_cast<unsigned char>(body[1]) == 0xD8) ||
+                                         body.compare(1, 3, "PNG") == 0 || body.compare(0, 4, "GIF8") == 0 ||
+                                         (body.size() >= 12 && (body.compare(8, 4, "WEBP") == 0 || body.compare(4, 4, "ftyp") == 0)));
+  if (!response.error.empty() || response.status != 200 || !image) {
+    panplay::log_warn("帖子封面 " + title_id + " 取不到：" +
+                      (!response.error.empty() ? response.error : "HTTP " + std::to_string(response.status)) + "，" + url);
+    std::lock_guard<std::mutex> lock(site_cover_mu);
+    site_cover_failed[key] = std::chrono::steady_clock::now();
+    return "";
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  auto tmp = path;
+  tmp += ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    out.write(body.data(), static_cast<std::streamsize>(body.size()));
+  }
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) std::filesystem::remove(tmp, ec);
+  return body;
 }
 
 // 游戏库目录和主机上的安装情况。读一次要列网盘目录、连主机，约两秒，所以缓存起来：
@@ -2334,7 +2394,7 @@ void handle_client(SOCKET client, bool local_peer) {
   const std::string target = request_target(header);
   // 界面每秒轮询队列、测速近况，每几秒查资料库状态，封面一页几十张，这些不记。
   if (target != "/api/queue" && target != "/api/catalog" && target != "/api/speedtest" &&
-      target.rfind("/api/cover/", 0) != 0) {
+      target.rfind("/api/cover/", 0) != 0 && target.rfind("/api/site-cover/", 0) != 0) {
     PANPLAY_DEBUG("请求 " + method + " " + target + (local_peer ? "（本机）" : "（局域网）"));
   }
   if (!local_peer && !lan.enabled) {
@@ -2378,6 +2438,18 @@ void handle_client(SOCKET client, bool local_peer) {
     const std::string id = target.substr(11, target.find('?') == std::string::npos ? std::string::npos : target.find('?') - 11);
     const bool digits = !id.empty() && id.size() < 19 && std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isdigit(c); });
     const std::string bytes = digits && store_meta != nullptr ? read_file(store_meta->cover_file(std::stoll(id))) : "";
+    if (bytes.empty()) {
+      reply_json(client, 404, json_error("没有这张封面"));
+      return;
+    }
+    reply(client, 200, image_type(bytes), bytes, "Cache-Control: max-age=86400\r\n");
+    return;
+  }
+  if (method == "GET" && target.rfind("/api/site-cover/", 0) == 0) {
+    const std::string id = target.substr(16, target.find('?') == std::string::npos ? std::string::npos : target.find('?') - 16);
+    const bool valid = !id.empty() && id.size() <= 16 &&
+                       std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isalnum(c) != 0; });
+    const std::string bytes = valid ? site_cover_bytes(id) : "";
     if (bytes.empty()) {
       reply_json(client, 404, json_error("没有这张封面"));
       return;
