@@ -348,7 +348,7 @@ std::set<std::string> queued_paths() {
 void send_all(SOCKET socket, const std::string& data) { panplay::send_all(socket, data.data(), data.size()); }
 
 void reply(SOCKET socket, int status, const std::string& type, const std::string& body, const std::string& extra = "") {
-  const std::string text = "HTTP/1.1 " + std::to_string(status) + (status == 200 ? " OK" : " Error") +
+  const std::string text = "HTTP/1.1 " + std::to_string(status) + (status == 200 ? " OK" : status == 302 ? " Found" : " Error") +
                            "\r\nContent-Type: " + type + "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n" +
                            extra + "Connection: close\r\n\r\n" + body;
   send_all(socket, text);
@@ -2489,7 +2489,14 @@ void handle_client(SOCKET client, bool local_peer) {
                        std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isalnum(c) != 0; });
     const std::string bytes = valid ? site_cover_bytes(id) : "";
     if (bytes.empty()) {
-      reply_json(client, 404, json_error("没有这张封面"));
+      // 盘游连不上那个图床（比如主机没走代理）时让浏览器自己去取：电脑上的浏览器多半取得到。
+      const auto library = valid ? shelf_library() : nullptr;
+      const ShelfGame* shelf = library ? library->find(id) : nullptr;
+      if (shelf != nullptr && !shelf->info.cover.empty() && shelf->info.cover.find_first_of("\r\n") == std::string::npos) {
+        reply(client, 302, "text/plain; charset=utf-8", "", "Location: " + shelf->info.cover + "\r\nCache-Control: no-store\r\n");
+      } else {
+        reply_json(client, 404, json_error("没有这张封面"));
+      }
       return;
     }
     reply(client, 200, image_type(bytes), bytes, "Cache-Control: max-age=86400\r\n");
