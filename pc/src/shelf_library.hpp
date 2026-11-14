@@ -73,6 +73,8 @@ struct ShelfGameInfo {
   std::string description;
   std::string publisher;
   std::string release_date;
+  // 盘架传到网盘的那份封面（/盘游/封面/…）。主机常常连不上外面的图床，先读这份；盘架还没传时为空。
+  std::string cover_file;
 
   bool empty() const { return cover.empty() && description.empty() && publisher.empty() && release_date.empty(); }
 };

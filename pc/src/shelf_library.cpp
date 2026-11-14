@@ -227,6 +227,11 @@ std::shared_ptr<ShelfLibrary> parse_shelf_library(const std::string& text, std::
     if (const panplay::Json* info = item.get("info"); info && info->type == panplay::Json::Type::object) {
       game.info = {info->str("cover"), info->str("description"), info->str("publisher"), info->str("release_date")};
       if (game.info.cover.rfind("https://", 0) != 0 && game.info.cover.rfind("http://", 0) != 0) game.info.cover.clear();
+      game.info.cover_file = info->str("cover_file");
+      if (game.info.cover.empty() || game.info.cover_file.rfind(kLibraryDir + "/封面/", 0) != 0 ||
+          game.info.cover_file.find("..") != std::string::npos) {
+        game.info.cover_file.clear();
+      }
     }
     if (const panplay::Json* variants = item.get("variants")) {
       for (const auto& entry : variants->array) {

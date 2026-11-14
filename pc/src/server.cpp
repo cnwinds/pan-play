@@ -658,7 +658,34 @@ std::mutex site_cover_mu;
 // 帖子封面下载失败的时刻，过一阵才再试，免得一页几十个格子每次都去等慢图床。
 std::map<std::string, std::chrono::steady_clock::time_point> site_cover_failed;
 
-// 盘架资源库里这款游戏的帖子封面：按地址缓存在数据目录的 site-covers/，没有时下载。取不到时为空。
+bool looks_like_image(const std::string& body) {
+  return body.size() > 12 && ((static_cast<unsigned char>(body[0]) == 0xFF && static_cast<unsigned char>(body[1]) == 0xD8) ||
+                              body.compare(1, 3, "PNG") == 0 || body.compare(0, 4, "GIF8") == 0 ||
+                              body.compare(8, 4, "WEBP") == 0 || body.compare(4, 4, "ftyp") == 0);
+}
+
+// 盘架传到网盘的那份帖子封面，读不到时为空、why 写原因。
+std::string site_cover_from_drive(const std::string& file, std::string* why) {
+  const auto slash = file.find_last_of('/');
+  auto drive = open_drive();
+  std::string error;
+  const auto entries = drive->list(file.substr(0, slash), &error);
+  for (const auto& entry : entries) {
+    if (entry.is_dir || entry.name != file.substr(slash + 1)) continue;
+    if (entry.size <= 0 || entry.size > (4 << 20)) break;
+    const panplay::ReadResult read = drive->read_at(entry.file_id, 0, static_cast<std::size_t>(entry.size));
+    if (!read.error.empty()) {
+      *why = "读网盘失败：" + read.error;
+      return "";
+    }
+    return std::string(read.bytes.begin(), read.bytes.end());
+  }
+  *why = error.empty() ? "网盘上没有 " + file : "列网盘失败：" + error;
+  return "";
+}
+
+// 盘架资源库里这款游戏的帖子封面：按地址缓存在数据目录的 site-covers/。没有缓存时先读盘架传到网盘的那份
+// （主机常常连图床的域名都解析不了），再直接去图床取。取不到时为空。
 std::string site_cover_bytes(const std::string& title_id) {
   const auto library = shelf_library();
   const ShelfGame* shelf = library ? library->find(title_id) : nullptr;
@@ -675,17 +702,20 @@ std::string site_cover_bytes(const std::string& title_id) {
       return "";
     }
   }
-  panplay::HttpRequest request;
-  request.url = url;
-  request.timeout_ms = 30000;
-  const panplay::HttpResponse response = panplay::http_send(request);
-  const std::string& body = response.body;
-  const bool image = body.size() > 4 && ((static_cast<unsigned char>(body[0]) == 0xFF && static_cast<unsigned char>(body[1]) == 0xD8) ||
-                                         body.compare(1, 3, "PNG") == 0 || body.compare(0, 4, "GIF8") == 0 ||
-                                         (body.size() >= 12 && (body.compare(8, 4, "WEBP") == 0 || body.compare(4, 4, "ftyp") == 0)));
-  if (!response.error.empty() || response.status != 200 || !image) {
-    panplay::log_warn("帖子封面 " + title_id + " 取不到：" +
-                      (!response.error.empty() ? response.error : "HTTP " + std::to_string(response.status)) + "，" + url);
+  std::string body;
+  std::string why;
+  if (!shelf->info.cover_file.empty()) body = site_cover_from_drive(shelf->info.cover_file, &why);
+  if (!looks_like_image(body)) {
+    panplay::HttpRequest request;
+    request.url = url;
+    request.timeout_ms = 30000;
+    const panplay::HttpResponse response = panplay::http_send(request);
+    body = response.status == 200 ? response.body : "";
+    why += std::string(why.empty() ? "" : "；") + "图床：" +
+           (!response.error.empty() ? response.error : "HTTP " + std::to_string(response.status));
+  }
+  if (!looks_like_image(body)) {
+    panplay::log_warn("帖子封面 " + title_id + " 取不到（" + why + "），" + url);
     std::lock_guard<std::mutex> lock(site_cover_mu);
     site_cover_failed[key] = std::chrono::steady_clock::now();
     return "";
