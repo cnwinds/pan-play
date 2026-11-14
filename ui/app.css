@@ -811,74 +811,133 @@ body.drawer-open { overflow: hidden; }
 .install .btn.done { background: rgba(95, 211, 160, 0.14); color: var(--mint); opacity: 1; }
 .install .btn.done::before { content: "✓"; margin-right: 0.45em; font-weight: 700; }
 
-.progress {
-  display: grid;
-  gap: 0.45rem;
-}
-
-.progress-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  color: var(--muted);
-  font-size: 0.88rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.progress-row > span:first-child {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.progress-row .link {
-  flex: none;
-  white-space: nowrap;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--muted);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-.progress-row .link:hover { color: var(--danger); }
-
-.progress-top {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 1rem;
-}
-
-.progress-pct {
-  font-size: 1.55rem;
-  font-weight: 700;
-  line-height: 1;
-  letter-spacing: 0.01em;
-  font-variant-numeric: tabular-nums;
-}
-
-.progress-eta {
-  color: var(--muted);
-  font-size: 0.84rem;
-  white-space: nowrap;
-}
-
-.progress-note {
-  margin: 0;
-  color: var(--faint);
-  font-size: 0.8rem;
-}
-
 .action-row {
   display: flex;
   gap: 0.6rem;
 }
 
-.action-row .btn.primary { flex: 1; min-width: 0; }
+.action-row .btn.primary {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+/* 主按钮兼做安装进度条（ADR 0013）。用户看底色填到几成和文字里的百分比、速度；
+   阶段看填充的纹理，copy 阶段底边细条的颜色是慢在哪、长度是字典多大。 */
+.job-fill,
+.job-strip { display: none; }
+
+.job-label {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn.primary.job {
+  padding: 0 2.4rem;
+  border-color: var(--line);
+  background: var(--raise);
+  color: var(--text);
+}
+
+.btn.primary.job:hover:not(:disabled) { background: #2b3750; }
+.btn.primary.job:disabled { opacity: 1; }
+.btn.primary.job .job-label { text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45); }
+
+.btn.primary.job .job-fill {
+  display: block;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: -1;
+  width: calc(var(--p, 0) * 100%);
+  background: var(--signal);
+  transition: width 0.6s ease, opacity 0.3s;
+}
+
+.btn.job[data-phase="paused"] .job-fill,
+.btn.job[data-phase="queued"] .job-fill,
+.btn.job[data-phase="pausing"] .job-fill { opacity: 0.45; }
+
+.btn.job[data-phase="retry"] .job-fill { background: var(--amber); }
+
+.btn.job[data-phase="check"] .job-fill {
+  background: repeating-linear-gradient(-45deg, var(--signal) 0, var(--signal) 6px, var(--signal-hi) 6px, var(--signal-hi) 12px);
+}
+
+.btn.job[data-phase="finish"] .job-fill { animation: job-pulse 1.2s ease-in-out infinite alternate; }
+
+.btn.job[data-phase="prep"]::after,
+.btn.job[data-phase="console"]::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: -1;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, rgba(122, 168, 255, 0.35), transparent);
+  animation: job-sweep 1.6s linear infinite;
+}
+
+.btn.job[data-phase="console"]::after { background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent); }
+
+.btn.primary.job[data-phase="copy"] .job-strip {
+  display: block;
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  width: calc(var(--dict, 0) * 100%);
+  background: rgba(255, 255, 255, 0.55);
+  transition: width 0.6s ease, background-color 0.3s;
+}
+
+.btn.primary.job[data-slow="download"] .job-strip { background: #3fd0ff; }
+.btn.primary.job[data-slow="decode"] .job-strip { background: #b48cff; }
+.btn.primary.job[data-slow="memory"] .job-strip { background: #ff9f43; }
+.btn.primary.job[data-slow="write"] .job-strip { background: var(--mint); }
+
+.job-icon {
+  display: none;
+  position: absolute;
+  top: 50%;
+  right: 0.95rem;
+  box-sizing: content-box;
+}
+
+.job-icon[data-icon="pause"] {
+  display: block;
+  width: 4px;
+  height: 12px;
+  margin-top: -6px;
+  border-left: 4px solid currentColor;
+  border-right: 4px solid currentColor;
+}
+
+.job-icon[data-icon="play"] {
+  display: block;
+  width: 0;
+  height: 0;
+  margin-top: -6px;
+  border-left: 11px solid currentColor;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+}
+
+@keyframes job-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+
+@keyframes job-pulse {
+  from { opacity: 1; }
+  to { opacity: 0.55; }
+}
 
 .variant-row {
   display: flex;
@@ -1334,8 +1393,6 @@ body.drawer-open { overflow: hidden; }
   transition: width 0.6s ease;
 }
 
-.progress.resume .meter > span { opacity: 0.55; }
-
 .status-text { color: var(--muted); font-size: 0.88rem; }
 .status-text.warn { color: var(--amber); }
 
@@ -1619,8 +1676,7 @@ body.drawer-open { overflow: hidden; }
 
 .dock-panel-head h2 { font-size: 0.92rem; font-weight: 700; }
 
-.dock-panel-head .link,
-.queue-links .link {
+.dock-panel-head .link {
   padding: 0;
   border: 0;
   background: none;
@@ -1630,10 +1686,7 @@ body.drawer-open { overflow: hidden; }
   text-underline-offset: 3px;
 }
 
-.dock-panel-head .link:hover,
-.queue-links .link:hover { color: var(--text); }
-
-.queue-links { display: inline-flex; gap: 1rem; }
+.dock-panel-head .link:hover { color: var(--text); }
 
 .queue-list {
   margin: 0;

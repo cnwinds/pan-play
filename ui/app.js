@@ -1009,7 +1009,7 @@ const actionText = {
   install: "安装到主机",
   continue: "继续安装",
   update: "安装更新",
-  installed: "已安装到主机",
+  installed: "已安装",
   installing: "正在安装…",
   unsupported: "这种压缩包还不能安装",
   empty: "目录里没有压缩包",
@@ -1226,6 +1226,63 @@ function resumeProgress(game, task) {
   return { done: Math.min(done, total || done), total, files };
 }
 
+// 主按钮的悬停提示：按钮上只画出来的那些数字，给开发者对照。
+function jobDetail(task) {
+  const parts = [task.message || "", jobText(task, true)];
+  const pace = taskPace(task);
+  if (pace) parts.push(pace.left !== null ? `预计 ${finishClock(pace.left)} 装完` : "正在估算剩余时间", `平均 ${pace.average}`);
+  parts.push(paceNote(task));
+  return [...new Set(parts.filter(Boolean))].join(" · ");
+}
+
+// 详情页主按钮上画的安装进度（ADR 0013）。fraction 是填到几成，phase 决定填充的纹理，text 只有百分比和速度；
+// copy 阶段的 slow（慢在哪）和 dictionary（字典多大）画成底边细条的颜色和长度。没有进度可画时为 null。
+function jobLook(game, task, label) {
+  const percent = (fraction) => Math.floor(fraction * 100) + "%";
+  if (task && task.state === "running") {
+    const message = task.message || "";
+    const fraction = taskFraction(task);
+    const detail = jobDetail(task);
+    if (message === "正在暂停…") return { phase: "pausing", fraction, text: percent(fraction), detail };
+    if (message.startsWith("安装中断")) return { phase: "retry", fraction, text: percent(fraction), detail };
+    if (message === "正在收尾") return { phase: "finish", fraction: 1, text: "100%", detail };
+    if (message.startsWith("正在注册") || message.includes("在主机上安装")) return { phase: "console", fraction: 1, text: "100%", detail };
+    if (message === "正在核对" && task.files_to_check > 0) {
+      const checked = Math.min(1, task.files_checked / task.files_to_check);
+      return { phase: "check", fraction: checked, text: percent(checked), detail };
+    }
+    if (message === "正在安装" && taskStarted(task)) {
+      const pace = taskPace(task);
+      return {
+        phase: "copy", fraction, text: percent(fraction) + (pace ? ` · ${pace.speed}` : ""), detail,
+        slow: task.slow || "", dictionary: task.dictionary || 0,
+      };
+    }
+    return { phase: "prep", fraction: 0, text: "正在安装", detail };
+  }
+  if (task && task.state === "queued") {
+    const fraction = taskStarted(task) ? taskFraction(task) : 0;
+    const detail = jobText(task);
+    if (queuePaused) return { phase: "paused", fraction, text: fraction ? `已暂停 · ${percent(fraction)}` : "已暂停", detail };
+    return { phase: "queued", fraction, text: "排队中", detail };
+  }
+  if (game.state === "continue") {
+    const last = resumeProgress(game, task);
+    const fraction = last && last.total ? Math.min(1, last.done / last.total) : 0;
+    const detail = !last ? "" : last.total
+      ? `上次装到 ${formatBytes(last.done)} / ${formatBytes(last.total)} · ${last.files} 个文件`
+      : `上次已装好 ${last.files} 个文件`;
+    return { phase: "paused", fraction, text: fraction ? `${label} · ${percent(fraction)}` : label, detail };
+  }
+  return null;
+}
+
+// 底边细条的长度：字典 1 MB 到 4 GB 按对数铺满。
+function dictionaryScale(bytes) {
+  const mb = bytes / 1048576;
+  return mb >= 1 ? Math.min(1, Math.max(0.04, Math.log2(mb) / 12)) : 0;
+}
+
 // 详情里的删除确认，替换掉安装按钮那一行。有几步就要点几次；多步时最后一步的按钮先锁一会儿，
 // 免得连点两下直接删掉。
 function buildConfirm() {
@@ -1334,40 +1391,15 @@ function openDetail(game, opener) {
   hero.append(backdrop, row, refreshMeta);
 
   const install = el("div", "drawer-section install");
+  // 安装进度画在主按钮上（ADR 0013）：用户看百分比和速度，阶段、慢在哪、字典多大用纹理和底边细条表示。
   const action = el("button", "btn primary");
   action.type = "button";
-  const progress = el("div", "progress");
-  const progressTop = el("div", "progress-top");
-  const progressPct = el("span", "progress-pct num");
-  const progressEta = el("span", "progress-eta");
-  progressTop.append(progressPct, progressEta);
-  const progressRow = el("div", "progress-row");
-  const progressText = el("span");
-  progressText.setAttribute("role", "status");
-  const cancel = el("button", "link", "暂停安装");
-  cancel.type = "button";
-  progressRow.append(progressText, cancel);
-  const meter = el("span", "meter");
-  meter.append(el("span"));
-  const progressNote = el("p", "progress-note");
-  progress.append(progressTop, meter, progressRow, progressNote);
-  const resume = el("div", "progress resume");
-  const resumeMeter = el("span", "meter");
-  resumeMeter.append(el("span"));
-  const resumeText = el("span", "progress-row num");
-  resume.append(resumeMeter, resumeText);
-  const queueRow = el("div", "progress-row queue-row");
-  const queueText = el("span");
-  queueText.setAttribute("role", "status");
-  const queueLinks = el("span", "queue-links");
-  const resumeAll = el("button", "link", "全部继续");
-  resumeAll.type = "button";
-  const first = el("button", "link", "先装这个");
-  first.type = "button";
-  const leave = el("button", "link", "移出队列");
-  leave.type = "button";
-  queueLinks.append(resumeAll, first, leave);
-  queueRow.append(queueText, queueLinks);
+  const actionFill = el("span", "job-fill");
+  const actionStrip = el("span", "job-strip");
+  const actionLabel = el("span", "job-label num");
+  const actionIcon = el("span", "job-icon");
+  actionIcon.setAttribute("aria-hidden", "true");
+  action.append(actionFill, actionStrip, actionLabel, actionIcon);
   const status = el("p", "status-text");
   status.setAttribute("role", "status");
   // 网盘里还没有的格式：链接失效、评过有问题时在这里说。
@@ -1382,6 +1414,8 @@ function openDetail(game, opener) {
     item.setAttribute("role", "menuitem");
     return item;
   };
+  const first = menuItem("先装这个");
+  const leave = menuItem("移出安装队列");
   const adjust = menuItem("调整要装的补丁");
   const registerItem = menuItem("注册到主机桌面");
   const discard = menuItem("删除已装的部分", "danger");
@@ -1395,7 +1429,7 @@ function openDetail(game, opener) {
   more.innerHTML = '<svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true" fill="currentColor"><circle cx="3" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13" cy="8" r="1.5"/></svg>';
   const menu = el("div", "more-menu");
   menu.setAttribute("role", "menu");
-  menu.append(adjust, registerItem, reshelf, discard, remove, unshelve);
+  menu.append(first, leave, adjust, registerItem, reshelf, discard, remove, unshelve);
   const moreWrap = el("div", "more-wrap");
   moreWrap.append(more, menu);
   let menuOpen = false;
@@ -1641,7 +1675,7 @@ function openDetail(game, opener) {
     }));
   };
 
-  install.append(variantRow, remoteNote, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, resume, progress, queueRow, status);
+  install.append(variantRow, remoteNote, packageNotes, reviewBox, actionRow, confirm.panel, picker.panel, consoleRow, status);
 
   const about = el("div", "drawer-section");
   const desc = el("p", "desc");
@@ -1729,15 +1763,28 @@ function openDetail(game, opener) {
     if (waitingLayers) label = "正在读取压缩包…";
     if (unshelved) label = game.on_drive === false ? "已删除" : "已从网盘删除";
     const onConsole = game.console && ["installed", "update"].includes(game.state) ? consoleSummary(game.console) : null;
-    if (game.state === "installed" && onConsole && onConsole.healthy) label = "已安装 · 已在主机桌面";
     const remoteVariant = game.remote ? (game.variants || []).find((item) => item.path === game.path) : null;
     const toInstall = ["install", "continue"].includes(game.state) && !running && !queued;
     const linkDead = toInstall && Boolean(remoteVariant && remoteVariant.alive === false);
     if (linkDead) label = "链接已失效";
-    action.textContent = label;
+    // 装的时候点主按钮暂停，暂停了点它继续；收尾、注册这些停不下来的阶段不能点。
+    const look = unshelved || linkDead || refused || waitingLayers ? null : jobLook(game, task, label);
+    const pausable = Boolean(running && look && ["prep", "check", "copy", "retry"].includes(look.phase));
+    action.classList.toggle("job", Boolean(look));
+    action.dataset.phase = look ? look.phase : "";
+    action.dataset.slow = look && look.slow ? look.slow : "";
+    action.style.setProperty("--p", look ? look.fraction : 0);
+    action.style.setProperty("--dict", look ? Math.max(dictionaryScale(look.dictionary || 0), look.slow ? 0.04 : 0) : 0);
+    actionLabel.textContent = look ? look.text : label;
+    actionIcon.dataset.icon = pausable ? "pause" : look && look.phase === "paused" ? "play" : "";
+    action.title = look ? look.detail : "";
     action.classList.toggle("done", game.state === "installed");
-    action.disabled = unshelved || waitingLayers || running || queued || refused || linkDead || ["installed", "unsupported", "empty", "other"].includes(game.state) ||
-      (game.state !== "need-settings" && archivesRead && !game.formats);
+    if (running) action.disabled = !pausable;
+    else if (queued) action.disabled = !queuePaused;
+    else {
+      action.disabled = unshelved || waitingLayers || refused || linkDead || ["installed", "unsupported", "empty", "other"].includes(game.state) ||
+        (game.state !== "need-settings" && archivesRead && !game.formats);
+    }
     let remoteText = "";
     if (remoteVariant && toInstall) {
       if (remoteVariant.alive === false) {
@@ -1748,18 +1795,16 @@ function openDetail(game, opener) {
     }
     remoteNote.textContent = remoteText;
     remoteNote.hidden = !remoteText || picking || confirm.open;
-    const packages = game.console_packages || [];
+    // 激活包装好了、或者装好游戏后会自动装的不用说，只列没装上、得换到主机上装的。
+    const packages = (game.console_packages || []).filter((item) => item.state === "failed" || item.state === "manual");
     packageNotes.hidden = !packages.length || picking || confirm.open;
     const packagesKey = JSON.stringify(packages);
     if (packagesKey !== packageNotesKey) {
       packageNotesKey = packagesKey;
       const list = el("ul");
       for (const item of packages) {
-        const state = item.state === "installed" ? "已装好"
-          : item.state === "failed" ? `没装上：${item.error}`
-          : item.state === "manual" ? "电脑上的盘游装不了，用主机上的盘游装这款游戏会自动装"
-          : "装好游戏后自动装";
-        list.append(el("li", item.state === "failed" || item.state === "manual" ? "warn" : "", `${item.name}（${formatBytes(item.size)}）：${state}`));
+        const state = item.state === "failed" ? `没装上：${item.error}` : "电脑上的盘游装不了，用主机上的盘游装这款游戏会自动装";
+        list.append(el("li", "warn", `${item.name}（${formatBytes(item.size)}）：${state}`));
       }
       packageNotes.replaceChildren(el("strong", "", "要在主机上安装的包"), list);
     }
@@ -1786,7 +1831,9 @@ function openDetail(game, opener) {
     reshelf.disabled = Boolean(game.shelf_feedback);
     reshelf.textContent = game.shelf_feedback ? "已通知盘架，等它重新分析" : "让盘架重新分析";
     paintReview(installedNow, busy || unshelved);
-    moreWrap.hidden = unshelved || [adjust, registerItem, reviewItem, reshelf, discard, remove, unshelve].every((item) => item.hidden);
+    leave.hidden = !queued;
+    first.hidden = !queued || position <= 1;
+    moreWrap.hidden = unshelved || [first, leave, adjust, registerItem, reviewItem, reshelf, discard, remove, unshelve].every((item) => item.hidden);
     if (moreWrap.hidden && menuOpen) setMenu(false);
     // 注册有问题时说注册的事，没问题时说 backport 库和最近一次启动的经过。
     let consoleNote = null;
@@ -1802,41 +1849,15 @@ function openDetail(game, opener) {
       consoleAction.textContent = consoleNote.button || "";
       consoleAction.hidden = consoleBusy || !consoleNote.button;
     }
-    const last = picking ? null : resumeProgress(game, task);
-    resume.hidden = !last;
-    if (last) {
-      resumeMeter.style.setProperty("--p", last.total ? last.done / last.total : 0);
-      resumeText.textContent = last.total
-        ? `上次装到 ${formatBytes(last.done)} / ${formatBytes(last.total)}（${Math.floor((last.done / last.total) * 100)}%）· ${last.files} 个文件`
-        : `上次已装好 ${last.files} 个文件`;
-    }
-    progress.hidden = !running;
-    if (running) {
-      progressText.textContent = jobText(task, true);
-      meter.style.setProperty("--p", taskFraction(task));
-      cancel.disabled = task.message === "正在暂停…";
-      const pace = taskPace(task);
-      progressTop.hidden = !taskStarted(task);
-      progressPct.textContent = Math.round(taskFraction(task) * 100) + "%";
-      progressEta.textContent = pace ? (pace.left !== null ? `预计 ${finishClock(pace.left)} 装完` : "正在估算剩余时间…") : "";
-      progressEta.title = pace ? `最近的速度 ${pace.speed}，从开始解压算的平均 ${pace.average}` : "";
-      progressNote.textContent = paceNote(task);
-      progressNote.hidden = !progressNote.textContent;
-    }
-    queueRow.hidden = !queued;
-    if (queued) {
-      if (queuePaused) queueText.textContent = `安装队列已暂停，这个排在第 ${position} 个`;
-      else queueText.textContent = position === 1 ? "排在第 1 个，当前这个装完就开始" : `排在第 ${position} 个`;
-      resumeAll.hidden = !queuePaused;
-      first.hidden = position <= 1;
-    }
+    // 装好了、自己暂停的不另外说，按钮上已经看得出来；只说装不下去的原因。
     const finished = !unshelved && task && task.state === "done";
+    const stuck = finished && !["installed", "already"].includes(task.status) &&
+      !(task.status === "interrupted" && (task.message || "").startsWith("已暂停"));
     if (running || queued) say("");
     const failed = Boolean(notice) && noticeWarn;
-    status.hidden = !failed && !finished && !notice;
-    status.className = "status-text" + (failed || (finished && settledState(task) !== "installed") ? " warn" : "");
-    if (failed || !finished) status.textContent = notice;
-    else status.textContent = jobText(task);
+    status.hidden = !failed && !stuck && !notice;
+    status.className = "status-text" + (failed || stuck ? " warn" : "");
+    status.textContent = stuck && !failed ? jobText(task) : notice;
 
     desc.textContent = game.description || "";
     desc.hidden = !game.description;
@@ -1884,6 +1905,15 @@ function openDetail(game, opener) {
     startInstall(game);
   };
   action.addEventListener("click", () => {
+    const task = taskFor(game.path);
+    if (task && task.state === "running") {
+      queueAction("/api/queue/remove", { path: game.path });
+      return;
+    }
+    if (task && task.state === "queued") {
+      queueAction("/api/queue/resume", {});
+      return;
+    }
     if (game.state === "need-settings") {
       show("settings", "target");
       return;
@@ -1954,7 +1984,6 @@ function openDetail(game, opener) {
       if (current()) paint();
     }, 2000);
   });
-  cancel.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
   const removeWith = (endpoint, done, focusAfter) => async () => {
     const error = await removeInstall(game, endpoint);
     if (!detail || detail.game !== game) return;
@@ -2067,7 +2096,6 @@ function openDetail(game, opener) {
     });
     paint();
   });
-  resumeAll.addEventListener("click", () => queueAction("/api/queue/resume", {}));
   first.addEventListener("click", () => queueAction("/api/queue/first", { path: game.path }));
   leave.addEventListener("click", () => queueAction("/api/queue/remove", { path: game.path }));
 
