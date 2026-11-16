@@ -49,7 +49,7 @@ struct ShelfPlan {
 };
 
 struct ShelfVariant {
-  // exfat、folder、unknown，网盘里分别放在 @exfat、@folder、@other。
+  // folder、zstd、exfat、unknown，网盘里分别放在 @folder、@zstd、@exfat、@other。
   std::string format;
   std::string surl;
   std::string pwd;

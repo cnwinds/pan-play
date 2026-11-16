@@ -157,21 +157,23 @@
 
 ## 八、一款游戏有几种格式
 
-同一款游戏有 exFAT 镜像版、文件夹版好几份时，每种格式在游戏目录下各占一个 `@格式` 子目录，[盘架](https://github.com/cnwinds/pan-shelf) 按格式转存时就放成这样：
+同一款游戏有文件夹版、ZSTD、exFAT 镜像版好几份时，每种格式在游戏目录下各占一个 `@格式` 子目录，[盘架](https://github.com/cnwinds/pan-shelf) 按格式转存时就放成这样：
 
 ```
 极速骑行5 PPSA15190/
+├── @folder/                       文件夹版
+│   └── PPSA15190.part1~8.rar
+├── @zstd/                         ZSTD 压缩 dump（ampr_zstd*.pak）
+│   └── …rar
 ├── @exfat/                        exFAT 镜像版
 │   ├── PPSA15190-e.part01~12.rar  解压出来是一个 .exfat 镜像文件
 │   └── backport files.zip         固件补丁
-├── @folder/                       文件夹版
-│   └── PPSA15190.part1~8.rar
 └── @other/                        资源站没标格式的
 ```
 
-- 子目录名是 `@` 加小写字母或数字：`@exfat`、`@folder`、`@other`。每个 `@格式` 目录里面照前几节放主游戏和补丁。
+- 子目录名是 `@` 加小写字母或数字：`@folder`、`@zstd`、`@exfat`、`@other`。每个 `@格式` 目录里面照前几节放主游戏和补丁。
 - 游戏目录本身不再收 `@格式` 子目录里的压缩包；游戏目录里另外直接放着压缩包时，它也算一种（「没分格式」）。
-- 详情页最上面列出几种格式，点哪个就看哪个的压缩包、评价、安装状态。默认选主机上已经装的那种，没装时选 exFAT。
+- 详情页最上面列出几种格式，点哪个就看哪个的压缩包、评价、安装状态。默认选主机上已经装的那种，没装时按文件夹、ZSTD、exFAT、其他的顺序。
 - **主机上同一款游戏只装一种格式**，几种格式都装到同一个 `<存放位置>/<Title ID>/`。已经装了 exFAT 版时，切到文件夹版会显示「主机上装的是 exFAT 镜像版」、不能安装；要换格式先在「⋯」里删除游戏。
 - 镜像版装完，主机上的游戏文件夹里是一个 `.exfat` 镜像加上 backport 解压出来的文件。PS5 上的盘游注册时把镜像读写挂载到 `/mnt/panplay/<Title ID>`，把 backport 写进镜像，再注册到桌面；每次开机也由盘游先挂好镜像（见 [ADR 0007](adr/0007-game-format-variants.md)）。PC 版用 FTP 装镜像版时，注册要交给 ShadowMountPlus。
 - 只支持 `.exfat`（和 ShadowMountPlus 的 `.ffpkg`）镜像，`.ffpfs` 不支持。资源站标的 fpkg 是 PKG 安装包，装不了。

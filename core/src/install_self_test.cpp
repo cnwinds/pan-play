@@ -1647,12 +1647,14 @@ int variant_test() {
   const auto folder = pattern(3000, 22);
   FakeDrive drive;
   drive.add("/apps/panplay/Var PPSA41000/@folder/game.zip", make_zip({{"eboot.bin", folder, true}}, {}).front());
+  drive.add("/apps/panplay/Var PPSA41000/@zstd/game.zip", make_zip({{"eboot.bin", folder, true}}, {}).front());
   drive.add("/apps/panplay/Var PPSA41000/@exfat/game.zip", make_zip({{"PPSA41000.exfat", image, false}}, {}).front());
   drive.add("/apps/panplay/Var PPSA41000/@other/game.zip", make_zip({{"x.bin", folder, false}}, {}).front());
   std::string error;
   const auto variants = list_variants(drive, "/apps/panplay/Var PPSA41000", &error);
-  if (!error.empty() || variants.size() != 3 || variants[0].format != "folder" || variants[1].format != "exfat" ||
-      variants[2].format != "other" || variants[0].path != "/apps/panplay/Var PPSA41000/@folder") {
+  if (!error.empty() || variants.size() != 4 || variants[0].format != "folder" || variants[1].format != "zstd" ||
+      variants[2].format != "exfat" || variants[3].format != "other" ||
+      variants[0].path != "/apps/panplay/Var PPSA41000/@folder") {
     return fail("格式子目录列得不对: " + error);
   }
   if (!collect_archives(drive, "/apps/panplay/Var PPSA41000", &error).empty()) return fail("游戏目录把格式子目录里的压缩包也算进来了");
@@ -1660,7 +1662,7 @@ int variant_test() {
 
   drive.add("/apps/panplay/Var PPSA41000/loose.zip", make_zip({{"y.bin", folder, false}}, {}).front());
   const auto with_loose = list_variants(drive, "/apps/panplay/Var PPSA41000", &error);
-  if (with_loose.size() != 4 || !with_loose.back().format.empty() || with_loose.back().path != "/apps/panplay/Var PPSA41000") {
+  if (with_loose.size() != 5 || !with_loose.back().format.empty() || with_loose.back().path != "/apps/panplay/Var PPSA41000") {
     return fail("游戏目录里直接放的压缩包没有算成一个变体");
   }
   {

@@ -146,8 +146,9 @@ std::string variant_format(const std::string& path) {
 
 int variant_rank(const std::string& format) {
   if (format == "folder") return 0;
-  if (format == "exfat") return 1;
-  return format.empty() ? 3 : 2;
+  if (format == "zstd") return 1;
+  if (format == "exfat") return 2;
+  return format.empty() ? 4 : 3;
 }
 
 std::string game_dir_of(const std::string& path) {

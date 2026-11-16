@@ -197,7 +197,8 @@ int check_parse() {
   const ShelfVariant& dead = target->variants[1];
   if (dead.alive != 0 || !dead.reviewed || dead.playable || dead.review_note != "黑屏") return fail("失效、评价读错了");
   if (target->variants[0].alive != -1 || library->find("PPSA00002")->variants[0].alive != 1) return fail("alive 读错了");
-  if (shelf_variant_dir("unknown") != "@other" || shelf_variant_dir("exfat") != "@exfat" || shelf_format_of("other") != "unknown") {
+  if (shelf_variant_dir("unknown") != "@other" || shelf_variant_dir("exfat") != "@exfat" ||
+      shelf_variant_dir("zstd") != "@zstd" || shelf_format_of("other") != "unknown" || shelf_format_of("zstd") != "zstd") {
     return fail("格式和目录名对不上");
   }
   if (parse_shelf_library("{}", &error) || error.empty()) return fail("没有 games 应该报错");

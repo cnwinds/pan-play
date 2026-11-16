@@ -1022,8 +1022,11 @@ const actionText = {
   "need-settings": "先到设置里填写存放位置",
 };
 
-// 网盘上同一款游戏按格式分的子目录（@exfat、@folder、@other）。
-const variantText = { exfat: "exFAT 镜像", folder: "文件夹", other: "其他格式", unknown: "其他格式", "": "没分格式" };
+// 网盘上同一款游戏按格式分的子目录（@folder、@zstd、@exfat、@other）。
+const variantText = {
+  folder: "文件夹", zstd: "ZSTD", exfat: "exFAT 镜像",
+  other: "其他格式", unknown: "其他格式", "": "没分格式",
+};
 function variantLabel(format) {
   return variantText[format] ?? format;
 }
@@ -1643,7 +1646,7 @@ function openDetail(game, opener) {
     loadCached();
     reload();
   };
-  // 打开的是游戏目录本身、它又按格式分了：默认打开主机上装着的那种，没装就按文件夹、exFAT、其他的顺序取第一个（服务端排好了）。
+  // 打开的是游戏目录本身、它又按格式分了：默认打开主机上装着的那种，没装就按文件夹、ZSTD、exFAT、其他的顺序取第一个（服务端排好了）。
   const pickVariant = () => {
     const variants = game.variants || [];
     if (!variants.length || variants.some((item) => item.path === game.path)) return false;

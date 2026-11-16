@@ -33,7 +33,7 @@
                         "review":{"playable":false,"note":"…"}}]}]}
 ```
 
-- `format` 是 `exfat`、`folder`、`unknown`，对应网盘里的 `@exfat`、`@folder`、`@other`（0007）。PKG、单独的补丁 / DLC 不收，和盘架现在挑链接的规则一样。
+- `format` 是 `folder`、`zstd`、`exfat`、`unknown`，对应网盘里的 `@folder`、`@zstd`、`@exfat`、`@other`（0007）。PKG、单独的补丁 / DLC 不收，和盘架现在挑链接的规则一样。
 - 同一个编号有几个帖子时合成一个游戏，`name` 取最新帖子的名字，`added_at` 是最新帖子被采集到的时间。每种格式只留一条链接：能用的优先，然后版本高的，再然后帖子新的。
 - `size`、`alive`、`checked_at` 来自盘架最近一次列分享（每条链接 7 天复查一次）；没列过时 `size`、`checked_at` 为 0，不写 `alive`。确认失效的写 `alive: false`，仍然列出来，盘游显示「链接失效」。
 - `review` 是盘架按 0006 把分享里的 `md5` 和评价对上的结果，对不上时不写。盘游不用自己再列分享算指纹，转存前就能提示「这份评过不能玩」。
